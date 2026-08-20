@@ -9,8 +9,17 @@ use serde_json::Value;
 /// What kind of Zarr node a directory is, as far as its metadata files reveal.
 enum NodeKind {
     Group,
-    Array,
+    Array(ArrayMeta),
     Unknown,
+}
+
+/// The three fields shown underneath an array, already formatted for printing.
+/// Each is optional on its own, so metadata missing `chunks` still shows the
+/// shape it does have.
+struct ArrayMeta {
+    shape: Option<String>,
+    chunks: Option<String>,
+    dtype: Option<String>,
 }
 
 impl NodeKind {
@@ -19,7 +28,7 @@ impl NodeKind {
     fn label(&self) -> &'static str {
         match self {
             NodeKind::Group => "[group]",
-            NodeKind::Array => "[array]",
+            NodeKind::Array(_) => "[array]",
             NodeKind::Unknown => "[unknown]",
         }
     }
@@ -47,12 +56,15 @@ fn main() {
     let root_kind = classify(root);
     println!("{root_name} {}", root_kind.label());
 
-    // An array is a leaf here too: everything below it is chunk storage.
-    if !matches!(root_kind, NodeKind::Array)
-        && let Err(e) = print_tree(root, "")
-    {
-        eprintln!("error: {e}");
-        process::exit(1);
+    // An array is a leaf here too: its metadata takes the place of the walk.
+    match &root_kind {
+        NodeKind::Array(meta) => print_array_meta(meta, ""),
+        _ => {
+            if let Err(e) = print_tree(root, "") {
+                eprintln!("error: {e}");
+                process::exit(1);
+            }
+        }
     }
 }
 
@@ -78,17 +90,19 @@ fn print_tree(dir: &Path, prefix: &str) -> io::Result<()> {
         let kind = classify(path);
         println!("{prefix}{connector}{name} {}", kind.label());
 
+        // Children of the last entry need no vertical bar above them.
+        let child_prefix = if is_last {
+            format!("{prefix}    ")
+        } else {
+            format!("{prefix}│   ")
+        };
+
         // Stop at arrays: what lies beneath is chunk storage (a V3 `c/`
         // directory, V2 chunk keys), an implementation detail rather than
-        // structure worth showing.
-        if !matches!(kind, NodeKind::Array) {
-            // Children of the last entry need no vertical bar above them.
-            let child_prefix = if is_last {
-                format!("{prefix}    ")
-            } else {
-                format!("{prefix}│   ")
-            };
-            print_tree(path, &child_prefix)?;
+        // structure worth showing. The metadata rows go there instead.
+        match &kind {
+            NodeKind::Array(meta) => print_array_meta(meta, &child_prefix),
+            _ => print_tree(path, &child_prefix)?,
         }
     }
 
@@ -107,8 +121,9 @@ fn classify(dir: &Path) -> NodeKind {
     if dir.join(".zgroup").is_file() {
         return NodeKind::Group;
     }
-    if dir.join(".zarray").is_file() {
-        return NodeKind::Array;
+    let zarray = dir.join(".zarray");
+    if zarray.is_file() {
+        return NodeKind::Array(array_meta_v2(&zarray));
     }
 
     // Zarr V3 uses one filename for both kinds and moves the distinction inside
@@ -124,15 +139,97 @@ fn classify(dir: &Path) -> NodeKind {
 /// Read `node_type` out of a Zarr V3 `zarr.json`, or `None` if the file is
 /// missing, unreadable, not valid JSON, or has no recognisable `node_type`.
 fn classify_v3(path: &Path) -> Option<NodeKind> {
+    let value = read_json(path)?;
+
+    match value.get("node_type")?.as_str()? {
+        "group" => Some(NodeKind::Group),
+        "array" => Some(NodeKind::Array(array_meta_v3(&value))),
+        _ => None,
+    }
+}
+
+/// Read a file and parse it as JSON, or `None` if either step fails.
+fn read_json(path: &Path) -> Option<Value> {
     // `.ok()` drops the error and leaves an Option: we care *that* this failed,
     // not why. `?` then returns None early, the same way it returns Err early
     // on a Result.
     let text = fs::read_to_string(path).ok()?;
-    let value: Value = serde_json::from_str(&text).ok()?;
+    serde_json::from_str(&text).ok()
+}
 
-    match value.get("node_type")?.as_str()? {
-        "group" => Some(NodeKind::Group),
-        "array" => Some(NodeKind::Array),
-        _ => None,
+/// Collect the display metadata from a Zarr V2 `.zarray`.
+///
+/// The filename already told us this is an array, so a file we cannot read or
+/// parse only costs us the metadata: every field comes back missing and the
+/// node is still shown as an array.
+fn array_meta_v2(path: &Path) -> ArrayMeta {
+    let Some(value) = read_json(path) else {
+        return ArrayMeta {
+            shape: None,
+            chunks: None,
+            dtype: None,
+        };
+    };
+
+    ArrayMeta {
+        shape: format_dims(value.get("shape")),
+        chunks: format_dims(value.get("chunks")),
+        // Shown exactly as stored, in V2's NumPy notation ("<u2", "|u1").
+        dtype: value
+            .get("dtype")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    }
+}
+
+/// Collect the display metadata from an already-parsed Zarr V3 `zarr.json`.
+fn array_meta_v3(value: &Value) -> ArrayMeta {
+    // V3 keeps the chunk shape inside the chunk grid description. Only the
+    // "regular" grid has a `chunk_shape`; any other grid simply yields None
+    // here and the row shows as missing.
+    let chunk_shape = value
+        .get("chunk_grid")
+        .and_then(|grid| grid.get("configuration"))
+        .and_then(|config| config.get("chunk_shape"));
+
+    ArrayMeta {
+        shape: format_dims(value.get("shape")),
+        chunks: format_dims(chunk_shape),
+        // The object form used by dtype extensions is not interpreted.
+        dtype: value
+            .get("data_type")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    }
+}
+
+/// Render a JSON array of numbers as `[4096, 4096]`, or `None` if the value is
+/// missing or is not an array.
+fn format_dims(value: Option<&Value>) -> Option<String> {
+    let items = value?.as_array()?;
+    let dims: Vec<String> = items.iter().map(|item| item.to_string()).collect();
+    Some(format!("[{}]", dims.join(", ")))
+}
+
+/// Print the metadata rows that sit underneath an array line.
+///
+/// All three rows are always printed, in the same order, so the closing
+/// connector is always on `dtype`. A field we could not read shows as `?`.
+fn print_array_meta(meta: &ArrayMeta, prefix: &str) {
+    let rows = [
+        ("shape:", &meta.shape),
+        ("chunks:", &meta.chunks),
+        ("dtype:", &meta.dtype),
+    ];
+
+    for (i, (name, value)) in rows.into_iter().enumerate() {
+        let connector = if i == rows.len() - 1 {
+            "└─ "
+        } else {
+            "├─ "
+        };
+        let value = value.as_deref().unwrap_or("?");
+        // Pad to the width of the longest name, "chunks:", so values line up.
+        println!("{prefix}{connector}{name:<7} {value}");
     }
 }
