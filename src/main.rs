@@ -44,10 +44,13 @@ fn main() {
     }
 
     let root_name = args[1].trim_end_matches('/');
-    let root_label = classify(root).label();
-    println!("{root_name} {root_label}");
+    let root_kind = classify(root);
+    println!("{root_name} {}", root_kind.label());
 
-    if let Err(e) = print_tree(root, "") {
+    // An array is a leaf here too: everything below it is chunk storage.
+    if !matches!(root_kind, NodeKind::Array)
+        && let Err(e) = print_tree(root, "")
+    {
         eprintln!("error: {e}");
         process::exit(1);
     }
@@ -72,16 +75,21 @@ fn print_tree(dir: &Path, prefix: &str) -> io::Result<()> {
         let is_last = i == subdirs.len() - 1;
         let connector = if is_last { "└── " } else { "├── " };
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let label = classify(path).label();
-        println!("{prefix}{connector}{name} {label}");
+        let kind = classify(path);
+        println!("{prefix}{connector}{name} {}", kind.label());
 
-        // Children of the last entry need no vertical bar above them.
-        let child_prefix = if is_last {
-            format!("{prefix}    ")
-        } else {
-            format!("{prefix}│   ")
-        };
-        print_tree(path, &child_prefix)?;
+        // Stop at arrays: what lies beneath is chunk storage (a V3 `c/`
+        // directory, V2 chunk keys), an implementation detail rather than
+        // structure worth showing.
+        if !matches!(kind, NodeKind::Array) {
+            // Children of the last entry need no vertical bar above them.
+            let child_prefix = if is_last {
+                format!("{prefix}    ")
+            } else {
+                format!("{prefix}│   ")
+            };
+            print_tree(path, &child_prefix)?;
+        }
     }
 
     Ok(())
