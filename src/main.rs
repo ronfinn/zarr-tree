@@ -22,6 +22,24 @@ struct ArrayMeta {
     dtype: Option<String>,
 }
 
+/// The text printed by `--help`.
+///
+/// A plain multi-line string literal: everything between the quotes, newlines
+/// included, is part of the value. That is why these lines sit flush against
+/// the left margin instead of following the indentation around them. The `\`
+/// after the opening quote swallows the newline that would otherwise start the
+/// string with a blank line.
+const HELP: &str = "\
+zarr-tree
+Explore the structure and metadata of a local Zarr store.
+
+USAGE:
+    zarr-tree <DIRECTORY>
+
+OPTIONS:
+    -h, --help       Print help
+    -V, --version    Print version";
+
 impl NodeKind {
     /// The tag printed after a directory name. These strings are compiled into
     /// the binary, so `'static` says the borrow never expires.
@@ -37,6 +55,33 @@ impl NodeKind {
 fn main() {
     // args[0] is the program itself, so we expect exactly two entries.
     let args: Vec<String> = env::args().collect();
+
+    // A lone flag is answered before anything else. Both arms return from
+    // main, so a flag never reaches the path checks below and every other
+    // argument falls through to exactly the code that handled it before.
+    //
+    // The cost of parsing this simply is that a directory actually named "-h"
+    // or "-V" can no longer be inspected.
+    if args.len() == 2 {
+        // args[1] is a String; as_str() borrows it as a &str so it can be
+        // matched against string literals.
+        match args[1].as_str() {
+            "-h" | "--help" => {
+                println!("{HELP}");
+                return;
+            }
+            "-V" | "--version" => {
+                // env! reads the variable when the crate is compiled, so this
+                // is a plain string literal in the binary. Cargo fills it in
+                // from the version field in Cargo.toml, which is why the two
+                // cannot drift apart.
+                println!("zarr-tree {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            _ => {}
+        }
+    }
+
     if args.len() != 2 {
         eprintln!("usage: zarr-tree <directory>");
         process::exit(1);

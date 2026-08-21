@@ -75,12 +75,19 @@ with rustc 1.98.0.
 zarr-tree <directory>
 ```
 
-Exactly one argument, a path to a local directory. There are no flags yet.
-Anything else prints a usage line and exits with status 1:
+Exactly one argument, a path to a local directory. Anything else prints a usage
+line and exits with status 1:
 
 ```
 $ zarr-tree
 usage: zarr-tree <directory>
+```
+
+Two flags are recognised, each on its own:
+
+```
+    -h, --help       Print help
+    -V, --version    Print version
 ```
 
 ## Example output
