@@ -310,4 +310,48 @@ mod tests {
             Some(String::from("[128, 256, 256]"))
         );
     }
+
+    #[test]
+    fn malformed_v3_metadata_classifies_as_unknown() {
+        // A name of its own, so two tests running in parallel cannot delete
+        // each other's fixtures.
+        let dir = env::temp_dir().join(format!("zarr-tree-test-v3-malformed-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Truncated mid-object: serde_json will refuse to parse this.
+        fs::write(dir.join("zarr.json"), r#"{"zarr_format": 3, "node_type":"#).unwrap();
+
+        let kind = classify(&dir);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        // One corrupt file should cost us only that node's label, not the
+        // walk. `matches!` checks the variant without making NodeKind derive
+        // PartialEq and Debug that nothing outside this test would use.
+        assert!(matches!(kind, NodeKind::Unknown));
+    }
+
+    #[test]
+    fn v2_dtype_is_passed_through_uninterpreted() {
+        let dir = env::temp_dir().join(format!("zarr-tree-test-v2-dtype-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let zarray = dir.join(".zarray");
+        // `<M8[ns]` is NumPy's datetime64, valid V2 but outside what a Zarr
+        // library would necessarily load. We only display dtypes, so it has
+        // to survive to the screen unchanged.
+        fs::write(
+            &zarray,
+            r#"{"zarr_format": 2, "shape": [10], "chunks": [10], "dtype": "<M8[ns]"}"#,
+        )
+        .unwrap();
+
+        let meta = array_meta_v2(&zarray);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(meta.shape, Some(String::from("[10]")));
+        assert_eq!(meta.chunks, Some(String::from("[10]")));
+        assert_eq!(meta.dtype, Some(String::from("<M8[ns]")));
+    }
 }
