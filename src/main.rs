@@ -233,3 +233,81 @@ fn print_array_meta(meta: &ArrayMeta, prefix: &str) {
         println!("{prefix}{connector}{name:<7} {value}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // `tests` is a child module of the crate root, so it can already see the
+    // root's private items. This glob import just brings their names into
+    // scope so we can call them unqualified.
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn v2_metadata_is_read_from_a_zarray_file() {
+        // A directory of our own inside the system temp directory. The process
+        // id keeps two simultaneous test runs from colliding.
+        let dir = env::temp_dir().join(format!("zarr-tree-test-v2-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let zarray = dir.join(".zarray");
+        fs::write(
+            &zarray,
+            r#"{"shape": [4096, 4096], "chunks": [512, 512], "dtype": "<u2"}"#,
+        )
+        .unwrap();
+
+        let meta = array_meta_v2(&zarray);
+
+        // Clean up before asserting: a failing assert_eq! panics, and anything
+        // after the panic would never run.
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(meta.shape, Some(String::from("[4096, 4096]")));
+        assert_eq!(meta.chunks, Some(String::from("[512, 512]")));
+        // V2 dtype is passed through untouched, in NumPy notation.
+        assert_eq!(meta.dtype, Some(String::from("<u2")));
+    }
+
+    #[test]
+    fn v3_metadata_is_read_from_a_parsed_zarr_json() {
+        let value = json!({
+            "node_type": "array",
+            "shape": [4096, 4096],
+            "chunk_grid": {
+                "name": "regular",
+                "configuration": { "chunk_shape": [512, 512] }
+            },
+            "data_type": "uint16"
+        });
+
+        let meta = array_meta_v3(&value);
+
+        assert_eq!(meta.shape, Some(String::from("[4096, 4096]")));
+        assert_eq!(meta.chunks, Some(String::from("[512, 512]")));
+        assert_eq!(meta.dtype, Some(String::from("uint16")));
+    }
+
+    #[test]
+    fn v3_metadata_missing_fields_become_none() {
+        let value = json!({
+            "node_type": "array",
+            "shape": [4096, 4096]
+        });
+
+        let meta = array_meta_v3(&value);
+
+        assert_eq!(meta.shape, Some(String::from("[4096, 4096]")));
+        assert_eq!(meta.chunks, None);
+        assert_eq!(meta.dtype, None);
+    }
+
+    #[test]
+    fn format_dims_renders_a_json_array() {
+        let value = json!([128, 256, 256]);
+
+        assert_eq!(
+            format_dims(Some(&value)),
+            Some(String::from("[128, 256, 256]"))
+        );
+    }
+}
