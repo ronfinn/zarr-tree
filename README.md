@@ -30,6 +30,7 @@ example.zarr [group]
 - Shows `shape`, `chunks` and `dtype` underneath every array.
 - Stops descending at arrays, so chunk storage (a V3 `c/` directory, V2 chunk
   keys) does not clutter the output.
+- Recognises OME-Zarr image groups and tags them, e.g. `[group, OME-Zarr 0.4]`.
 - Degrades gracefully: metadata that cannot be read or parsed costs only that
   node's label or a single field, never the rest of the walk.
 
@@ -48,6 +49,43 @@ as V2.
 V2 `dtype` values are displayed exactly as stored, in NumPy notation — `<u2`,
 `|u1`, `<M8[ns]`. They are not translated into V3 names such as `uint16`, and no
 attempt is made to validate them.
+
+## OME-Zarr
+
+An [OME-Zarr](https://ngff.openmicroscopy.org/) image is an ordinary Zarr group
+whose attributes carry a `multiscales` key, describing the same image stored at
+several resolutions. Groups like that are tagged, with the metadata version
+appended when one is recorded:
+
+```
+$ zarr-tree image.zarr
+image.zarr [group, OME-Zarr 0.4]
+├── 0 [array]
+│   ├─ shape:  [2, 2048, 2048]
+│   ├─ chunks: [1, 512, 512]
+│   └─ dtype:  <u2
+└── 1 [array]
+    ├─ shape:  [2, 1024, 1024]
+    ├─ chunks: [1, 512, 512]
+    └─ dtype:  <u2
+```
+
+Where the metadata lives follows the Zarr version:
+
+| OME-Zarr | Zarr | Attributes | Version field |
+| --- | --- | --- | --- |
+| 0.1 - 0.4 | V2 | `.zattrs`, keys at the top level | first `multiscales` entry's `version`, often absent |
+| 0.5 | V3 | `attributes.ome` inside `zarr.json` | `attributes.ome.version` |
+
+The version is printed exactly as stored and is never checked against the
+versions that exist, so an unfamiliar one still shows. A group whose
+`multiscales` is present but carries no readable version is tagged
+`[group, OME-Zarr]`.
+
+This is **recognition, not validation**. Nothing here checks a store against the
+OME-NGFF specification: axes, datasets, coordinate transformations, `omero`
+channels, labels and plate/well layouts are all ignored. For real validation use
+the [OME-NGFF validator](https://ome.github.io/ome-ngff-validator/).
 
 ## Installation
 
@@ -126,8 +164,8 @@ cargo clippy -- -D warnings  # lints, as CI runs them
 cargo fmt --check            # formatting, as CI runs it
 ```
 
-The suite is in two parts: 6 unit tests in `src/main.rs`, which cover metadata
-parsing directly, and 3 integration tests in `tests/cli.rs`, which run the
+The suite is in two parts: 9 unit tests in `src/main.rs`, which cover metadata
+parsing directly, and 4 integration tests in `tests/cli.rs`, which run the
 compiled binary against throwaway fixture stores and assert on what it prints.
 
 CI runs `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` on
@@ -144,6 +182,9 @@ every push and pull request.
   (the extension syntax) are not interpreted.
 - Sharding is not understood; a sharded array shows its declared chunk shape
   only.
+- OME-Zarr support goes no further than spotting image groups and showing their
+  version. No OME-NGFF validation, and no reading of axes, datasets, coordinate
+  transformations, `omero`, labels or plate/well metadata.
 - Symlinked directories are listed but not followed.
 
 ## Roadmap
@@ -153,8 +194,9 @@ Small, in roughly this order:
 1. A `--depth` flag for large stores.
 2. Show a node's user attributes when asked.
 3. Report V3 dtypes given in object form, instead of showing them as missing.
+4. Show an OME-Zarr image's axes alongside its version.
 
-Remote stores, OME-Zarr awareness and anything ecosystem-specific are out of
+Remote stores and anything beyond lightweight OME-Zarr recognition are out of
 scope for now.
 
 ## Why this project exists

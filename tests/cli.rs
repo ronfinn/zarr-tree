@@ -184,6 +184,68 @@ fn malformed_metadata_is_labelled_unknown_and_the_walk_continues() {
 }
 
 #[test]
+fn ome_zarr_image_group_is_tagged() {
+    let dir = fixture_dir("ome");
+    let root = dir.join("image.zarr");
+
+    // A Zarr V2 image group. `.zgroup` makes it a group; `.zattrs` beside it
+    // carries the OME-Zarr metadata, which in V2 sits at the top level with no
+    // `ome` namespace around it.
+    write_file(&root.join(".zgroup"), r#"{"zarr_format": 2}"#);
+    write_file(
+        &root.join(".zattrs"),
+        r#"{
+            "multiscales": [
+                {
+                    "version": "0.4",
+                    "axes": [{"name": "y", "type": "space"}, {"name": "x", "type": "space"}],
+                    "datasets": [
+                        {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": [1.0, 1.0]}]},
+                        {"path": "1", "coordinateTransformations": [{"type": "scale", "scale": [2.0, 2.0]}]}
+                    ]
+                }
+            ]
+        }"#,
+    );
+    // The two resolution levels, as ordinary V2 arrays.
+    write_file(
+        &root.join("0/.zarray"),
+        r#"{"zarr_format": 2, "shape": [1024, 1024], "chunks": [512, 512], "dtype": "<u2"}"#,
+    );
+    write_file(
+        &root.join("1/.zarray"),
+        r#"{"zarr_format": 2, "shape": [512, 512], "chunks": [512, 512], "dtype": "<u2"}"#,
+    );
+
+    let output = run(&[root.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert!(
+        output.status.success(),
+        "expected success, got {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lines = lines(&stdout);
+    for expected in [
+        // The tag is appended to the group label, version included.
+        "image.zarr [group, OME-Zarr 0.4]",
+        // The levels are still plain arrays, still carrying their metadata.
+        "0 [array]",
+        "1 [array]",
+        "shape: [1024, 1024]",
+        "shape: [512, 512]",
+        "chunks: [512, 512]",
+        "dtype: <u2",
+    ] {
+        assert!(has(&lines, expected), "missing {expected:?} in:\n{stdout}");
+    }
+}
+
+#[test]
 fn help_flag_prints_usage_and_exits_successfully() {
     let output = run(&["--help"]);
     let stdout = String::from_utf8_lossy(&output.stdout);

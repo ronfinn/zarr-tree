@@ -8,7 +8,10 @@ use serde_json::Value;
 
 /// What kind of Zarr node a directory is, as far as its metadata files reveal.
 enum NodeKind {
-    Group,
+    /// A Zarr group. The payload is the OME-Zarr tag -- `Some("OME-Zarr 0.4")`,
+    /// or `Some("OME-Zarr")` when no version could be read -- and is `None` for
+    /// an ordinary group. See `ome_tag`.
+    Group(Option<String>),
     Array(ArrayMeta),
     Unknown,
 }
@@ -41,13 +44,19 @@ OPTIONS:
     -V, --version    Print version";
 
 impl NodeKind {
-    /// The tag printed after a directory name. These strings are compiled into
-    /// the binary, so `'static` says the borrow never expires.
-    fn label(&self) -> &'static str {
+    /// The tag printed after a directory name.
+    ///
+    /// A group carrying OME-Zarr image metadata says so here, as
+    /// `[group, OME-Zarr 0.4]`. That text is built at run time from the version
+    /// found in the file, so this can no longer hand back a `&'static str`
+    /// borrowing a literal compiled into the binary: it returns an owned
+    /// `String` instead.
+    fn label(&self) -> String {
         match self {
-            NodeKind::Group => "[group]",
-            NodeKind::Array(_) => "[array]",
-            NodeKind::Unknown => "[unknown]",
+            NodeKind::Group(None) => String::from("[group]"),
+            NodeKind::Group(Some(tag)) => format!("[group, {tag}]"),
+            NodeKind::Array(_) => String::from("[array]"),
+            NodeKind::Unknown => String::from("[unknown]"),
         }
     }
 }
@@ -164,7 +173,7 @@ fn classify(dir: &Path) -> NodeKind {
     // Zarr V2 keeps the two node kinds in separate files, so the filename alone
     // answers the question -- no need to open anything.
     if dir.join(".zgroup").is_file() {
-        return NodeKind::Group;
+        return NodeKind::Group(ome_tag_v2(dir));
     }
     let zarray = dir.join(".zarray");
     if zarray.is_file() {
@@ -187,9 +196,62 @@ fn classify_v3(path: &Path) -> Option<NodeKind> {
     let value = read_json(path)?;
 
     match value.get("node_type")?.as_str()? {
-        "group" => Some(NodeKind::Group),
+        "group" => Some(NodeKind::Group(ome_tag_v3(&value))),
         "array" => Some(NodeKind::Array(array_meta_v3(&value))),
         _ => None,
+    }
+}
+
+/// Look for OME-Zarr image metadata beside a Zarr V2 `.zgroup`.
+///
+/// V2 keeps user attributes in a `.zattrs` file separate from `.zgroup`, so
+/// this is the one extra read the tag costs us. A `.zattrs` that is missing or
+/// unparseable simply means no tag.
+fn ome_tag_v2(dir: &Path) -> Option<String> {
+    let attrs = read_json(&dir.join(".zattrs"))?;
+
+    // V2 predates the `ome` namespace: the keys sit at the top level of
+    // `.zattrs`, and the version belongs to an individual multiscale rather
+    // than to the group. Real 0.4 stores often leave it out entirely.
+    let version = attrs
+        .get("multiscales")
+        .and_then(|value| value.as_array())
+        .and_then(|entries| entries.first())
+        .and_then(|first| first.get("version"));
+
+    ome_tag(&attrs, version)
+}
+
+/// Look for OME-Zarr image metadata in an already-parsed Zarr V3 `zarr.json`.
+///
+/// V3 keeps group attributes in that same file, so nothing extra is read here.
+/// The OME-Zarr keys live under a namespace of their own, version included.
+fn ome_tag_v3(value: &Value) -> Option<String> {
+    let ome = value.get("attributes")?.get("ome")?;
+    ome_tag(ome, ome.get("version"))
+}
+
+/// Build the tag appended to an OME-Zarr image group's label, or `None` if this
+/// is an ordinary Zarr group.
+///
+/// `ome` is whichever object holds the OME-Zarr keys -- the whole `.zattrs` for
+/// V2, `attributes.ome` for V3 -- and `version` is passed in separately because
+/// that is the only other thing the two layouts disagree about.
+fn ome_tag(ome: &Value, version: Option<&Value>) -> Option<String> {
+    // A `multiscales` key holding a non-empty array is what makes a group an
+    // image. Missing, the wrong JSON type, or empty all mean it is not one, and
+    // `?` turns the first two into `None` without any error handling of ours.
+    let multiscales = ome.get("multiscales")?.as_array()?;
+    if multiscales.is_empty() {
+        return None;
+    }
+
+    // Shown exactly as stored, and never checked against the versions we happen
+    // to know about: this tool reports metadata rather than validating it. A
+    // version that is absent, or is not a string, just leaves the tag bare.
+    match version.and_then(|value| value.as_str()) {
+        Some(version) => Some(format!("OME-Zarr {version}")),
+        None => Some(String::from("OME-Zarr")),
     }
 }
 
@@ -398,5 +460,61 @@ mod tests {
         assert_eq!(meta.shape, Some(String::from("[10]")));
         assert_eq!(meta.chunks, Some(String::from("[10]")));
         assert_eq!(meta.dtype, Some(String::from("<M8[ns]")));
+    }
+
+    #[test]
+    fn ome_version_is_read_from_v3_attributes() {
+        // A V3 image group: the OME-Zarr keys sit under their own `ome`
+        // namespace inside `attributes`, with the version alongside them.
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "ome": {
+                    "version": "0.5",
+                    "multiscales": [
+                        { "datasets": [{ "path": "0" }] }
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(ome_tag_v3(&value), Some(String::from("OME-Zarr 0.5")));
+    }
+
+    #[test]
+    fn ome_v2_multiscales_without_version_is_still_detected() {
+        let dir = env::temp_dir().join(format!("zarr-tree-test-ome-v2-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // A V2 image group, written the way real 0.4 stores often are: the keys
+        // at the top level of `.zattrs`, and no `version` anywhere. The group is
+        // still an OME-Zarr image, so it earns a tag -- just a bare one.
+        fs::write(
+            dir.join(".zattrs"),
+            r#"{"multiscales": [{"datasets": [{"path": "0"}]}]}"#,
+        )
+        .unwrap();
+
+        let tag = ome_tag_v2(&dir);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(tag, Some(String::from("OME-Zarr")));
+    }
+
+    #[test]
+    fn plain_group_is_not_ome_zarr() {
+        // Attributes are present, and so is the `ome` namespace, but there is no
+        // `multiscales` -- so this is not an image and gets no tag at all.
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "ome": { "version": "0.5" }
+            }
+        });
+
+        assert_eq!(ome_tag_v3(&value), None);
     }
 }
