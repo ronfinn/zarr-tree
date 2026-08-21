@@ -126,6 +126,10 @@ cargo clippy -- -D warnings  # lints, as CI runs them
 cargo fmt --check            # formatting, as CI runs it
 ```
 
+The suite is in two parts: 6 unit tests in `src/main.rs`, which cover metadata
+parsing directly, and 3 integration tests in `tests/cli.rs`, which run the
+compiled binary against throwaway fixture stores and assert on what it prints.
+
 CI runs `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` on
 every push and pull request.
 
@@ -141,8 +145,6 @@ every push and pull request.
 - Sharding is not understood; a sharded array shows its declared chunk shape
   only.
 - Symlinked directories are listed but not followed.
-- No integration tests yet — the tests in `src/main.rs` cover metadata parsing,
-  not the rendered tree.
 
 ## Roadmap
 
@@ -150,8 +152,7 @@ Small, in roughly this order:
 
 1. A `--depth` flag for large stores.
 2. Show a node's user attributes when asked.
-3. Integration tests over fixture stores that assert the rendered tree.
-4. Report V3 dtypes given in object form, instead of showing them as missing.
+3. Report V3 dtypes given in object form, instead of showing them as missing.
 
 Remote stores, OME-Zarr awareness and anything ecosystem-specific are out of
 scope for now.
