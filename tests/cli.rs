@@ -143,6 +143,13 @@ fn prints_a_zarr_tree_with_groups_arrays_and_metadata() {
     );
     assert!(!has(&lines, "c [unknown]"));
     assert!(!has(&lines, "0 [unknown]"));
+
+    // Nothing here carries OME-Zarr metadata, so the output is exactly what it
+    // was before axes existed.
+    assert!(
+        !stdout.contains("axes:"),
+        "a store with no OME-Zarr metadata should print no axes row:\n{stdout}"
+    );
 }
 
 #[test]
@@ -233,6 +240,9 @@ fn ome_zarr_image_group_is_tagged() {
     for expected in [
         // The tag is appended to the group label, version included.
         "image.zarr [group, OME-Zarr 0.4]",
+        // The axes this fixture's `.zattrs` declares, in the object form 0.4
+        // uses. The root is an image group, so its row sits at the top level.
+        "axes: y, x",
         // The levels are still plain arrays, still carrying their metadata.
         "0 [array]",
         "1 [array]",
@@ -243,6 +253,133 @@ fn ome_zarr_image_group_is_tagged() {
     ] {
         assert!(has(&lines, expected), "missing {expected:?} in:\n{stdout}");
     }
+}
+
+#[test]
+fn ome_zarr_axes_are_printed_above_the_datasets() {
+    let dir = fixture_dir("ome-axes");
+    let root = dir.join("dataset.zarr");
+
+    // A plain V3 group at the root, so the image group below it is reached
+    // through the recursive walk rather than as the root itself.
+    write_file(
+        &root.join("zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group"}"#,
+    );
+
+    // A Zarr V3 / OME-NGFF 0.5 image group: the OME-Zarr keys live under the
+    // `ome` namespace inside the group's own `zarr.json`.
+    write_file(
+        &root.join("image/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "ome": {
+                    "version": "0.5",
+                    "multiscales": [
+                        {
+                            "axes": [
+                                {"name": "c", "type": "channel"},
+                                {"name": "y", "type": "space", "unit": "micrometer"},
+                                {"name": "x", "type": "space", "unit": "micrometer"}
+                            ],
+                            "datasets": [
+                                {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": [1.0, 1.0, 1.0]}]}
+                            ]
+                        }
+                    ]
+                }
+            }
+        }"#,
+    );
+    write_file(
+        &root.join("image/0/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [2, 64, 64],
+            "chunk_grid": {
+                "name": "regular",
+                "configuration": { "chunk_shape": [1, 32, 32] }
+            },
+            "data_type": "uint16"
+        }"#,
+    );
+
+    // A second image group whose resolution levels are missing entirely -- a
+    // broken store, but a readable one. Sorted after "image", so it is the
+    // last child and its axes row has nothing below it.
+    write_file(
+        &root.join("orphan/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "ome": {
+                    "version": "0.5",
+                    "multiscales": [
+                        {
+                            "axes": [{"name": "y", "type": "space"}, {"name": "x", "type": "space"}],
+                            "datasets": [{"path": "0"}]
+                        }
+                    ]
+                }
+            }
+        }"#,
+    );
+
+    let output = run(&[root.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert!(
+        output.status.success(),
+        "expected success, got {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lines = lines(&stdout);
+    for expected in [
+        "image [group, OME-Zarr 0.5]",
+        "axes: c, y, x",
+        // The resolution level and its metadata are untouched by the new row.
+        "0 [array]",
+        "shape: [2, 64, 64]",
+        "chunks: [1, 32, 32]",
+        "dtype: uint16",
+    ] {
+        assert!(has(&lines, expected), "missing {expected:?} in:\n{stdout}");
+    }
+
+    // The row belongs to the group, so it comes before the group's children.
+    let axes_row = lines
+        .iter()
+        .position(|line| line.contains("axes: c, y, x"))
+        .expect("expected an axes row");
+    let dataset = lines
+        .iter()
+        .position(|line| line.contains("0 [array]"))
+        .expect("expected the resolution level");
+    assert!(
+        axes_row < dataset,
+        "the axes row should precede the datasets in:\n{stdout}"
+    );
+
+    // Indentation and connectors, checked against the undisturbed output:
+    // a nested group's row is indented under its parent and keeps the stem
+    // running down to the children below it.
+    assert!(
+        stdout.contains("│   ├─ axes: c, y, x"),
+        "expected a nested axes row with children following in:\n{stdout}"
+    );
+    // With no children below it, the row closes its branch instead.
+    assert!(
+        stdout.contains("    └─ axes: y, x"),
+        "expected a closing axes row on the childless group in:\n{stdout}"
+    );
 }
 
 #[test]

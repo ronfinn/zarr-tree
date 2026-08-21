@@ -31,6 +31,7 @@ example.zarr [group]
 - Stops descending at arrays, so chunk storage (a V3 `c/` directory, V2 chunk
   keys) does not clutter the output.
 - Recognises OME-Zarr image groups and tags them, e.g. `[group, OME-Zarr 0.4]`.
+- Shows an OME-Zarr image's axis names on one row, e.g. `axes: c, y, x`.
 - Degrades gracefully: metadata that cannot be read or parsed costs only that
   node's label or a single field, never the rest of the walk.
 
@@ -60,6 +61,7 @@ appended when one is recorded:
 ```
 $ zarr-tree image.zarr
 image.zarr [group, OME-Zarr 0.4]
+├─ axes: c, y, x
 ├── 0 [array]
 │   ├─ shape:  [2, 2048, 2048]
 │   ├─ chunks: [1, 512, 512]
@@ -81,6 +83,20 @@ The version is printed exactly as stored and is never checked against the
 versions that exist, so an unfamiliar one still shows. A group whose
 `multiscales` is present but carries no readable version is tagged
 `[group, OME-Zarr]`.
+
+Axis names come from the first `multiscales` entry's `axes`, whose form changed
+over the course of the specification:
+
+| OME-Zarr | `axes` |
+| --- | --- |
+| 0.1, 0.2 | no `axes` field |
+| 0.3 | a list of names, `["c", "y", "x"]` |
+| 0.4, 0.5 | a list of objects, `{"name": "y", "type": "space", "unit": "micrometer"}` |
+
+Both forms are read, and only `name` is displayed. An entry whose name cannot be
+read shows as `?`, so the number of axes always matches the number the file
+declares. Axes that are absent, empty or not a list print no row at all —
+nothing is inferred from an array's dimensionality.
 
 This is **recognition, not validation**. Nothing here checks a store against the
 OME-NGFF specification: axes, datasets, coordinate transformations, `omero`
@@ -164,8 +180,8 @@ cargo clippy -- -D warnings  # lints, as CI runs them
 cargo fmt --check            # formatting, as CI runs it
 ```
 
-The suite is in two parts: 9 unit tests in `src/main.rs`, which cover metadata
-parsing directly, and 4 integration tests in `tests/cli.rs`, which run the
+The suite is in two parts: 13 unit tests in `src/main.rs`, which cover metadata
+parsing directly, and 5 integration tests in `tests/cli.rs`, which run the
 compiled binary against throwaway fixture stores and assert on what it prints.
 
 CI runs `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` on
@@ -182,9 +198,10 @@ every push and pull request.
   (the extension syntax) are not interpreted.
 - Sharding is not understood; a sharded array shows its declared chunk shape
   only.
-- OME-Zarr support goes no further than spotting image groups and showing their
-  version. No OME-NGFF validation, and no reading of axes, datasets, coordinate
-  transformations, `omero`, labels or plate/well metadata.
+- OME-Zarr support goes no further than spotting image groups, showing their
+  version and listing their axis names. Axis `type` and `unit` are not shown,
+  nothing is validated (axis names, ordering or count), and datasets, coordinate
+  transformations, `omero`, labels and plate/well metadata are not read.
 - Symlinked directories are listed but not followed.
 
 ## Roadmap
@@ -194,7 +211,6 @@ Small, in roughly this order:
 1. A `--depth` flag for large stores.
 2. Show a node's user attributes when asked.
 3. Report V3 dtypes given in object form, instead of showing them as missing.
-4. Show an OME-Zarr image's axes alongside its version.
 
 Remote stores and anything beyond lightweight OME-Zarr recognition are out of
 scope for now.

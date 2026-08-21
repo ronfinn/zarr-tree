@@ -8,10 +8,9 @@ use serde_json::Value;
 
 /// What kind of Zarr node a directory is, as far as its metadata files reveal.
 enum NodeKind {
-    /// A Zarr group. The payload is the OME-Zarr tag -- `Some("OME-Zarr 0.4")`,
-    /// or `Some("OME-Zarr")` when no version could be read -- and is `None` for
-    /// an ordinary group. See `ome_tag`.
-    Group(Option<String>),
+    /// A Zarr group. The payload describes an OME-Zarr image, and is `None`
+    /// for an ordinary group. See `ome_info`.
+    Group(Option<OmeInfo>),
     Array(ArrayMeta),
     Unknown,
 }
@@ -23,6 +22,20 @@ struct ArrayMeta {
     shape: Option<String>,
     chunks: Option<String>,
     dtype: Option<String>,
+}
+
+/// What an OME-Zarr image group carries, already formatted for printing -- the
+/// same approach `ArrayMeta` takes for shape, chunks and dtype.
+///
+/// The `Option` sits outside this struct rather than around `tag`: a group
+/// either is an OME-Zarr image, in which case it always has a tag, or it is an
+/// ordinary group and there is nothing here at all.
+struct OmeInfo {
+    /// The label tag: "OME-Zarr 0.5", or "OME-Zarr" when no version was read.
+    tag: String,
+    /// The axes row, e.g. "c, z, y, x". `None` when the metadata carries no
+    /// axes (OME-NGFF 0.1 and 0.2) or we could not read them.
+    axes: Option<String>,
 }
 
 /// The text printed by `--help`.
@@ -54,7 +67,7 @@ impl NodeKind {
     fn label(&self) -> String {
         match self {
             NodeKind::Group(None) => String::from("[group]"),
-            NodeKind::Group(Some(tag)) => format!("[group, {tag}]"),
+            NodeKind::Group(Some(ome)) => format!("[group, {}]", ome.tag),
             NodeKind::Array(_) => String::from("[array]"),
             NodeKind::Unknown => String::from("[unknown]"),
         }
@@ -114,7 +127,7 @@ fn main() {
     match &root_kind {
         NodeKind::Array(meta) => print_array_meta(meta, ""),
         _ => {
-            if let Err(e) = print_tree(root, "") {
+            if let Err(e) = print_tree(root, "", group_axes(&root_kind)) {
                 eprintln!("error: {e}");
                 process::exit(1);
             }
@@ -123,7 +136,11 @@ fn main() {
 }
 
 /// Print the directories inside `dir`, one line each, indented by `prefix`.
-fn print_tree(dir: &Path, prefix: &str) -> io::Result<()> {
+///
+/// `axes` is `dir`'s own axes row, if it has one. It is printed here rather
+/// than by the caller because this is the one place that already knows whether
+/// any children follow it, which is what decides the connector.
+fn print_tree(dir: &Path, prefix: &str, axes: Option<&str>) -> io::Result<()> {
     // Collect first: read_dir returns entries in arbitrary order, and we need
     // to know which child is last before we can draw its connector.
     let mut subdirs: Vec<PathBuf> = Vec::new();
@@ -136,6 +153,17 @@ fn print_tree(dir: &Path, prefix: &str) -> io::Result<()> {
         }
     }
     subdirs.sort();
+
+    // This directory's own metadata, above its children. Metadata rows keep
+    // the shorter two-dash stem that tells them apart from node rows.
+    if let Some(axes) = axes {
+        let connector = if subdirs.is_empty() {
+            "└─ "
+        } else {
+            "├─ "
+        };
+        println!("{prefix}{connector}axes: {axes}");
+    }
 
     for (i, path) in subdirs.iter().enumerate() {
         let is_last = i == subdirs.len() - 1;
@@ -156,7 +184,7 @@ fn print_tree(dir: &Path, prefix: &str) -> io::Result<()> {
         // structure worth showing. The metadata rows go there instead.
         match &kind {
             NodeKind::Array(meta) => print_array_meta(meta, &child_prefix),
-            _ => print_tree(path, &child_prefix)?,
+            _ => print_tree(path, &child_prefix, group_axes(&kind))?,
         }
     }
 
@@ -173,7 +201,7 @@ fn classify(dir: &Path) -> NodeKind {
     // Zarr V2 keeps the two node kinds in separate files, so the filename alone
     // answers the question -- no need to open anything.
     if dir.join(".zgroup").is_file() {
-        return NodeKind::Group(ome_tag_v2(dir));
+        return NodeKind::Group(ome_info_v2(dir));
     }
     let zarray = dir.join(".zarray");
     if zarray.is_file() {
@@ -196,7 +224,7 @@ fn classify_v3(path: &Path) -> Option<NodeKind> {
     let value = read_json(path)?;
 
     match value.get("node_type")?.as_str()? {
-        "group" => Some(NodeKind::Group(ome_tag_v3(&value))),
+        "group" => Some(NodeKind::Group(ome_info_v3(&value))),
         "array" => Some(NodeKind::Array(array_meta_v3(&value))),
         _ => None,
     }
@@ -207,7 +235,7 @@ fn classify_v3(path: &Path) -> Option<NodeKind> {
 /// V2 keeps user attributes in a `.zattrs` file separate from `.zgroup`, so
 /// this is the one extra read the tag costs us. A `.zattrs` that is missing or
 /// unparseable simply means no tag.
-fn ome_tag_v2(dir: &Path) -> Option<String> {
+fn ome_info_v2(dir: &Path) -> Option<OmeInfo> {
     let attrs = read_json(&dir.join(".zattrs"))?;
 
     // V2 predates the `ome` namespace: the keys sit at the top level of
@@ -219,39 +247,56 @@ fn ome_tag_v2(dir: &Path) -> Option<String> {
         .and_then(|entries| entries.first())
         .and_then(|first| first.get("version"));
 
-    ome_tag(&attrs, version)
+    ome_info(&attrs, version)
 }
 
 /// Look for OME-Zarr image metadata in an already-parsed Zarr V3 `zarr.json`.
 ///
 /// V3 keeps group attributes in that same file, so nothing extra is read here.
 /// The OME-Zarr keys live under a namespace of their own, version included.
-fn ome_tag_v3(value: &Value) -> Option<String> {
+fn ome_info_v3(value: &Value) -> Option<OmeInfo> {
     let ome = value.get("attributes")?.get("ome")?;
-    ome_tag(ome, ome.get("version"))
+    ome_info(ome, ome.get("version"))
 }
 
-/// Build the tag appended to an OME-Zarr image group's label, or `None` if this
-/// is an ordinary Zarr group.
+/// Collect what we display about an OME-Zarr image group, or `None` if this is
+/// an ordinary Zarr group.
 ///
 /// `ome` is whichever object holds the OME-Zarr keys -- the whole `.zattrs` for
 /// V2, `attributes.ome` for V3 -- and `version` is passed in separately because
 /// that is the only other thing the two layouts disagree about.
-fn ome_tag(ome: &Value, version: Option<&Value>) -> Option<String> {
+fn ome_info(ome: &Value, version: Option<&Value>) -> Option<OmeInfo> {
     // A `multiscales` key holding a non-empty array is what makes a group an
-    // image. Missing, the wrong JSON type, or empty all mean it is not one, and
-    // `?` turns the first two into `None` without any error handling of ours.
-    let multiscales = ome.get("multiscales")?.as_array()?;
-    if multiscales.is_empty() {
-        return None;
-    }
+    // image. Missing, the wrong JSON type, or empty all mean it is not one:
+    // `?` handles the first two without any error handling of ours, and
+    // `first()` the third.
+    let first = ome.get("multiscales")?.as_array()?.first()?;
 
     // Shown exactly as stored, and never checked against the versions we happen
     // to know about: this tool reports metadata rather than validating it. A
     // version that is absent, or is not a string, just leaves the tag bare.
-    match version.and_then(|value| value.as_str()) {
-        Some(version) => Some(format!("OME-Zarr {version}")),
-        None => Some(String::from("OME-Zarr")),
+    let tag = match version.and_then(|value| value.as_str()) {
+        Some(version) => format!("OME-Zarr {version}"),
+        None => String::from("OME-Zarr"),
+    };
+
+    // Axes belong to an individual multiscale rather than to the group, so they
+    // come from that same first entry in both layouts -- the one part of this
+    // metadata V2 and V3 already agree about.
+    Some(OmeInfo {
+        tag,
+        axes: format_axes(first.get("axes")),
+    })
+}
+
+/// The axes row for a node, if it is an OME-Zarr image group that had one.
+///
+/// Hands back a borrow rather than a copy: the row is only being printed, so
+/// there is no reason to clone the string out of the `NodeKind`.
+fn group_axes(kind: &NodeKind) -> Option<&str> {
+    match kind {
+        NodeKind::Group(Some(ome)) => ome.axes.as_deref(),
+        _ => None,
     }
 }
 
@@ -316,6 +361,35 @@ fn format_dims(value: Option<&Value>) -> Option<String> {
     let items = value?.as_array()?;
     let dims: Vec<String> = items.iter().map(|item| item.to_string()).collect();
     Some(format!("[{}]", dims.join(", ")))
+}
+
+/// Render a `multiscales` entry's `axes` as `c, z, y, x`, or `None` when there
+/// is nothing to show.
+///
+/// Both spellings are handled in one pass: OME-NGFF 0.3 stores each axis as a
+/// bare dimension name, 0.4 and 0.5 as an object with a `name`. Only the name
+/// is read -- `type` and `unit` are not displayed.
+///
+/// An entry we cannot read a name from becomes `?` rather than being dropped,
+/// so the number of axes shown always matches the number the file declares.
+fn format_axes(value: Option<&Value>) -> Option<String> {
+    let items = value?.as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+
+    let names: Vec<&str> = items
+        .iter()
+        .map(|item| {
+            // Try the 0.3 form, then the 0.4/0.5 form, then give up on this
+            // one entry alone.
+            item.as_str()
+                .or_else(|| item.get("name").and_then(|name| name.as_str()))
+                .unwrap_or("?")
+        })
+        .collect();
+
+    Some(names.join(", "))
 }
 
 /// Print the metadata rows that sit underneath an array line.
@@ -465,7 +539,8 @@ mod tests {
     #[test]
     fn ome_version_is_read_from_v3_attributes() {
         // A V3 image group: the OME-Zarr keys sit under their own `ome`
-        // namespace inside `attributes`, with the version alongside them.
+        // namespace inside `attributes`, with the version alongside them. The
+        // axes belong to the multiscale rather than to the group.
         let value = json!({
             "zarr_format": 3,
             "node_type": "group",
@@ -473,13 +548,23 @@ mod tests {
                 "ome": {
                     "version": "0.5",
                     "multiscales": [
-                        { "datasets": [{ "path": "0" }] }
+                        {
+                            "axes": [
+                                { "name": "c", "type": "channel" },
+                                { "name": "y", "type": "space", "unit": "micrometer" },
+                                { "name": "x", "type": "space", "unit": "micrometer" }
+                            ],
+                            "datasets": [{ "path": "0" }]
+                        }
                     ]
                 }
             }
         });
 
-        assert_eq!(ome_tag_v3(&value), Some(String::from("OME-Zarr 0.5")));
+        let info = ome_info_v3(&value).expect("a V3 image group should be recognised");
+
+        assert_eq!(info.tag, "OME-Zarr 0.5");
+        assert_eq!(info.axes, Some(String::from("c, y, x")));
     }
 
     #[test]
@@ -496,11 +581,14 @@ mod tests {
         )
         .unwrap();
 
-        let tag = ome_tag_v2(&dir);
+        let info = ome_info_v2(&dir);
 
         fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(tag, Some(String::from("OME-Zarr")));
+        let info = info.expect("multiscales alone should make this an image group");
+        assert_eq!(info.tag, "OME-Zarr");
+        // That fixture carries no axes, so there is no row to print.
+        assert_eq!(info.axes, None);
     }
 
     #[test]
@@ -515,6 +603,59 @@ mod tests {
             }
         });
 
-        assert_eq!(ome_tag_v3(&value), None);
+        assert!(ome_info_v3(&value).is_none());
+    }
+
+    #[test]
+    fn axes_are_read_from_the_0_3_string_form() {
+        // OME-NGFF 0.3 stores each axis as a bare dimension name.
+        let value = json!(["c", "y", "x"]);
+
+        assert_eq!(format_axes(Some(&value)), Some(String::from("c, y, x")));
+    }
+
+    #[test]
+    fn axes_are_read_from_the_0_4_object_form() {
+        // 0.4 and 0.5 store an object per axis instead. Only `name` is read,
+        // so the result is the very same string the 0.3 form produces above --
+        // which is the whole point of formatting them in one place.
+        let value = json!([
+            { "name": "c", "type": "channel" },
+            { "name": "y", "type": "space", "unit": "micrometer" },
+            { "name": "x", "type": "space", "unit": "micrometer" }
+        ]);
+
+        assert_eq!(format_axes(Some(&value)), Some(String::from("c, y, x")));
+    }
+
+    #[test]
+    fn an_unreadable_axis_entry_keeps_its_place() {
+        // The middle entry has no `name`. Dropping it would report a
+        // three-dimensional image as two-dimensional, so it becomes `?` and
+        // the number of axes still matches what the file declares.
+        let value = json!([
+            { "name": "y" },
+            { "type": "space" },
+            { "name": "x" }
+        ]);
+
+        assert_eq!(format_axes(Some(&value)), Some(String::from("y, ?, x")));
+    }
+
+    #[test]
+    fn axes_with_nothing_to_show_produce_no_row() {
+        // Three ways of having no axes to display, and one rule for all of
+        // them: print no row, and never guess one from the arrays.
+
+        // No axes key at all -- OME-NGFF 0.1 and 0.2.
+        assert_eq!(format_axes(None), None);
+
+        // Present, but nothing we can walk over.
+        let not_an_array = json!("tczyx");
+        assert_eq!(format_axes(Some(&not_an_array)), None);
+
+        // Present and walkable, but empty.
+        let empty = json!([]);
+        assert_eq!(format_axes(Some(&empty)), None);
     }
 }
