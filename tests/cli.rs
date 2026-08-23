@@ -529,7 +529,7 @@ fn spatialdata_root_is_tagged_from_metadata_not_from_directory_names() {
 
     // The element containers of a real store carry no attributes at all,
     // which is exactly why their names cannot be what tags them.
-    let containers = ["images", "points", "shapes", "tables"];
+    let containers = ["images", "labels", "points", "shapes", "tables"];
     for container in containers {
         write_file(
             &store.join(container).join("zarr.json"),
@@ -537,9 +537,10 @@ fn spatialdata_root_is_tagged_from_metadata_not_from_directory_names() {
         );
     }
 
-    // An image element: an ordinary OME-Zarr group that happens to live in a
-    // SpatialData store. It carries a `spatialdata_attrs` of its own, holding
-    // only its own encoding version, and must not be taken for a second root.
+    // An image element: an OME-Zarr group that also carries SpatialData's
+    // mark, a `spatialdata_attrs` holding only its own encoding version. That
+    // pairing is what makes it an element; it must not be taken for a second
+    // store root, and its OME-Zarr rows must survive being classified.
     write_file(
         &store.join("images/morphology/zarr.json"),
         r#"{
@@ -574,6 +575,78 @@ fn spatialdata_root_is_tagged_from_metadata_not_from_directory_names() {
                 "configuration": { "chunk_shape": [1, 512, 512] }
             },
             "data_type": "uint16"
+        }"#,
+    );
+
+    // A labels element, alike in every way this tool reads except for the
+    // `image-label` object beside its `multiscales`. That key is the whole
+    // difference between the two rasters; the `labels/` directory it sits in
+    // is not consulted.
+    write_file(
+        &store.join("labels/nuclei/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "ome": {
+                    "version": "0.5-dev-spatialdata",
+                    "image-label": { "version": "0.5" },
+                    "multiscales": [
+                        {
+                            "axes": [
+                                { "name": "y", "type": "space" },
+                                { "name": "x", "type": "space" }
+                            ],
+                            "datasets": [{ "path": "s0" }]
+                        }
+                    ]
+                },
+                "spatialdata_attrs": { "version": "0.3" }
+            }
+        }"#,
+    );
+
+    // A table element, with the two keys a real one carries: AnnData's own,
+    // and SpatialData's beside it.
+    write_file(
+        &store.join("tables/table/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "encoding-type": "anndata",
+                "encoding-version": "0.1.0",
+                "spatialdata-encoding-type": "ngff:regions_table",
+                "region": "nuclei",
+                "region_key": "region",
+                "instance_key": "instance_id",
+                "version": "0.2"
+            }
+        }"#,
+    );
+    // Two nodes from inside that table's AnnData subtree. Recognising the
+    // table does not stop the walk: it is still an ordinary Zarr hierarchy,
+    // and the group above says nothing about what is or is not worth showing
+    // below it. Collapsing it would be a separate decision from naming it.
+    write_file(
+        &store.join("tables/table/obs/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": { "encoding-type": "dataframe", "encoding-version": "0.2.0" }
+        }"#,
+    );
+    write_file(
+        &store.join("tables/table/X/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [8, 4],
+            "chunk_grid": {
+                "name": "regular",
+                "configuration": { "chunk_shape": [8, 4] }
+            },
+            "data_type": "float32"
         }"#,
     );
 
@@ -613,18 +686,29 @@ fn spatialdata_root_is_tagged_from_metadata_not_from_directory_names() {
         "experiment.zarr [group, SpatialData 0.2]",
         // The containers, untagged, because their metadata says nothing.
         "images [group]",
+        "labels [group]",
         "points [group]",
         "shapes [group]",
         "tables [group]",
-        // And the OME-Zarr output, exactly as it was before any of this.
-        "morphology [group, OME-Zarr 0.5-dev-spatialdata]",
+        // The two rasters, told apart by their metadata alone. Both keep
+        // every OME-Zarr row they had before they were classified.
+        "morphology [group, OME-Zarr 0.5-dev-spatialdata, SpatialData image]",
+        "nuclei [group, OME-Zarr 0.5-dev-spatialdata, SpatialData labels]",
         "axes: c, y, x",
+        "axes: y, x",
         "pyramid levels: 1",
         "datasets: s0",
         "s0 [array]",
         "shape: [4, 2048, 2048]",
         "chunks: [1, 512, 512]",
         "dtype: uint16",
+        // The table, named but not collapsed: its AnnData subtree is still an
+        // ordinary Zarr hierarchy and is still walked.
+        "table [group, SpatialData table]",
+        "obs [group]",
+        "X [array]",
+        "shape: [8, 4]",
+        "dtype: float32",
     ] {
         assert!(
             has(&store_lines, expected),
@@ -632,13 +716,13 @@ fn spatialdata_root_is_tagged_from_metadata_not_from_directory_names() {
         );
     }
 
-    // Once, on the root, and nowhere else: not on the containers whose names
-    // match the element types, and not on the image element that carries a
-    // `spatialdata_attrs` of its own.
+    // The root, its two rasters and its table, and nothing else: not the
+    // containers whose names match the element types, not the arrays below
+    // the rasters, and not the AnnData nodes below the table.
     assert_eq!(
         store_stdout.matches("SpatialData").count(),
-        1,
-        "the SpatialData tag belongs on the root alone:\n{store_stdout}"
+        4,
+        "expected the root and its three elements to be tagged:\n{store_stdout}"
     );
 
     // The same tree, without the marker, is just a Zarr store.

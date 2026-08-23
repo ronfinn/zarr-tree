@@ -17,9 +17,10 @@ enum NodeKind {
 /// What a group's attributes say about it, already formatted for printing --
 /// the same approach `ArrayMeta` takes for shape, chunks and dtype.
 ///
-/// The two fields are independent facts, read from two unrelated keys by two
-/// conventions that know nothing about each other. A group may carry either,
-/// both, or -- as almost every group does -- neither.
+/// The two fields are independent facts, read by two conventions that know
+/// nothing about each other. A group may carry either, both, or -- as almost
+/// every group does -- neither. A SpatialData raster element carries both, and
+/// each field is still read on its own terms.
 struct GroupMeta {
     /// Set when the group carries OME-Zarr image metadata. See `ome_info`.
     ome: Option<OmeInfo>,
@@ -37,8 +38,8 @@ struct GroupMeta {
 /// would: most of the combinations two or three of those could represent
 /// cannot occur.
 ///
-/// Which one it is comes from two unrelated markers -- see `spatialdata_info`
-/// -- but the answer is always a single value.
+/// Which one it is comes from three unrelated markers -- see
+/// `spatialdata_info` -- but the answer is always a single value.
 ///
 /// [SpatialData]: https://spatialdata.scverse.org/
 enum SpatialData {
@@ -50,6 +51,14 @@ enum SpatialData {
     Points,
     /// A shapes element: cell boundaries, circles, landmarks.
     Shapes,
+    /// A table element: an AnnData annotation table over the regions of
+    /// another element.
+    Table,
+    /// A raster image element: microscopy, morphology. See
+    /// `spatialdata_raster_element`.
+    Image,
+    /// A raster segmentation element: one integer label per pixel.
+    Labels,
 }
 
 impl SpatialData {
@@ -67,6 +76,9 @@ impl SpatialData {
             SpatialData::Root(None) => String::from("SpatialData"),
             SpatialData::Points => String::from("SpatialData points"),
             SpatialData::Shapes => String::from("SpatialData shapes"),
+            SpatialData::Table => String::from("SpatialData table"),
+            SpatialData::Image => String::from("SpatialData image"),
+            SpatialData::Labels => String::from("SpatialData labels"),
         }
     }
 }
@@ -399,30 +411,42 @@ fn ome_info(ome: &Value, version: Option<&Value>) -> Option<OmeInfo> {
 /// reading each fact where that fact is explained costs less confusion than it
 /// costs microseconds.
 fn spatialdata_info_v2(dir: &Path) -> Option<SpatialData> {
-    spatialdata_info(&read_json(&dir.join(".zattrs"))?)
+    let attrs = read_json(&dir.join(".zattrs"))?;
+    // V2 predates the `ome` namespace, so the OME-Zarr keys sit at the top
+    // level of `.zattrs` alongside SpatialData's own -- the two objects this
+    // function has to tell apart are, here, one and the same.
+    spatialdata_info(&attrs, Some(&attrs))
 }
 
 /// Look for SpatialData metadata in an already-parsed Zarr V3 `zarr.json`.
 ///
 /// V3 keeps group attributes in that same file, so nothing extra is read here.
 fn spatialdata_info_v3(value: &Value) -> Option<SpatialData> {
-    spatialdata_info(value.get("attributes")?)
+    let attrs = value.get("attributes")?;
+    // V3 keeps the OME-Zarr keys in a namespace of their own. A group with no
+    // `ome` key is simply not a raster, which `spatialdata_raster_element`
+    // handles as the `None` it is handed.
+    spatialdata_info(attrs, attrs.get("ome"))
 }
 
 /// What a group says about itself in SpatialData's vocabulary, or `None` when
 /// it says nothing.
 ///
 /// `attrs` is whichever object holds the group's attributes -- the whole
-/// `.zattrs` for V2, `attributes` for V3 -- the same split `ome_info` handles.
+/// `.zattrs` for V2, `attributes` for V3 -- and `ome` is whichever object
+/// inside it holds the OME-Zarr keys, which is `attrs` itself in V2 and
+/// `attrs.ome` in V3. That is the same split `ome_info` handles, and it is
+/// passed in separately for the same reason: it is the one thing the two
+/// layouts disagree about.
 ///
 /// [SpatialData] keeps a spatial omics experiment in a Zarr container: images,
 /// segmentation masks, transcript locations, geometries and annotation tables,
 /// all in one store.
 ///
-/// Two independent markers are read, in two different keys, and a group is
+/// Three independent markers are read, in three different keys, and a group is
 /// only ever one of them. They are tried in order, so a group that somehow
-/// carried both would be reported as the first that matched -- the store root
-/// before anything inside a store.
+/// carried more than one would be reported as the first that matched -- the
+/// store root before anything inside a store.
 ///
 /// Nothing here looks at directory names. In a real store the `images`,
 /// `points`, `shapes` and `tables` groups carry no attributes at all, so a
@@ -431,8 +455,10 @@ fn spatialdata_info_v3(value: &Value) -> Option<SpatialData> {
 /// SpatialData store.
 ///
 /// [SpatialData]: https://spatialdata.scverse.org/
-fn spatialdata_info(attrs: &Value) -> Option<SpatialData> {
-    spatialdata_root(attrs).or_else(|| spatialdata_encoded_element(attrs))
+fn spatialdata_info(attrs: &Value, ome: Option<&Value>) -> Option<SpatialData> {
+    spatialdata_root(attrs)
+        .or_else(|| spatialdata_encoded_element(attrs))
+        .or_else(|| spatialdata_raster_element(attrs, ome))
 }
 
 /// The root of a SpatialData store, or `None` when this group is not one.
@@ -477,10 +503,17 @@ fn spatialdata_root(attrs: &Value) -> Option<SpatialData> {
 /// recognition needs no per-version handling: what changed between format
 /// versions is where the *payload* lives, and no payload is read.
 ///
-/// The kind is read from `encoding-type`, and matched exactly -- never by
-/// prefix, and never by the mere presence of the key. That key is not ours
-/// alone: AnnData writes it too, with values of its own such as `"anndata"`
-/// and `"dataframe"`, and none of those is a SpatialData element.
+/// Two key names carry it, for a historical reason rather than a semantic
+/// one. Points and shapes use `encoding-type`; a table's group is written by
+/// AnnData, which claims that key for its own `"anndata"`, so SpatialData
+/// records the kind one key over. One list of values is tried under both
+/// names: they are drawn from a single namespace, no store writes them
+/// crosswise, and a kind added later needs adding in one place.
+///
+/// Each value is matched exactly, never by prefix or by the mere presence of
+/// a key. AnnData writes `encoding-type` throughout the subtree beneath a
+/// table -- `"dataframe"`, `"csr_matrix"`, `"array"` -- and none of those is a
+/// SpatialData element.
 ///
 /// An element carries no version in its tag, so nothing is read here beyond
 /// this one string. What it does carry -- axis names, a feature key, an
@@ -488,6 +521,7 @@ fn spatialdata_root(attrs: &Value) -> Option<SpatialData> {
 /// version does not display.
 fn spatialdata_encoded_element(attrs: &Value) -> Option<SpatialData> {
     encoded_kind(attrs, "encoding-type")
+        .or_else(|| encoded_kind(attrs, "spatialdata-encoding-type"))
 }
 
 /// The element kind named by `key`, or `None` when it names nothing we know.
@@ -495,7 +529,50 @@ fn encoded_kind(attrs: &Value, key: &str) -> Option<SpatialData> {
     match attrs.get(key)?.as_str()? {
         "ngff:points" => Some(SpatialData::Points),
         "ngff:shapes" => Some(SpatialData::Shapes),
+        "ngff:regions_table" => Some(SpatialData::Table),
         _ => None,
+    }
+}
+
+/// A raster element inside a SpatialData store, or `None` when this group is
+/// not one.
+///
+/// Rasters name themselves nowhere: SpatialData writes them through the
+/// OME-Zarr writers, which have no `encoding-type` of their own, so both
+/// halves of this answer come from somewhere else.
+///
+/// *That* it is a SpatialData element comes from `spatialdata_attrs`. Every
+/// raster SpatialData writes gets one, holding the version of its own
+/// encoding. On its own that object is weak evidence -- `spatialdata_root`
+/// explains why it is not enough to prove a store root -- but paired with
+/// OME-Zarr image metadata it is what separates an element of a store from an
+/// ordinary OME-Zarr image that has nothing to do with SpatialData. Without
+/// it, every microscopy image ever written would be reported as a SpatialData
+/// element.
+///
+/// *Which* raster it is comes from OME-Zarr. A segmentation is a multiscale
+/// image like any other, distinguished only by an `image-label` object beside
+/// its `multiscales`, which describes the colours and properties of the label
+/// values. Read here for its presence alone: nothing inside it is displayed,
+/// and no label value is ever looked at.
+///
+/// The specification says a label image SHOULD carry that key, not MUST, so a
+/// segmentation that omits it is reported as an image. Reporting what the
+/// metadata declares is this tool's rule, and the alternative would be to
+/// guess from the `labels/` directory name.
+fn spatialdata_raster_element(attrs: &Value, ome: Option<&Value>) -> Option<SpatialData> {
+    // SpatialData's mark on an element it wrote. Required to be an object, so
+    // that a `spatialdata_attrs` holding a string or a number proves nothing.
+    attrs.get("spatialdata_attrs")?.as_object()?;
+
+    // And the OME-Zarr metadata that makes it a raster, tested exactly as
+    // `ome_info` tests it: a `multiscales` key holding a non-empty array.
+    let ome = ome?;
+    ome.get("multiscales")?.as_array()?.first()?;
+
+    match ome.get("image-label") {
+        Some(_) => Some(SpatialData::Labels),
+        None => Some(SpatialData::Image),
     }
 }
 
@@ -1024,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn element_spatialdata_attrs_do_not_make_a_root() {
+    fn an_image_element_is_not_mistaken_for_a_store_root() {
         // An image element from inside a store. It carries a
         // `spatialdata_attrs` of its own -- as every image, label, point and
         // shape element does -- holding only the version of its own encoding.
@@ -1047,11 +1124,138 @@ mod tests {
             }
         });
 
-        assert!(spatialdata_info_v3(&value).is_none());
+        // Reported as the element it is, and never with a version: a bare
+        // "SpatialData 0.3" here would read as a second store nested inside
+        // the first.
+        assert_eq!(
+            spatialdata_info_v3(&value).map(|info| info.tag()),
+            Some(String::from("SpatialData image"))
+        );
 
-        // Withholding the one tag leaves the other untouched: this is still
-        // the OME-Zarr image it says it is.
+        // And the OME-Zarr reading is untouched: this is still the image it
+        // says it is, with all its rows.
         assert!(ome_info_v3(&value).is_some());
+    }
+
+    #[test]
+    fn a_labels_element_is_told_from_an_image_by_its_ome_metadata() {
+        // Two raster elements from the same store, alike in every way this
+        // tool reads except one: the segmentation carries an `image-label`
+        // object beside its `multiscales`. That key, and not the `labels/`
+        // directory it happens to sit in, is the whole distinction.
+        let attributes = |extra: Value| {
+            let mut ome = json!({
+                "version": "0.5-dev-spatialdata",
+                "multiscales": [
+                    {
+                        "axes": [{ "name": "y" }, { "name": "x" }],
+                        "datasets": [{ "path": "scale0" }]
+                    }
+                ]
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                ome[key] = value.clone();
+            }
+            json!({
+                "zarr_format": 3,
+                "node_type": "group",
+                "attributes": {
+                    "ome": ome,
+                    "spatialdata_attrs": { "version": "0.3" }
+                }
+            })
+        };
+
+        let image = attributes(json!({}));
+        let labels = attributes(json!({ "image-label": { "version": "0.5" } }));
+
+        assert_eq!(
+            spatialdata_info_v3(&image).map(|info| info.tag()),
+            Some(String::from("SpatialData image"))
+        );
+        assert_eq!(
+            spatialdata_info_v3(&labels).map(|info| info.tag()),
+            Some(String::from("SpatialData labels"))
+        );
+
+        // Both are OME-Zarr images as far as the rest of the tool cares, so
+        // neither loses a row for being classified.
+        assert!(ome_info_v3(&image).is_some());
+        assert!(ome_info_v3(&labels).is_some());
+    }
+
+    #[test]
+    fn a_plain_ome_zarr_image_is_not_a_spatialdata_element() {
+        // The same multiscale metadata, without SpatialData's mark on it: an
+        // ordinary microscopy image that has nothing to do with SpatialData.
+        // Classifying rasters from OME-Zarr alone would tag every one of them.
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "ome": {
+                    "version": "0.5",
+                    "multiscales": [
+                        {
+                            "axes": [{ "name": "y" }, { "name": "x" }],
+                            "datasets": [{ "path": "0" }]
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert!(spatialdata_info_v3(&value).is_none());
+        assert!(ome_info_v3(&value).is_some());
+    }
+
+    #[test]
+    fn a_raster_element_is_read_from_a_v2_zattrs_file() {
+        let dir = env::temp_dir().join(format!("zarr-tree-test-sd-labels-v2-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // A Zarr V2 segmentation. V2 predates the `ome` namespace, so
+        // `image-label` and `multiscales` sit at the top level of `.zattrs`
+        // beside `spatialdata_attrs` -- which is the whole reason the two
+        // objects are passed separately.
+        fs::write(dir.join(".zgroup"), r#"{"zarr_format": 2}"#).unwrap();
+        fs::write(
+            dir.join(".zattrs"),
+            r#"{
+                "image-label": {"version": "0.4"},
+                "multiscales": [{"version": "0.4", "datasets": [{"path": "0"}]}],
+                "spatialdata_attrs": {"version": "0.2"}
+            }"#,
+        )
+        .unwrap();
+
+        let info = spatialdata_info_v2(&dir);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            info.map(|info| info.tag()),
+            Some(String::from("SpatialData labels"))
+        );
+    }
+
+    #[test]
+    fn a_group_with_spatialdata_attrs_but_no_raster_metadata_is_not_an_element() {
+        // Two ways of carrying SpatialData's mark without being a raster. Both
+        // leave the group untagged rather than guessing which element it is.
+
+        // No OME-Zarr metadata at all.
+        let no_ome = json!({ "attributes": { "spatialdata_attrs": { "version": "0.3" } } });
+        assert!(spatialdata_info_v3(&no_ome).is_none());
+
+        // The namespace is there, but declares no image.
+        let no_multiscales = json!({
+            "attributes": {
+                "ome": { "version": "0.5" },
+                "spatialdata_attrs": { "version": "0.3" }
+            }
+        });
+        assert!(spatialdata_info_v3(&no_multiscales).is_none());
     }
 
     #[test]
@@ -1214,6 +1418,46 @@ mod tests {
     }
 
     #[test]
+    fn a_table_element_is_detected_beside_its_anndata_metadata() {
+        // A table group as every release has written it. AnnData wrote the
+        // first two keys and claims `encoding-type` for itself, which is why
+        // SpatialData records the element kind one key over.
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "encoding-type": "anndata",
+                "encoding-version": "0.1.0",
+                "spatialdata-encoding-type": "ngff:regions_table",
+                "region": "cell_circles",
+                "region_key": "region",
+                "instance_key": "cell_id",
+                "version": "0.2"
+            }
+        });
+
+        let info = spatialdata_info_v3(&value).expect("a table marker should be recognised");
+
+        // Recognised despite `encoding-type` saying "anndata": the two keys
+        // are read independently, and neither shadows the other.
+        assert_eq!(info.tag(), "SpatialData table");
+    }
+
+    #[test]
+    fn anndata_nodes_beneath_a_table_are_not_elements() {
+        // AnnData writes `encoding-type` throughout the subtree under a table.
+        // None of these is a SpatialData element, and matching the key rather
+        // than its value would tag every one of them.
+        for kind in ["anndata", "dataframe", "csr_matrix", "array", "dict"] {
+            let value = json!({ "attributes": { "encoding-type": kind } });
+            assert!(
+                spatialdata_info_v3(&value).is_none(),
+                "{kind:?} is AnnData's, not an element kind"
+            );
+        }
+    }
+
+    #[test]
     fn unrecognised_encoding_types_produce_no_element_tag() {
         // Four ways of not being an element we know, and one rule for all of
         // them: print no element tag, and never fall back on directory names.
@@ -1222,8 +1466,9 @@ mod tests {
         let plain = json!({ "attributes": {} });
         assert!(spatialdata_info_v3(&plain).is_none());
 
-        // A real value from a real store, and not ours: AnnData writes this
-        // one. Matching the key rather than the value would tag it.
+        // A real value from a real store, and not ours: every SpatialData
+        // annotation table carries this, written by AnnData. Matching the key
+        // rather than the value would tag all of them as elements.
         let anndata = json!({ "attributes": { "encoding-type": "anndata" } });
         assert!(spatialdata_info_v3(&anndata).is_none());
 

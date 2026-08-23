@@ -36,8 +36,9 @@ example.zarr [group]
   metadata declares, and the paths it declares them at.
 - Recognises the root of a SpatialData store and tags it, e.g.
   `[group, SpatialData 0.2]`.
-- Recognises SpatialData points and shapes elements from their own metadata,
-  e.g. `[group, SpatialData points]`.
+- Recognises SpatialData elements — images, labels, points, shapes and tables —
+  e.g. `[group, SpatialData points]`, and tells a segmentation from an image by
+  its OME-Zarr metadata rather than by its directory name.
 - Degrades gracefully: metadata that cannot be read or parsed costs only that
   node's label or a single field, never the rest of the walk.
 
@@ -308,7 +309,7 @@ cargo clippy -- -D warnings  # lints, as CI runs them
 cargo fmt --check            # formatting, as CI runs it
 ```
 
-The suite is in two parts: 28 unit tests in `src/main.rs`, which cover metadata
+The suite is in two parts: 34 unit tests in `src/main.rs`, which cover metadata
 parsing directly, and 8 integration tests in `tests/cli.rs`, which run the
 compiled binary against throwaway fixture stores and assert on what it prints.
 
@@ -330,16 +331,22 @@ every push and pull request.
   version, axis names, declared pyramid level count and dataset paths. Axis
   `type` and `unit` are not shown, nothing is validated (axis names, ordering or
   count; whether a declared dataset path exists), and coordinate
-  transformations, `omero`, labels and plate/well metadata are not read. No
+  transformations, `omero` and plate/well metadata are not read. `image-label`
+  is read only for its presence, to tell a segmentation from an image. No
   scale factors, pixel sizes or physical extents are calculated.
 - SpatialData support goes no further than recognising a store root and its
-  points and shapes elements. Images, labels and tables are not classified, and
-  nothing inside an element is read: `points.parquet`, `shapes.parquet` and the
-  AnnData tables are left alone.
+  image, labels, points, shapes and table elements. Nothing inside an element
+  is read: `points.parquet`, `shapes.parquet` and a table's `X`, `obs`, `var`
+  and `layers` are left alone.
+- A segmentation that omits the optional `image-label` key is reported as an
+  image. Nothing inside `image-label` — colours, properties, the source image —
+  is read, and no label value is ever looked at.
 - A store root written before SpatialData recorded a software version carries
-  no root marker and is not recognised as one; its points and shapes elements
-  still are, because those name themselves in a key such a store does carry.
-  Nothing is inferred from directory names in any case.
+  no root marker and is not recognised as one; its points, shapes and table
+  elements still are, because those name themselves in a key such a store does
+  carry. Its images and labels do not, since they are recognised in part by a
+  `spatialdata_attrs` those older stores do not write. Nothing is inferred from
+  directory names in any case.
 - Symlinked directories are listed but not followed.
 
 ## Roadmap
