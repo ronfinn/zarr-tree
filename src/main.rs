@@ -36,6 +36,14 @@ struct OmeInfo {
     /// The axes row, e.g. "c, z, y, x". `None` when the metadata carries no
     /// axes (OME-NGFF 0.1 and 0.2) or we could not read them.
     axes: Option<String>,
+    /// The declared resolution levels, as the paths the metadata lists, in the
+    /// order it lists them. `None` when there is no usable `datasets` array.
+    ///
+    /// Held as a list rather than as a finished row because two rows are drawn
+    /// from it -- the level count and the paths themselves -- and they are one
+    /// fact shown twice. Keeping the list is what stops the two from drifting:
+    /// the count is simply its length.
+    datasets: Option<Vec<String>>,
 }
 
 /// The text printed by `--help`.
@@ -127,7 +135,7 @@ fn main() {
     match &root_kind {
         NodeKind::Array(meta) => print_array_meta(meta, ""),
         _ => {
-            if let Err(e) = print_tree(root, "", group_axes(&root_kind)) {
+            if let Err(e) = print_tree(root, "", &group_rows(&root_kind)) {
                 eprintln!("error: {e}");
                 process::exit(1);
             }
@@ -137,10 +145,12 @@ fn main() {
 
 /// Print the directories inside `dir`, one line each, indented by `prefix`.
 ///
-/// `axes` is `dir`'s own axes row, if it has one. It is printed here rather
-/// than by the caller because this is the one place that already knows whether
-/// any children follow it, which is what decides the connector.
-fn print_tree(dir: &Path, prefix: &str, axes: Option<&str>) -> io::Result<()> {
+/// `rows` is `dir`'s own metadata, one finished line each, in the order they
+/// should appear. They are printed here rather than by the caller because this
+/// is the one place that already knows whether any children follow them, which
+/// is what decides the last connector. An empty slice means there is nothing to
+/// print above the children.
+fn print_tree(dir: &Path, prefix: &str, rows: &[String]) -> io::Result<()> {
     // Collect first: read_dir returns entries in arbitrary order, and we need
     // to know which child is last before we can draw its connector.
     let mut subdirs: Vec<PathBuf> = Vec::new();
@@ -156,13 +166,12 @@ fn print_tree(dir: &Path, prefix: &str, axes: Option<&str>) -> io::Result<()> {
 
     // This directory's own metadata, above its children. Metadata rows keep
     // the shorter two-dash stem that tells them apart from node rows.
-    if let Some(axes) = axes {
-        let connector = if subdirs.is_empty() {
-            "└─ "
-        } else {
-            "├─ "
-        };
-        println!("{prefix}{connector}axes: {axes}");
+    for (i, row) in rows.iter().enumerate() {
+        // `└─` closes a branch, so it belongs to the last row only when there
+        // are no children below it to keep the branch open.
+        let is_last = i == rows.len() - 1 && subdirs.is_empty();
+        let connector = if is_last { "└─ " } else { "├─ " };
+        println!("{prefix}{connector}{row}");
     }
 
     for (i, path) in subdirs.iter().enumerate() {
@@ -184,7 +193,7 @@ fn print_tree(dir: &Path, prefix: &str, axes: Option<&str>) -> io::Result<()> {
         // structure worth showing. The metadata rows go there instead.
         match &kind {
             NodeKind::Array(meta) => print_array_meta(meta, &child_prefix),
-            _ => print_tree(path, &child_prefix, group_axes(&kind))?,
+            _ => print_tree(path, &child_prefix, &group_rows(&kind))?,
         }
     }
 
@@ -283,21 +292,42 @@ fn ome_info(ome: &Value, version: Option<&Value>) -> Option<OmeInfo> {
     // Axes belong to an individual multiscale rather than to the group, so they
     // come from that same first entry in both layouts -- the one part of this
     // metadata V2 and V3 already agree about.
+    //
+    // `datasets` is the one part of this metadata that has not changed shape
+    // since OME-NGFF 0.1 -- always a list of objects with a `path` -- so unlike
+    // the axes it needs no per-version handling at all. What 0.4 added to each
+    // entry, `coordinateTransformations`, is not read.
     Some(OmeInfo {
         tag,
         axes: format_axes(first.get("axes")),
+        datasets: dataset_paths(first.get("datasets")),
     })
 }
 
-/// The axes row for a node, if it is an OME-Zarr image group that had one.
+/// The metadata rows to print underneath a node's own line, in display order.
 ///
-/// Hands back a borrow rather than a copy: the row is only being printed, so
-/// there is no reason to clone the string out of the `NodeKind`.
-fn group_axes(kind: &NodeKind) -> Option<&str> {
-    match kind {
-        NodeKind::Group(Some(ome)) => ome.axes.as_deref(),
-        _ => None,
+/// Everything but an OME-Zarr image group has nothing to say here and gets an
+/// empty list. Returning one list rather than one argument per row keeps
+/// `print_tree` from growing a parameter every time a row is added: all it
+/// needs to know is how many rows there are and what each one says.
+fn group_rows(kind: &NodeKind) -> Vec<String> {
+    // `let ... else` matches one pattern and takes an early exit when it does
+    // not fit, which reads better here than a `match` whose other arm is just
+    // an empty list.
+    let NodeKind::Group(Some(ome)) = kind else {
+        return Vec::new();
+    };
+
+    let mut rows = Vec::new();
+    if let Some(axes) = &ome.axes {
+        rows.push(format!("axes: {axes}"));
     }
+    // Both rows come from the same list, so they appear and vanish together.
+    if let Some(datasets) = &ome.datasets {
+        rows.push(format!("pyramid levels: {}", datasets.len()));
+        rows.push(format!("datasets: {}", datasets.join(", ")));
+    }
+    rows
 }
 
 /// Read a file and parse it as JSON, or `None` if either step fails.
@@ -390,6 +420,38 @@ fn format_axes(value: Option<&Value>) -> Option<String> {
         .collect();
 
     Some(names.join(", "))
+}
+
+/// Read a `multiscales` entry's `datasets` as the list of paths it declares,
+/// or `None` when there is nothing to show.
+///
+/// The paths are shown exactly as stored. `"0"`, `"1"`, `"2"` is only a
+/// convention -- `"s0"`, `"full"` and nested paths such as `"a/b"` are all
+/// legal -- so nothing here sorts, renumbers or interprets them.
+///
+/// An entry we cannot read a path from becomes `?` rather than being dropped,
+/// the same way `format_axes` treats a nameless axis: dropping it would report
+/// a three-level pyramid as a two-level one.
+fn dataset_paths(value: Option<&Value>) -> Option<Vec<String>> {
+    let items = value?.as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+
+    let paths: Vec<String> = items
+        .iter()
+        .map(|item| {
+            // `get` on anything that is not an object yields None, so an entry
+            // that is a bare string or a number lands on `?` too.
+            let path = item
+                .get("path")
+                .and_then(|path| path.as_str())
+                .unwrap_or("?");
+            String::from(path)
+        })
+        .collect();
+
+    Some(paths)
 }
 
 /// Print the metadata rows that sit underneath an array line.
@@ -565,6 +627,7 @@ mod tests {
 
         assert_eq!(info.tag, "OME-Zarr 0.5");
         assert_eq!(info.axes, Some(String::from("c, y, x")));
+        assert_eq!(info.datasets, Some(vec![String::from("0")]));
     }
 
     #[test]
@@ -589,6 +652,9 @@ mod tests {
         assert_eq!(info.tag, "OME-Zarr");
         // That fixture carries no axes, so there is no row to print.
         assert_eq!(info.axes, None);
+        // Its datasets, on the other hand, are laid out the same way in V2 as
+        // they are in V3 -- which is why no V2-specific reading was needed.
+        assert_eq!(info.datasets, Some(vec![String::from("0")]));
     }
 
     #[test]
@@ -657,5 +723,60 @@ mod tests {
         // Present and walkable, but empty.
         let empty = json!([]);
         assert_eq!(format_axes(Some(&empty)), None);
+    }
+
+    #[test]
+    fn dataset_paths_are_read_in_declaration_order() {
+        // The ordinary case: three levels, named by the usual convention.
+        let value = json!([{ "path": "0" }, { "path": "1" }, { "path": "2" }]);
+
+        let paths = dataset_paths(Some(&value)).expect("three declared levels");
+
+        // The level count is just how many the metadata declares.
+        assert_eq!(paths.len(), 3);
+        assert_eq!(paths.join(", "), "0, 1, 2");
+    }
+
+    #[test]
+    fn dataset_paths_are_shown_as_stored() {
+        // "0", "1", "2" is a convention, not a rule. Anything the file says is
+        // a path is printed as it stands.
+        let value = json!([{ "path": "full" }, { "path": "half" }]);
+
+        let paths = dataset_paths(Some(&value)).expect("two declared levels");
+
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths.join(", "), "full, half");
+    }
+
+    #[test]
+    fn an_unreadable_dataset_entry_keeps_its_place() {
+        // The middle entry has no `path`. Dropping it would report a
+        // three-level pyramid as two-level, so it becomes `?` and the count
+        // still matches what the file declares -- the same rule the axes
+        // follow.
+        let value = json!([{ "path": "0" }, { "foo": "bar" }, { "path": "2" }]);
+
+        let paths = dataset_paths(Some(&value)).expect("three declared levels");
+
+        assert_eq!(paths.len(), 3);
+        assert_eq!(paths.join(", "), "0, ?, 2");
+    }
+
+    #[test]
+    fn datasets_with_nothing_to_show_produce_no_rows() {
+        // Three ways of having no datasets to display, and one rule for all of
+        // them: print no rows, and never count the child directories instead.
+
+        // No datasets key at all.
+        assert_eq!(dataset_paths(None), None);
+
+        // Present, but nothing we can walk over.
+        let not_an_array = json!("0");
+        assert_eq!(dataset_paths(Some(&not_an_array)), None);
+
+        // Present and walkable, but empty.
+        let empty = json!([]);
+        assert_eq!(dataset_paths(Some(&empty)), None);
     }
 }

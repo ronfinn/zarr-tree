@@ -32,6 +32,8 @@ example.zarr [group]
   keys) does not clutter the output.
 - Recognises OME-Zarr image groups and tags them, e.g. `[group, OME-Zarr 0.4]`.
 - Shows an OME-Zarr image's axis names on one row, e.g. `axes: c, y, x`.
+- Summarises an OME-Zarr multiscale pyramid: how many resolution levels the
+  metadata declares, and the paths it declares them at.
 - Degrades gracefully: metadata that cannot be read or parsed costs only that
   node's label or a single field, never the rest of the walk.
 
@@ -62,12 +64,18 @@ appended when one is recorded:
 $ zarr-tree image.zarr
 image.zarr [group, OME-Zarr 0.4]
 ├─ axes: c, y, x
+├─ pyramid levels: 3
+├─ datasets: 0, 1, 2
 ├── 0 [array]
 │   ├─ shape:  [2, 2048, 2048]
 │   ├─ chunks: [1, 512, 512]
 │   └─ dtype:  <u2
-└── 1 [array]
-    ├─ shape:  [2, 1024, 1024]
+├── 1 [array]
+│   ├─ shape:  [2, 1024, 1024]
+│   ├─ chunks: [1, 512, 512]
+│   └─ dtype:  <u2
+└── 2 [array]
+    ├─ shape:  [2, 512, 512]
     ├─ chunks: [1, 512, 512]
     └─ dtype:  <u2
 ```
@@ -98,10 +106,66 @@ read shows as `?`, so the number of axes always matches the number the file
 declares. Axes that are absent, empty or not a list print no row at all —
 nothing is inferred from an array's dimensionality.
 
+### Pyramid levels
+
+The same `multiscales` entry's `datasets` lists the resolution levels the image
+is stored at. Unlike `axes`, this has had the same shape since OME-Zarr 0.1 — a
+list of objects each carrying a `path` — so one reading serves every version.
+What 0.4 added to each entry, `coordinateTransformations`, is not read.
+
+Two rows come from it: how many levels are declared, and the paths they are
+declared at.
+
+```
+├─ pyramid levels: 3
+├─ datasets: 0, 1, 2
+```
+
+The count comes from the metadata, **never from counting child directories**.
+The two often disagree: an image group commonly holds a `labels` group beside
+its levels, a 0.5 store adds an `OME` directory, a path may be nested such as
+`a/b`, and a truncated copy may declare more levels than it actually contains.
+The directories are already listed below these rows; what the metadata claims is
+the part you cannot otherwise see.
+
+Paths are printed exactly as stored. `0`, `1`, `2` is only a convention —
+`s0`, `full`, `half` and nested paths are all legal — so nothing is sorted,
+renumbered or interpreted:
+
+```
+$ zarr-tree named.zarr
+named.zarr [group, OME-Zarr 0.3]
+├─ axes: y, x
+├─ pyramid levels: 2
+├─ datasets: full, half
+├── full [array]
+...
+```
+
+An entry whose path cannot be read shows as `?`, so the count still matches what
+the file declares. `datasets` that is absent, empty or not a list prints neither
+row:
+
+```
+$ zarr-tree partial.zarr
+partial.zarr [group, OME-Zarr 0.4]
+├─ axes: y, x
+├─ pyramid levels: 3
+└─ datasets: 0, ?, 2
+```
+
+That store declares three levels but has none of them on disk, so nothing
+follows the rows and the last one closes the branch with `└─`.
+
+Nothing checks that a declared path exists on disk, and no scale factors, pixel
+sizes or physical extents are calculated — the `coordinateTransformations` those
+would come from are not read at all.
+
 This is **recognition, not validation**. Nothing here checks a store against the
-OME-NGFF specification: axes, datasets, coordinate transformations, `omero`
-channels, labels and plate/well layouts are all ignored. For real validation use
-the [OME-NGFF validator](https://ome.github.io/ome-ngff-validator/).
+OME-NGFF specification: axes, dataset paths, coordinate transformations, `omero`
+channels, labels and plate/well layouts are never validated, and most of them
+are not read at all. For real validation use the
+[OME-NGFF validator](https://ome.github.io/ome-ngff-validator/).
 
 ## Installation
 
@@ -180,7 +244,7 @@ cargo clippy -- -D warnings  # lints, as CI runs them
 cargo fmt --check            # formatting, as CI runs it
 ```
 
-The suite is in two parts: 13 unit tests in `src/main.rs`, which cover metadata
+The suite is in two parts: 17 unit tests in `src/main.rs`, which cover metadata
 parsing directly, and 5 integration tests in `tests/cli.rs`, which run the
 compiled binary against throwaway fixture stores and assert on what it prints.
 
@@ -198,10 +262,12 @@ every push and pull request.
   (the extension syntax) are not interpreted.
 - Sharding is not understood; a sharded array shows its declared chunk shape
   only.
-- OME-Zarr support goes no further than spotting image groups, showing their
-  version and listing their axis names. Axis `type` and `unit` are not shown,
-  nothing is validated (axis names, ordering or count), and datasets, coordinate
-  transformations, `omero`, labels and plate/well metadata are not read.
+- OME-Zarr support goes no further than spotting image groups and showing their
+  version, axis names, declared pyramid level count and dataset paths. Axis
+  `type` and `unit` are not shown, nothing is validated (axis names, ordering or
+  count; whether a declared dataset path exists), and coordinate
+  transformations, `omero`, labels and plate/well metadata are not read. No
+  scale factors, pixel sizes or physical extents are calculated.
 - Symlinked directories are listed but not followed.
 
 ## Roadmap

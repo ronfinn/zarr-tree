@@ -145,11 +145,13 @@ fn prints_a_zarr_tree_with_groups_arrays_and_metadata() {
     assert!(!has(&lines, "0 [unknown]"));
 
     // Nothing here carries OME-Zarr metadata, so the output is exactly what it
-    // was before axes existed.
-    assert!(
-        !stdout.contains("axes:"),
-        "a store with no OME-Zarr metadata should print no axes row:\n{stdout}"
-    );
+    // was before any of the OME rows existed.
+    for unexpected in ["axes:", "pyramid levels:", "datasets:"] {
+        assert!(
+            !stdout.contains(unexpected),
+            "a store with no OME-Zarr metadata should print no {unexpected:?} row:\n{stdout}"
+        );
+    }
 }
 
 #[test]
@@ -243,6 +245,10 @@ fn ome_zarr_image_group_is_tagged() {
         // The axes this fixture's `.zattrs` declares, in the object form 0.4
         // uses. The root is an image group, so its row sits at the top level.
         "axes: y, x",
+        // The pyramid as the metadata declares it. V2 lays `datasets` out the
+        // same way V3 does, so the rows are identical either side.
+        "pyramid levels: 2",
+        "datasets: 0, 1",
         // The levels are still plain arrays, still carrying their metadata.
         "0 [array]",
         "1 [array]",
@@ -256,8 +262,8 @@ fn ome_zarr_image_group_is_tagged() {
 }
 
 #[test]
-fn ome_zarr_axes_are_printed_above_the_datasets() {
-    let dir = fixture_dir("ome-axes");
+fn ome_zarr_metadata_rows_are_printed_above_the_child_arrays() {
+    let dir = fixture_dir("ome-rows");
     let root = dir.join("dataset.zarr");
 
     // A plain V3 group at the root, so the image group below it is reached
@@ -268,7 +274,8 @@ fn ome_zarr_axes_are_printed_above_the_datasets() {
     );
 
     // A Zarr V3 / OME-NGFF 0.5 image group: the OME-Zarr keys live under the
-    // `ome` namespace inside the group's own `zarr.json`.
+    // `ome` namespace inside the group's own `zarr.json`. Two resolution
+    // levels, declared and present.
     write_file(
         &root.join("image/zarr.json"),
         r#"{
@@ -285,7 +292,8 @@ fn ome_zarr_axes_are_printed_above_the_datasets() {
                                 {"name": "x", "type": "space", "unit": "micrometer"}
                             ],
                             "datasets": [
-                                {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": [1.0, 1.0, 1.0]}]}
+                                {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": [1.0, 1.0, 1.0]}]},
+                                {"path": "1", "coordinateTransformations": [{"type": "scale", "scale": [1.0, 2.0, 2.0]}]}
                             ]
                         }
                     ]
@@ -306,10 +314,24 @@ fn ome_zarr_axes_are_printed_above_the_datasets() {
             "data_type": "uint16"
         }"#,
     );
+    write_file(
+        &root.join("image/1/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [2, 32, 32],
+            "chunk_grid": {
+                "name": "regular",
+                "configuration": { "chunk_shape": [1, 32, 32] }
+            },
+            "data_type": "uint16"
+        }"#,
+    );
 
     // A second image group whose resolution levels are missing entirely -- a
     // broken store, but a readable one. Sorted after "image", so it is the
-    // last child and its axes row has nothing below it.
+    // last child and its rows have nothing below them. It still reports the
+    // level its metadata declares: nothing here checks that the path exists.
     write_file(
         &root.join("orphan/zarr.json"),
         r#"{
@@ -345,8 +367,12 @@ fn ome_zarr_axes_are_printed_above_the_datasets() {
     for expected in [
         "image [group, OME-Zarr 0.5]",
         "axes: c, y, x",
-        // The resolution level and its metadata are untouched by the new row.
+        "pyramid levels: 2",
+        "datasets: 0, 1",
+        // The resolution levels and their metadata are untouched by the new
+        // rows above them.
         "0 [array]",
+        "1 [array]",
         "shape: [2, 64, 64]",
         "chunks: [1, 32, 32]",
         "dtype: uint16",
@@ -354,31 +380,45 @@ fn ome_zarr_axes_are_printed_above_the_datasets() {
         assert!(has(&lines, expected), "missing {expected:?} in:\n{stdout}");
     }
 
-    // The row belongs to the group, so it comes before the group's children.
-    let axes_row = lines
-        .iter()
-        .position(|line| line.contains("axes: c, y, x"))
-        .expect("expected an axes row");
-    let dataset = lines
-        .iter()
-        .position(|line| line.contains("0 [array]"))
-        .expect("expected the resolution level");
+    // The rows belong to the group, so they all come before the group's
+    // children, in the order axes, level count, level paths.
+    let row = |needle: &str| {
+        lines
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("expected a {needle:?} row in:\n{stdout}"))
+    };
+    let axes = row("axes: c, y, x");
+    let levels = row("pyramid levels: 2");
+    let datasets = row("datasets: 0, 1");
+    let first_child = row("0 [array]");
     assert!(
-        axes_row < dataset,
-        "the axes row should precede the datasets in:\n{stdout}"
+        axes < levels && levels < datasets && datasets < first_child,
+        "expected axes, pyramid levels, datasets, then the child arrays in:\n{stdout}"
     );
 
-    // Indentation and connectors, checked against the undisturbed output:
-    // a nested group's row is indented under its parent and keeps the stem
-    // running down to the children below it.
+    // Indentation and connectors, checked against the undisturbed output: a
+    // nested group's rows are indented under it and keep the stem running down
+    // to the children below them, so only node rows close the branch.
+    for expected in [
+        "│   ├─ axes: c, y, x",
+        "│   ├─ pyramid levels: 2",
+        "│   ├─ datasets: 0, 1",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "expected {expected:?} with children following in:\n{stdout}"
+        );
+    }
+    // With no children below it, the *last* row closes the branch instead --
+    // and only the last one.
     assert!(
-        stdout.contains("│   ├─ axes: c, y, x"),
-        "expected a nested axes row with children following in:\n{stdout}"
+        stdout.contains("    ├─ axes: y, x"),
+        "a non-final row should stay open even with no children in:\n{stdout}"
     );
-    // With no children below it, the row closes its branch instead.
     assert!(
-        stdout.contains("    └─ axes: y, x"),
-        "expected a closing axes row on the childless group in:\n{stdout}"
+        stdout.contains("    └─ datasets: 0"),
+        "expected a closing datasets row on the childless group in:\n{stdout}"
     );
 }
 
