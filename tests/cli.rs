@@ -9,7 +9,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 /// A fresh, empty directory of our own under the system temp directory.
 ///
@@ -860,6 +860,70 @@ fn spatialdata_elements_are_tagged_but_their_containers_are_not() {
     assert!(
         !stdout.contains("shapes.parquet"),
         "a file is not a node in this tree:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_reader_that_stops_reading_ends_the_run_quietly() {
+    // What `zarr-tree store.zarr | head` does, without needing `head`: give
+    // the process a pipe, then close our end of it and never read a byte.
+    //
+    // The fixture has to be big enough that the tool cannot possibly finish
+    // writing before we close, or the test would pass without ever exercising
+    // the failure. A pipe buffer holds about 64 KiB; 800 arrays print four
+    // lines each, some 90 KiB, so the writes must block until someone reads
+    // and no-one ever will.
+    let dir = fixture_dir("broken-pipe");
+    let root = dir.join("big.zarr");
+    write_file(
+        &root.join("zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group"}"#,
+    );
+    for i in 0..800 {
+        write_file(
+            &root.join(format!("a{i}")).join("zarr.json"),
+            r#"{
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [4096, 4096],
+                "chunk_grid": {
+                    "name": "regular",
+                    "configuration": { "chunk_shape": [512, 512] }
+                },
+                "data_type": "uint16"
+            }"#,
+        );
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zarr-tree"))
+        .arg(root.to_str().unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run the zarr-tree binary");
+
+    // Dropping the read end is what breaks the pipe. `take` moves it out of
+    // the child handle so it can be dropped on its own, while we keep the
+    // handle itself to wait on.
+    drop(child.stdout.take());
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for the run");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    // Quietly: a panic would print here, and so would an `error:` line.
+    assert!(
+        stderr.is_empty(),
+        "a reader that stopped reading is not an error to report:\n{stderr}"
+    );
+    // And successfully: the pipeline asked for what it wanted and got it.
+    assert!(
+        output.status.success(),
+        "expected exit status 0, got {:?}",
+        output.status
     );
 }
 

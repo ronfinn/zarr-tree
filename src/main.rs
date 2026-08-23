@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -168,11 +169,48 @@ impl NodeKind {
 }
 
 fn main() {
+    // One error path for everything `run` does, and one special case in it.
+    //
+    // `zarr-tree store.zarr | head` closes the pipe as soon as `head` has the
+    // lines it wanted, and every write after that fails with `BrokenPipe`.
+    // That is not a failure of ours: the reader said it had seen enough. The
+    // Unix convention for a program at the producing end of a pipeline is to
+    // stop there, quietly and successfully, which is what a plain `return`
+    // does -- no message on stderr, exit status 0.
+    //
+    // Every other error keeps exactly the behaviour it had: a line on stderr
+    // and exit status 1. A directory we cannot read is still an error worth
+    // reporting; `BrokenPipe` cannot reach us from the filesystem.
+    if let Err(error) = run() {
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            return;
+        }
+        eprintln!("error: {error}");
+        process::exit(1);
+    }
+}
+
+/// Everything `main` used to do, with the writes routed through one handle so
+/// that a failed one comes back as a value rather than a panic.
+///
+/// `println!` writes to stdout and panics if that write fails, which is how a
+/// closed pipe used to end this program: a panic message on stderr and exit
+/// status 101. Writing through a handle of our own turns the same failure into
+/// an ordinary `io::Error` that `?` carries up to `main`.
+///
+/// The handle is locked once here rather than per line -- `println!` takes the
+/// same lock on every call -- and passed down the walk. `&mut dyn Write` is a
+/// trait object: the functions below neither know nor care that this is
+/// standard output.
+fn run() -> io::Result<()> {
     // args[0] is the program itself, so we expect exactly two entries.
     let args: Vec<String> = env::args().collect();
 
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
     // A lone flag is answered before anything else. Both arms return from
-    // main, so a flag never reaches the path checks below and every other
+    // run, so a flag never reaches the path checks below and every other
     // argument falls through to exactly the code that handled it before.
     //
     // The cost of parsing this simply is that a directory actually named "-h"
@@ -182,21 +220,25 @@ fn main() {
         // matched against string literals.
         match args[1].as_str() {
             "-h" | "--help" => {
-                println!("{HELP}");
-                return;
+                writeln!(out, "{HELP}")?;
+                return out.flush();
             }
             "-V" | "--version" => {
                 // env! reads the variable when the crate is compiled, so this
                 // is a plain string literal in the binary. Cargo fills it in
                 // from the version field in Cargo.toml, which is why the two
                 // cannot drift apart.
-                println!("zarr-tree {}", env!("CARGO_PKG_VERSION"));
-                return;
+                writeln!(out, "zarr-tree {}", env!("CARGO_PKG_VERSION"))?;
+                return out.flush();
             }
             _ => {}
         }
     }
 
+    // The argument errors exit directly. They are settled before anything is
+    // written, they belong on stderr rather than in the tree, and routing them
+    // through the `io::Result` would mean inventing an io::Error for something
+    // that is not an I/O failure at all.
     if args.len() != 2 {
         eprintln!("usage: zarr-tree <directory>");
         process::exit(1);
@@ -214,18 +256,18 @@ fn main() {
 
     let root_name = args[1].trim_end_matches('/');
     let root_kind = classify(root);
-    println!("{root_name} {}", root_kind.label());
+    writeln!(out, "{root_name} {}", root_kind.label())?;
 
     // An array is a leaf here too: its metadata takes the place of the walk.
     match &root_kind {
-        NodeKind::Array(meta) => print_array_meta(meta, ""),
-        _ => {
-            if let Err(e) = print_tree(root, "", &group_rows(&root_kind)) {
-                eprintln!("error: {e}");
-                process::exit(1);
-            }
-        }
+        NodeKind::Array(meta) => print_array_meta(&mut out, meta, "")?,
+        _ => print_tree(&mut out, root, "", &group_rows(&root_kind))?,
     }
+
+    // Stdout flushes itself when the process ends, but it swallows any error
+    // in doing so. Flushing here is what puts a late `BrokenPipe` in front of
+    // the handler above instead of losing it.
+    out.flush()
 }
 
 /// Print the directories inside `dir`, one line each, indented by `prefix`.
@@ -235,7 +277,7 @@ fn main() {
 /// is the one place that already knows whether any children follow them, which
 /// is what decides the last connector. An empty slice means there is nothing to
 /// print above the children.
-fn print_tree(dir: &Path, prefix: &str, rows: &[String]) -> io::Result<()> {
+fn print_tree(out: &mut dyn Write, dir: &Path, prefix: &str, rows: &[String]) -> io::Result<()> {
     // Collect first: read_dir returns entries in arbitrary order, and we need
     // to know which child is last before we can draw its connector.
     let mut subdirs: Vec<PathBuf> = Vec::new();
@@ -256,7 +298,7 @@ fn print_tree(dir: &Path, prefix: &str, rows: &[String]) -> io::Result<()> {
         // are no children below it to keep the branch open.
         let is_last = i == rows.len() - 1 && subdirs.is_empty();
         let connector = if is_last { "└─ " } else { "├─ " };
-        println!("{prefix}{connector}{row}");
+        writeln!(out, "{prefix}{connector}{row}")?;
     }
 
     for (i, path) in subdirs.iter().enumerate() {
@@ -264,7 +306,7 @@ fn print_tree(dir: &Path, prefix: &str, rows: &[String]) -> io::Result<()> {
         let connector = if is_last { "└── " } else { "├── " };
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let kind = classify(path);
-        println!("{prefix}{connector}{name} {}", kind.label());
+        writeln!(out, "{prefix}{connector}{name} {}", kind.label())?;
 
         // Children of the last entry need no vertical bar above them.
         let child_prefix = if is_last {
@@ -277,8 +319,8 @@ fn print_tree(dir: &Path, prefix: &str, rows: &[String]) -> io::Result<()> {
         // directory, V2 chunk keys), an implementation detail rather than
         // structure worth showing. The metadata rows go there instead.
         match &kind {
-            NodeKind::Array(meta) => print_array_meta(meta, &child_prefix),
-            _ => print_tree(path, &child_prefix, &group_rows(&kind))?,
+            NodeKind::Array(meta) => print_array_meta(out, meta, &child_prefix)?,
+            _ => print_tree(out, path, &child_prefix, &group_rows(&kind))?,
         }
     }
 
@@ -732,7 +774,7 @@ fn dataset_paths(value: Option<&Value>) -> Option<Vec<String>> {
 ///
 /// All three rows are always printed, in the same order, so the closing
 /// connector is always on `dtype`. A field we could not read shows as `?`.
-fn print_array_meta(meta: &ArrayMeta, prefix: &str) {
+fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::Result<()> {
     let rows = [
         ("shape:", &meta.shape),
         ("chunks:", &meta.chunks),
@@ -747,8 +789,10 @@ fn print_array_meta(meta: &ArrayMeta, prefix: &str) {
         };
         let value = value.as_deref().unwrap_or("?");
         // Pad to the width of the longest name, "chunks:", so values line up.
-        println!("{prefix}{connector}{name:<7} {value}");
+        writeln!(out, "{prefix}{connector}{name:<7} {value}")?;
     }
+
+    Ok(())
 }
 
 #[cfg(test)]

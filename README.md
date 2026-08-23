@@ -39,6 +39,8 @@ example.zarr [group]
 - Recognises SpatialData elements — images, labels, points, shapes and tables —
   e.g. `[group, SpatialData points]`, and tells a segmentation from an image by
   its OME-Zarr metadata rather than by its directory name.
+- Sits quietly at the producing end of a pipe: `| head` ends the run with no
+  panic and no error.
 - Degrades gracefully: metadata that cannot be read or parsed costs only that
   node's label or a single field, never the rest of the walk.
 
@@ -310,7 +312,7 @@ cargo fmt --check            # formatting, as CI runs it
 ```
 
 The suite is in two parts: 34 unit tests in `src/main.rs`, which cover metadata
-parsing directly, and 8 integration tests in `tests/cli.rs`, which run the
+parsing directly, and 9 integration tests in `tests/cli.rs`, which run the
 compiled binary against throwaway fixture stores and assert on what it prints.
 
 CI runs `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` on
