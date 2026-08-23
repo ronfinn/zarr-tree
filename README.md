@@ -34,6 +34,8 @@ example.zarr [group]
 - Shows an OME-Zarr image's axis names on one row, e.g. `axes: c, y, x`.
 - Summarises an OME-Zarr multiscale pyramid: how many resolution levels the
   metadata declares, and the paths it declares them at.
+- Recognises the root of a SpatialData store and tags it, e.g.
+  `[group, SpatialData 0.2]`.
 - Degrades gracefully: metadata that cannot be read or parsed costs only that
   node's label or a single field, never the rest of the walk.
 
@@ -167,6 +169,66 @@ channels, labels and plate/well layouts are never validated, and most of them
 are not read at all. For real validation use the
 [OME-NGFF validator](https://ome.github.io/ome-ngff-validator/).
 
+## SpatialData
+
+[SpatialData](https://spatialdata.scverse.org/) keeps a spatial omics
+experiment in a Zarr container: microscopy images, segmentation masks,
+transcript locations, geometries and annotation tables, all in one store. The
+root of such a store is tagged, with the container format version appended when
+one is recorded:
+
+```
+$ zarr-tree experiment.zarr
+experiment.zarr [group, SpatialData 0.2]
+├── images [group]
+│   └── morphology [group, OME-Zarr 0.5-dev-spatialdata]
+│       ├─ axes: c, y, x
+│       ├─ pyramid levels: 1
+│       ├─ datasets: s0
+│       └── s0 [array]
+│           ├─ shape:  [4, 2048, 2048]
+│           ├─ chunks: [1, 512, 512]
+│           └─ dtype:  uint16
+├── points [group]
+├── shapes [group]
+└── tables [group]
+```
+
+The container format version also decides which Zarr layout the store uses, and
+so where the marker lives:
+
+| Container | Zarr | Attributes |
+| --- | --- | --- |
+| 0.1 | V2 | `.zattrs`, keys at the top level |
+| 0.2 | V3 | `attributes` inside `zarr.json` |
+
+Detection requires `spatialdata_attrs.spatialdata_software_version`, not merely
+the presence of `spatialdata_attrs`. The elements inside a store — images,
+labels, points, shapes — each carry a `spatialdata_attrs` of their own, holding
+just the version of their own encoding; only the root records the software that
+wrote it. Without that distinction every element would be reported as a store
+of its own, which is why `morphology` above is tagged as the OME-Zarr image it
+is and not as a second SpatialData root.
+
+The directory names `images`, `labels`, `points`, `shapes` and `tables` are
+never used to detect anything. In a real store those groups carry no attributes
+at all, so the name would be the only thing left to go on — and an ordinary
+Zarr store whose children happen to be called `images` and `points` is not a
+SpatialData store:
+
+```
+$ zarr-tree plain.zarr
+plain.zarr [group]
+├── images [group]
+├── points [group]
+├── shapes [group]
+└── tables [group]
+```
+
+The version is printed exactly as stored and is never checked against the
+versions that exist. A root whose marker is present but carries no readable
+version is tagged `[group, SpatialData]`.
+
 ## Installation
 
 From source:
@@ -244,8 +306,8 @@ cargo clippy -- -D warnings  # lints, as CI runs them
 cargo fmt --check            # formatting, as CI runs it
 ```
 
-The suite is in two parts: 17 unit tests in `src/main.rs`, which cover metadata
-parsing directly, and 6 integration tests in `tests/cli.rs`, which run the
+The suite is in two parts: 22 unit tests in `src/main.rs`, which cover metadata
+parsing directly, and 7 integration tests in `tests/cli.rs`, which run the
 compiled binary against throwaway fixture stores and assert on what it prints.
 
 CI runs `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` on
@@ -268,6 +330,12 @@ every push and pull request.
   count; whether a declared dataset path exists), and coordinate
   transformations, `omero`, labels and plate/well metadata are not read. No
   scale factors, pixel sizes or physical extents are calculated.
+- SpatialData support goes no further than recognising a store root and showing
+  its container version. The element types — images, labels, points, shapes and
+  tables — are not classified, and nothing inside them is read: `points.parquet`,
+  `shapes.parquet` and the AnnData tables are left alone.
+- Stores written before SpatialData recorded a version carry no marker at all
+  and are not recognised. Nothing is inferred from directory names.
 - Symlinked directories are listed but not followed.
 
 ## Roadmap
@@ -278,8 +346,8 @@ Small, in roughly this order:
 2. Show a node's user attributes when asked.
 3. Report V3 dtypes given in object form, instead of showing them as missing.
 
-Remote stores and anything beyond lightweight OME-Zarr recognition are out of
-scope for now.
+Remote stores, and anything beyond lightweight OME-Zarr and SpatialData
+recognition, are out of scope for now.
 
 ## Why this project exists
 

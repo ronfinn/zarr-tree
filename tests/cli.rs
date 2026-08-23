@@ -502,6 +502,158 @@ fn a_labels_group_is_a_child_but_not_a_pyramid_level() {
 }
 
 #[test]
+fn spatialdata_root_is_tagged_from_metadata_not_from_directory_names() {
+    // Two stores laid out the same way, differing only in their root
+    // metadata. Running the binary over both in one test is what makes the
+    // point: the directory names are identical on either side, so anything
+    // that tells them apart has to have come from the metadata.
+    let dir = fixture_dir("spatialdata");
+
+    // A genuine SpatialData store. The marker carries the container format
+    // version, which is shown, and the writing software's version, which is
+    // what marks this out as the root rather than an element.
+    let store = dir.join("experiment.zarr");
+    write_file(
+        &store.join("zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "spatialdata_attrs": {
+                    "version": "0.2",
+                    "spatialdata_software_version": "0.7.3"
+                }
+            }
+        }"#,
+    );
+
+    // The element containers of a real store carry no attributes at all,
+    // which is exactly why their names cannot be what tags them.
+    let containers = ["images", "points", "shapes", "tables"];
+    for container in containers {
+        write_file(
+            &store.join(container).join("zarr.json"),
+            r#"{"zarr_format": 3, "node_type": "group", "attributes": {}}"#,
+        );
+    }
+
+    // An image element: an ordinary OME-Zarr group that happens to live in a
+    // SpatialData store. It carries a `spatialdata_attrs` of its own, holding
+    // only its own encoding version, and must not be taken for a second root.
+    write_file(
+        &store.join("images/morphology/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "ome": {
+                    "version": "0.5-dev-spatialdata",
+                    "multiscales": [
+                        {
+                            "axes": [
+                                { "name": "c", "type": "channel" },
+                                { "name": "y", "type": "space" },
+                                { "name": "x", "type": "space" }
+                            ],
+                            "datasets": [{ "path": "s0" }]
+                        }
+                    ]
+                },
+                "spatialdata_attrs": { "version": "0.3" }
+            }
+        }"#,
+    );
+    write_file(
+        &store.join("images/morphology/s0/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [4, 2048, 2048],
+            "chunk_grid": {
+                "name": "regular",
+                "configuration": { "chunk_shape": [1, 512, 512] }
+            },
+            "data_type": "uint16"
+        }"#,
+    );
+
+    // The same tree without the marker: an ordinary Zarr store whose children
+    // happen to be named after the SpatialData element types.
+    let plain = dir.join("plain.zarr");
+    write_file(
+        &plain.join("zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group", "attributes": {}}"#,
+    );
+    for container in containers {
+        write_file(
+            &plain.join(container).join("zarr.json"),
+            r#"{"zarr_format": 3, "node_type": "group", "attributes": {}}"#,
+        );
+    }
+
+    let store_output = run(&[store.to_str().unwrap()]);
+    let store_stdout = String::from_utf8_lossy(&store_output.stdout).into_owned();
+    let plain_output = run(&[plain.to_str().unwrap()]);
+    let plain_stdout = String::from_utf8_lossy(&plain_output.stdout).into_owned();
+
+    // Clean up before asserting: a failing assert panics, and nothing after
+    // the panic would run.
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert!(
+        store_output.status.success() && plain_output.status.success(),
+        "expected both runs to succeed; stderr: {} {}",
+        String::from_utf8_lossy(&store_output.stderr),
+        String::from_utf8_lossy(&plain_output.stderr)
+    );
+
+    let store_lines = lines(&store_stdout);
+    for expected in [
+        // The root, tagged from its own metadata.
+        "experiment.zarr [group, SpatialData 0.2]",
+        // The containers, untagged, because their metadata says nothing.
+        "images [group]",
+        "points [group]",
+        "shapes [group]",
+        "tables [group]",
+        // And the OME-Zarr output, exactly as it was before any of this.
+        "morphology [group, OME-Zarr 0.5-dev-spatialdata]",
+        "axes: c, y, x",
+        "pyramid levels: 1",
+        "datasets: s0",
+        "s0 [array]",
+        "shape: [4, 2048, 2048]",
+        "chunks: [1, 512, 512]",
+        "dtype: uint16",
+    ] {
+        assert!(
+            has(&store_lines, expected),
+            "missing {expected:?} in:\n{store_stdout}"
+        );
+    }
+
+    // Once, on the root, and nowhere else: not on the containers whose names
+    // match the element types, and not on the image element that carries a
+    // `spatialdata_attrs` of its own.
+    assert_eq!(
+        store_stdout.matches("SpatialData").count(),
+        1,
+        "the SpatialData tag belongs on the root alone:\n{store_stdout}"
+    );
+
+    // The same tree, without the marker, is just a Zarr store.
+    let plain_lines = lines(&plain_stdout);
+    assert!(
+        has(&plain_lines, "plain.zarr [group]"),
+        "expected an untagged root in:\n{plain_stdout}"
+    );
+    assert!(
+        !plain_stdout.contains("SpatialData"),
+        "directory names alone must not make a SpatialData store:\n{plain_stdout}"
+    );
+}
+
+#[test]
 fn help_flag_prints_usage_and_exits_successfully() {
     let output = run(&["--help"]);
     let stdout = String::from_utf8_lossy(&output.stdout);

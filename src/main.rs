@@ -8,11 +8,25 @@ use serde_json::Value;
 
 /// What kind of Zarr node a directory is, as far as its metadata files reveal.
 enum NodeKind {
-    /// A Zarr group. The payload describes an OME-Zarr image, and is `None`
-    /// for an ordinary group. See `ome_info`.
-    Group(Option<OmeInfo>),
+    /// A Zarr group, together with whatever its attributes say about it.
+    Group(GroupMeta),
     Array(ArrayMeta),
     Unknown,
+}
+
+/// What a group's attributes say about it, already formatted for printing --
+/// the same approach `ArrayMeta` takes for shape, chunks and dtype.
+///
+/// The two fields are independent facts, read from two unrelated keys by two
+/// conventions that know nothing about each other. A group may carry either,
+/// both, or -- as almost every group does -- neither.
+struct GroupMeta {
+    /// Set when the group carries OME-Zarr image metadata. See `ome_info`.
+    ome: Option<OmeInfo>,
+    /// The tag for the root of a SpatialData store: "SpatialData 0.2", or
+    /// "SpatialData" when no version was read. `None` for every other group,
+    /// including the elements *inside* a store. See `spatialdata_tag`.
+    spatialdata: Option<String>,
 }
 
 /// The three fields shown underneath an array, already formatted for printing.
@@ -72,10 +86,27 @@ impl NodeKind {
     /// found in the file, so this can no longer hand back a `&'static str`
     /// borrowing a literal compiled into the binary: it returns an owned
     /// `String` instead.
+    ///
+    /// A group can say more than one thing about itself, so its tags are
+    /// collected into a list and joined. That is one arm for every group
+    /// rather than one arm per combination, and it keeps the two conventions
+    /// independent: OME-Zarr comes first only because it is pushed first, not
+    /// because it outranks anything.
     fn label(&self) -> String {
         match self {
-            NodeKind::Group(None) => String::from("[group]"),
-            NodeKind::Group(Some(ome)) => format!("[group, {}]", ome.tag),
+            NodeKind::Group(meta) => {
+                let mut tags = vec![String::from("group")];
+                // `clone` copies a short string we are about to print. This
+                // function hands back an owned String either way, so there is
+                // nothing to be gained by borrowing here.
+                if let Some(ome) = &meta.ome {
+                    tags.push(ome.tag.clone());
+                }
+                if let Some(spatialdata) = &meta.spatialdata {
+                    tags.push(spatialdata.clone());
+                }
+                format!("[{}]", tags.join(", "))
+            }
             NodeKind::Array(_) => String::from("[array]"),
             NodeKind::Unknown => String::from("[unknown]"),
         }
@@ -210,7 +241,14 @@ fn classify(dir: &Path) -> NodeKind {
     // Zarr V2 keeps the two node kinds in separate files, so the filename alone
     // answers the question -- no need to open anything.
     if dir.join(".zgroup").is_file() {
-        return NodeKind::Group(ome_info_v2(dir));
+        // Each helper opens `.zattrs` for itself, so a V2 group costs one
+        // extra read of a small file. That buys each fact being read where it
+        // is explained; the V3 path below parses its one file once and hands
+        // the same value to both.
+        return NodeKind::Group(GroupMeta {
+            ome: ome_info_v2(dir),
+            spatialdata: spatialdata_info_v2(dir),
+        });
     }
     let zarray = dir.join(".zarray");
     if zarray.is_file() {
@@ -233,7 +271,10 @@ fn classify_v3(path: &Path) -> Option<NodeKind> {
     let value = read_json(path)?;
 
     match value.get("node_type")?.as_str()? {
-        "group" => Some(NodeKind::Group(ome_info_v3(&value))),
+        "group" => Some(NodeKind::Group(GroupMeta {
+            ome: ome_info_v3(&value),
+            spatialdata: spatialdata_info_v3(&value),
+        })),
         "array" => Some(NodeKind::Array(array_meta_v3(&value))),
         _ => None,
     }
@@ -304,6 +345,75 @@ fn ome_info(ome: &Value, version: Option<&Value>) -> Option<OmeInfo> {
     })
 }
 
+/// Look for the SpatialData store marker beside a Zarr V2 `.zgroup`.
+///
+/// V2 keeps user attributes in a `.zattrs` file, and that file *is* the
+/// attributes object -- so the marker sits at its top level, rather than under
+/// an `attributes` field the way V3 nests it. A `.zattrs` that is missing or
+/// unparseable simply means no tag.
+///
+/// This opens `.zattrs` a second time, after `ome_info_v2` has already read it.
+/// The file is small, V2 is the older of the two SpatialData layouts, and
+/// reading each fact where that fact is explained costs less confusion than it
+/// costs microseconds.
+fn spatialdata_info_v2(dir: &Path) -> Option<String> {
+    spatialdata_tag(&read_json(&dir.join(".zattrs"))?)
+}
+
+/// Look for the SpatialData store marker in an already-parsed Zarr V3
+/// `zarr.json`.
+///
+/// V3 keeps group attributes in that same file, so nothing extra is read here.
+fn spatialdata_info_v3(value: &Value) -> Option<String> {
+    spatialdata_tag(value.get("attributes")?)
+}
+
+/// The tag for the root of a SpatialData store, or `None` when this group is
+/// not one.
+///
+/// `attrs` is whichever object holds the group's attributes -- the whole
+/// `.zattrs` for V2, `attributes` for V3 -- the same split `ome_info` handles.
+///
+/// [SpatialData] keeps a spatial omics experiment in a Zarr container: images,
+/// segmentation masks, transcript locations, geometries and annotation tables,
+/// all in one store. Only the root of that store is tagged here.
+///
+/// The elements *inside* a store carry a `spatialdata_attrs` of their own,
+/// holding just the version of their own encoding -- so the presence of that
+/// object proves nothing. Only the root records the software that wrote it,
+/// which is why `spatialdata_software_version` is what is required. Without
+/// that check, every image, label, point and shape group would be reported as
+/// a store of its own.
+///
+/// Nothing here looks at directory names. In a real store the `images`,
+/// `points`, `shapes` and `tables` groups carry no attributes at all, so a
+/// name would be the only thing left to go on -- and a store written before
+/// the version was recorded carries no marker either, so it is left untagged
+/// rather than guessed at.
+///
+/// [SpatialData]: https://spatialdata.scverse.org/
+fn spatialdata_tag(attrs: &Value) -> Option<String> {
+    let spatialdata_attrs = attrs.get("spatialdata_attrs")?;
+
+    // The discriminator, read for its presence rather than its value. `get` on
+    // anything that is not an object yields None, so a `spatialdata_attrs`
+    // that is a string or a number falls out here too, with no type check of
+    // ours.
+    spatialdata_attrs.get("spatialdata_software_version")?;
+
+    // Shown exactly as stored, and never checked against the versions we
+    // happen to know about: this tool reports metadata rather than validating
+    // it. A version that is absent, or is not a string, just leaves the tag
+    // bare -- the same way an OME-Zarr image with no readable version does.
+    match spatialdata_attrs
+        .get("version")
+        .and_then(|value| value.as_str())
+    {
+        Some(version) => Some(format!("SpatialData {version}")),
+        None => Some(String::from("SpatialData")),
+    }
+}
+
 /// The metadata rows to print underneath a node's own line, in display order.
 ///
 /// Everything but an OME-Zarr image group has nothing to say here and gets an
@@ -314,7 +424,9 @@ fn group_rows(kind: &NodeKind) -> Vec<String> {
     // `let ... else` matches one pattern and takes an early exit when it does
     // not fit, which reads better here than a `match` whose other arm is just
     // an empty list.
-    let NodeKind::Group(Some(ome)) = kind else {
+    // The `..` says the rest of GroupMeta is not needed here: a SpatialData
+    // root has nothing to add below its own line in this version.
+    let NodeKind::Group(GroupMeta { ome: Some(ome), .. }) = kind else {
         return Vec::new();
     };
 
@@ -778,5 +890,121 @@ mod tests {
         // Present and walkable, but empty.
         let empty = json!([]);
         assert_eq!(dataset_paths(Some(&empty)), None);
+    }
+
+    #[test]
+    fn spatialdata_root_is_detected_from_v3_attributes() {
+        // The root of a SpatialData store as written today: the marker sits in
+        // the group's attributes and carries two versions -- the container
+        // format's, which is what we show, and the writing software's, which
+        // is what tells a root from an element.
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "spatialdata_attrs": {
+                    "version": "0.2",
+                    "spatialdata_software_version": "0.7.3"
+                }
+            }
+        });
+
+        assert_eq!(
+            spatialdata_info_v3(&value),
+            Some(String::from("SpatialData 0.2"))
+        );
+    }
+
+    #[test]
+    fn spatialdata_root_without_a_version_is_still_detected() {
+        // The discriminator is here, so this is a store root; the version is
+        // not, so the tag is bare. Requiring the version would mean refusing
+        // to name a store we can plainly see -- the same rule an OME-Zarr
+        // image with no readable version follows.
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "spatialdata_attrs": { "spatialdata_software_version": "0.7.3" }
+            }
+        });
+
+        assert_eq!(
+            spatialdata_info_v3(&value),
+            Some(String::from("SpatialData"))
+        );
+    }
+
+    #[test]
+    fn element_spatialdata_attrs_do_not_make_a_root() {
+        // An image element from inside a store. It carries a
+        // `spatialdata_attrs` of its own -- as every image, label, point and
+        // shape element does -- holding only the version of its own encoding.
+        // What it does not carry is the software version, and that is the
+        // entire difference between an element and a store root.
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "ome": {
+                    "version": "0.5-dev-spatialdata",
+                    "multiscales": [
+                        {
+                            "axes": [{ "name": "y" }, { "name": "x" }],
+                            "datasets": [{ "path": "s0" }]
+                        }
+                    ]
+                },
+                "spatialdata_attrs": { "version": "0.3" }
+            }
+        });
+
+        assert_eq!(spatialdata_info_v3(&value), None);
+
+        // Withholding the one tag leaves the other untouched: this is still
+        // the OME-Zarr image it says it is.
+        assert!(ome_info_v3(&value).is_some());
+    }
+
+    #[test]
+    fn spatialdata_metadata_with_nothing_to_show_produces_no_tag() {
+        // Three ways of not being a SpatialData store root, and one rule for
+        // all of them: print no tag, and never fall back on directory names.
+
+        // No marker at all -- an ordinary Zarr group.
+        let plain = json!({ "zarr_format": 3, "node_type": "group", "attributes": {} });
+        assert_eq!(spatialdata_info_v3(&plain), None);
+
+        // Present, but not an object. `get` on a string yields None, so this
+        // costs no type check of its own.
+        let not_an_object = json!({ "attributes": { "spatialdata_attrs": "0.2" } });
+        assert_eq!(spatialdata_info_v3(&not_an_object), None);
+
+        // An object, and a plausible one, but with no discriminator in it.
+        let no_discriminator = json!({ "attributes": { "spatialdata_attrs": { "foo": "bar" } } });
+        assert_eq!(spatialdata_info_v3(&no_discriminator), None);
+    }
+
+    #[test]
+    fn spatialdata_root_is_read_from_a_v2_zattrs_file() {
+        let dir = env::temp_dir().join(format!("zarr-tree-test-sd-v2-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Container format 0.1 is a Zarr V2 store. `.zattrs` *is* the
+        // attributes object, so the marker sits at its top level rather than
+        // under an `attributes` field the way V3 nests it -- which is the one
+        // thing this test can check and the V3 tests above cannot.
+        fs::write(dir.join(".zgroup"), r#"{"zarr_format": 2}"#).unwrap();
+        fs::write(
+            dir.join(".zattrs"),
+            r#"{"spatialdata_attrs": {"version": "0.1", "spatialdata_software_version": "0.7.3"}}"#,
+        )
+        .unwrap();
+
+        let info = spatialdata_info_v2(&dir);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(info, Some(String::from("SpatialData 0.1")));
     }
 }
