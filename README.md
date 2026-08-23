@@ -245,7 +245,7 @@ cargo fmt --check            # formatting, as CI runs it
 ```
 
 The suite is in two parts: 17 unit tests in `src/main.rs`, which cover metadata
-parsing directly, and 5 integration tests in `tests/cli.rs`, which run the
+parsing directly, and 6 integration tests in `tests/cli.rs`, which run the
 compiled binary against throwaway fixture stores and assert on what it prints.
 
 CI runs `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` on

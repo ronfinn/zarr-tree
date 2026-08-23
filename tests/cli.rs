@@ -423,6 +423,85 @@ fn ome_zarr_metadata_rows_are_printed_above_the_child_arrays() {
 }
 
 #[test]
+fn a_labels_group_is_a_child_but_not_a_pyramid_level() {
+    let dir = fixture_dir("ome-labels");
+    let root = dir.join("image.zarr");
+
+    // A V2 / OME-NGFF 0.4 image group declaring three resolution levels.
+    write_file(&root.join(".zgroup"), r#"{"zarr_format": 2}"#);
+    write_file(
+        &root.join(".zattrs"),
+        r#"{
+            "multiscales": [
+                {
+                    "version": "0.4",
+                    "axes": [{"name": "y", "type": "space"}, {"name": "x", "type": "space"}],
+                    "datasets": [{"path": "0"}, {"path": "1"}, {"path": "2"}]
+                }
+            ]
+        }"#,
+    );
+    for (level, size) in [("0", 1024), ("1", 512), ("2", 256)] {
+        write_file(
+            &root.join(level).join(".zarray"),
+            &format!(
+                r#"{{"zarr_format": 2, "shape": [{size}, {size}], "chunks": [256, 256], "dtype": "|u1"}}"#
+            ),
+        );
+    }
+
+    // ...and a fourth child directory that is not one of them. A `labels`
+    // group beside the levels is ordinary in a real OME-Zarr image, which is
+    // exactly what makes counting directories the wrong way to get the level
+    // count.
+    write_file(&root.join("labels/.zgroup"), r#"{"zarr_format": 2}"#);
+
+    let output = run(&[root.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert!(
+        output.status.success(),
+        "expected success, got {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lines = lines(&stdout);
+
+    // The fixture is only meaningful while it really does have four children,
+    // so check that before checking the count it is meant to disagree with.
+    assert!(
+        has(&lines, "labels [group]"),
+        "expected the labels group to be listed as a child in:\n{stdout}"
+    );
+    let arrays = lines.iter().filter(|line| line.contains("[array]")).count();
+    assert_eq!(arrays, 3, "expected three level arrays in:\n{stdout}");
+
+    // Three declared levels, from `multiscales[0].datasets` -- not the four
+    // directories on disk.
+    assert!(
+        has(&lines, "pyramid levels: 3"),
+        "expected three declared levels in:\n{stdout}"
+    );
+    assert!(
+        !has(&lines, "pyramid levels: 4"),
+        "the levels were counted from the filesystem, not the metadata:\n{stdout}"
+    );
+
+    // And `labels` is absent from the declared paths, for the same reason.
+    let datasets = lines
+        .iter()
+        .find(|line| line.contains("datasets:"))
+        .unwrap_or_else(|| panic!("expected a datasets row in:\n{stdout}"));
+    assert!(
+        datasets.ends_with("datasets: 0, 1, 2"),
+        "expected exactly the declared paths, got {datasets:?} in:\n{stdout}"
+    );
+}
+
+#[test]
 fn help_flag_prints_usage_and_exits_successfully() {
     let output = run(&["--help"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
