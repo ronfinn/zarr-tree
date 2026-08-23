@@ -654,6 +654,132 @@ fn spatialdata_root_is_tagged_from_metadata_not_from_directory_names() {
 }
 
 #[test]
+fn spatialdata_elements_are_tagged_but_their_containers_are_not() {
+    // A store laid out the way a real one is: a marked root, four unmarked
+    // container groups, and the elements themselves inside them. What this
+    // test is really about is which lines get a tag and which do not.
+    let dir = fixture_dir("spatialdata-elements");
+    let store = dir.join("experiment.zarr");
+
+    write_file(
+        &store.join("zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "spatialdata_attrs": {
+                    "version": "0.2",
+                    "spatialdata_software_version": "0.7.1"
+                }
+            }
+        }"#,
+    );
+
+    for container in ["points", "shapes"] {
+        write_file(
+            &store.join(container).join("zarr.json"),
+            r#"{"zarr_format": 3, "node_type": "group", "attributes": {}}"#,
+        );
+    }
+
+    // A points element, with the attributes a current Xenium store writes.
+    write_file(
+        &store.join("points/transcripts/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "encoding-type": "ngff:points",
+                "axes": ["x", "y", "z"],
+                "coordinateTransformations": [],
+                "spatialdata_attrs": {
+                    "instance_key": "cell_id",
+                    "feature_key": "feature_name",
+                    "version": "0.2"
+                }
+            }
+        }"#,
+    );
+
+    // The payload beside it. Points are written as a partitioned Parquet
+    // dataset, so this is a directory rather than a file -- which is why it
+    // shows up in the walk at all. It carries no Zarr metadata, so it is
+    // `[unknown]`, and this test pins that down: leaving it visible is a
+    // decision, not an oversight. Suppressing it would mean matching on the
+    // name `points.parquet`, and names decide nothing here.
+    write_file(
+        &store.join("points/transcripts/points.parquet/part.0.parquet"),
+        "not read",
+    );
+
+    write_file(
+        &store.join("shapes/cell_boundaries/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "encoding-type": "ngff:shapes",
+                "axes": ["x", "y"],
+                "coordinateTransformations": [],
+                "spatialdata_attrs": { "version": "0.3" }
+            }
+        }"#,
+    );
+
+    // Shapes are written as a single Parquet file, so this one never appears
+    // in the tree: only directories are walked. The asymmetry with
+    // points.parquet above is on disk, not in this tool.
+    write_file(
+        &store.join("shapes/cell_boundaries/shapes.parquet"),
+        "not read",
+    );
+
+    let output = run(&[store.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert!(
+        output.status.success(),
+        "expected success; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output_lines = lines(&stdout);
+    for expected in [
+        // The root, tagged with the container version, exactly as before.
+        "experiment.zarr [group, SpatialData 0.2]",
+        // The containers, untagged: their names are not evidence.
+        "points [group]",
+        "shapes [group]",
+        // The elements, tagged with their kind and no version.
+        "transcripts [group, SpatialData points]",
+        "cell_boundaries [group, SpatialData shapes]",
+        // The payload directory, still shown for what it is.
+        "points.parquet [unknown]",
+    ] {
+        assert!(
+            has(&output_lines, expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
+    }
+
+    // The root plus the two elements, and nothing else: not the containers,
+    // and not the payload directory.
+    assert_eq!(
+        stdout.matches("SpatialData").count(),
+        3,
+        "expected the root and its two elements to be tagged, and nothing else:\n{stdout}"
+    );
+
+    // The single-file payload is not a directory, so the walk never sees it.
+    assert!(
+        !stdout.contains("shapes.parquet"),
+        "a file is not a node in this tree:\n{stdout}"
+    );
+}
+
+#[test]
 fn help_flag_prints_usage_and_exits_successfully() {
     let output = run(&["--help"]);
     let stdout = String::from_utf8_lossy(&output.stdout);

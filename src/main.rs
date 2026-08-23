@@ -23,10 +23,52 @@ enum NodeKind {
 struct GroupMeta {
     /// Set when the group carries OME-Zarr image metadata. See `ome_info`.
     ome: Option<OmeInfo>,
-    /// The tag for the root of a SpatialData store: "SpatialData 0.2", or
-    /// "SpatialData" when no version was read. `None` for every other group,
-    /// including the elements *inside* a store. See `spatialdata_tag`.
-    spatialdata: Option<String>,
+    /// What this group is in SpatialData's own vocabulary, when it says
+    /// anything at all. `None` for every ordinary Zarr group, and for the
+    /// `images`/`labels`/`points`/`shapes`/`tables` containers inside a store,
+    /// which carry no attributes. See `spatialdata_info`.
+    spatialdata: Option<SpatialData>,
+}
+
+/// What a group says about itself in [SpatialData]'s own vocabulary.
+///
+/// A group is either the root of a store or one element inside one, and never
+/// both. One field of this type says that better than an `Option` per kind
+/// would: most of the combinations two or three of those could represent
+/// cannot occur.
+///
+/// Which one it is comes from two unrelated markers -- see `spatialdata_info`
+/// -- but the answer is always a single value.
+///
+/// [SpatialData]: https://spatialdata.scverse.org/
+enum SpatialData {
+    /// The root of a store, holding the container format version when one was
+    /// recorded. See `spatialdata_root`.
+    Root(Option<String>),
+    /// A points element: transcript locations, molecule detections. See
+    /// `spatialdata_encoded_element`.
+    Points,
+    /// A shapes element: cell boundaries, circles, landmarks.
+    Shapes,
+}
+
+impl SpatialData {
+    /// The text printed inside a group's label.
+    ///
+    /// A root is tagged with the *container* format version. An element is
+    /// tagged with its kind and no version at all: the number an element
+    /// records is the version of its own encoding, a different quantity that
+    /// would collide confusingly with the container version shown on the root
+    /// line -- in a container 0.2 store the points element is 0.2 and the
+    /// shapes element is 0.3.
+    fn tag(&self) -> String {
+        match self {
+            SpatialData::Root(Some(version)) => format!("SpatialData {version}"),
+            SpatialData::Root(None) => String::from("SpatialData"),
+            SpatialData::Points => String::from("SpatialData points"),
+            SpatialData::Shapes => String::from("SpatialData shapes"),
+        }
+    }
 }
 
 /// The three fields shown underneath an array, already formatted for printing.
@@ -103,7 +145,7 @@ impl NodeKind {
                     tags.push(ome.tag.clone());
                 }
                 if let Some(spatialdata) = &meta.spatialdata {
-                    tags.push(spatialdata.clone());
+                    tags.push(spatialdata.tag());
                 }
                 format!("[{}]", tags.join(", "))
             }
@@ -345,10 +387,10 @@ fn ome_info(ome: &Value, version: Option<&Value>) -> Option<OmeInfo> {
     })
 }
 
-/// Look for the SpatialData store marker beside a Zarr V2 `.zgroup`.
+/// Look for SpatialData metadata beside a Zarr V2 `.zgroup`.
 ///
 /// V2 keeps user attributes in a `.zattrs` file, and that file *is* the
-/// attributes object -- so the marker sits at its top level, rather than under
+/// attributes object -- so the markers sit at its top level, rather than under
 /// an `attributes` field the way V3 nests it. A `.zattrs` that is missing or
 /// unparseable simply means no tag.
 ///
@@ -356,27 +398,44 @@ fn ome_info(ome: &Value, version: Option<&Value>) -> Option<OmeInfo> {
 /// The file is small, V2 is the older of the two SpatialData layouts, and
 /// reading each fact where that fact is explained costs less confusion than it
 /// costs microseconds.
-fn spatialdata_info_v2(dir: &Path) -> Option<String> {
-    spatialdata_tag(&read_json(&dir.join(".zattrs"))?)
+fn spatialdata_info_v2(dir: &Path) -> Option<SpatialData> {
+    spatialdata_info(&read_json(&dir.join(".zattrs"))?)
 }
 
-/// Look for the SpatialData store marker in an already-parsed Zarr V3
-/// `zarr.json`.
+/// Look for SpatialData metadata in an already-parsed Zarr V3 `zarr.json`.
 ///
 /// V3 keeps group attributes in that same file, so nothing extra is read here.
-fn spatialdata_info_v3(value: &Value) -> Option<String> {
-    spatialdata_tag(value.get("attributes")?)
+fn spatialdata_info_v3(value: &Value) -> Option<SpatialData> {
+    spatialdata_info(value.get("attributes")?)
 }
 
-/// The tag for the root of a SpatialData store, or `None` when this group is
-/// not one.
+/// What a group says about itself in SpatialData's vocabulary, or `None` when
+/// it says nothing.
 ///
 /// `attrs` is whichever object holds the group's attributes -- the whole
 /// `.zattrs` for V2, `attributes` for V3 -- the same split `ome_info` handles.
 ///
 /// [SpatialData] keeps a spatial omics experiment in a Zarr container: images,
 /// segmentation masks, transcript locations, geometries and annotation tables,
-/// all in one store. Only the root of that store is tagged here.
+/// all in one store.
+///
+/// Two independent markers are read, in two different keys, and a group is
+/// only ever one of them. They are tried in order, so a group that somehow
+/// carried both would be reported as the first that matched -- the store root
+/// before anything inside a store.
+///
+/// Nothing here looks at directory names. In a real store the `images`,
+/// `points`, `shapes` and `tables` groups carry no attributes at all, so a
+/// name would be the only thing left to go on -- and an ordinary Zarr store
+/// whose children happen to be called `points` and `shapes` is not a
+/// SpatialData store.
+///
+/// [SpatialData]: https://spatialdata.scverse.org/
+fn spatialdata_info(attrs: &Value) -> Option<SpatialData> {
+    spatialdata_root(attrs).or_else(|| spatialdata_encoded_element(attrs))
+}
+
+/// The root of a SpatialData store, or `None` when this group is not one.
 ///
 /// The elements *inside* a store carry a `spatialdata_attrs` of their own,
 /// holding just the version of their own encoding -- so the presence of that
@@ -385,14 +444,11 @@ fn spatialdata_info_v3(value: &Value) -> Option<String> {
 /// that check, every image, label, point and shape group would be reported as
 /// a store of its own.
 ///
-/// Nothing here looks at directory names. In a real store the `images`,
-/// `points`, `shapes` and `tables` groups carry no attributes at all, so a
-/// name would be the only thing left to go on -- and a store written before
-/// the version was recorded carries no marker either, so it is left untagged
-/// rather than guessed at.
-///
-/// [SpatialData]: https://spatialdata.scverse.org/
-fn spatialdata_tag(attrs: &Value) -> Option<String> {
+/// A store written before that version was recorded carries no marker at all,
+/// and is left untagged rather than guessed at. Its *elements* are still
+/// recognised, as far as they name themselves: `spatialdata_encoded_element`
+/// reads a different key, which those older stores do carry.
+fn spatialdata_root(attrs: &Value) -> Option<SpatialData> {
     let spatialdata_attrs = attrs.get("spatialdata_attrs")?;
 
     // The discriminator, read for its presence rather than its value. `get` on
@@ -405,12 +461,41 @@ fn spatialdata_tag(attrs: &Value) -> Option<String> {
     // happen to know about: this tool reports metadata rather than validating
     // it. A version that is absent, or is not a string, just leaves the tag
     // bare -- the same way an OME-Zarr image with no readable version does.
-    match spatialdata_attrs
+    let version = spatialdata_attrs
         .get("version")
         .and_then(|value| value.as_str())
-    {
-        Some(version) => Some(format!("SpatialData {version}")),
-        None => Some(String::from("SpatialData")),
+        .map(String::from);
+
+    Some(SpatialData::Root(version))
+}
+
+/// An element that names its own kind, or `None` when this group is not one.
+///
+/// SpatialData writes the kind of its non-raster elements into the attributes
+/// as a plain string. The values read here have been written unchanged by
+/// every release of the library, and are the same in Zarr V2 and V3, so
+/// recognition needs no per-version handling: what changed between format
+/// versions is where the *payload* lives, and no payload is read.
+///
+/// The kind is read from `encoding-type`, and matched exactly -- never by
+/// prefix, and never by the mere presence of the key. That key is not ours
+/// alone: AnnData writes it too, with values of its own such as `"anndata"`
+/// and `"dataframe"`, and none of those is a SpatialData element.
+///
+/// An element carries no version in its tag, so nothing is read here beyond
+/// this one string. What it does carry -- axis names, a feature key, an
+/// instance key, the region a table annotates -- is scientific metadata this
+/// version does not display.
+fn spatialdata_encoded_element(attrs: &Value) -> Option<SpatialData> {
+    encoded_kind(attrs, "encoding-type")
+}
+
+/// The element kind named by `key`, or `None` when it names nothing we know.
+fn encoded_kind(attrs: &Value, key: &str) -> Option<SpatialData> {
+    match attrs.get(key)?.as_str()? {
+        "ngff:points" => Some(SpatialData::Points),
+        "ngff:shapes" => Some(SpatialData::Shapes),
+        _ => None,
     }
 }
 
@@ -909,8 +994,11 @@ mod tests {
             }
         });
 
+        // Compared through `tag()` rather than by variant: that keeps the
+        // assertion about what the user sees, and saves `SpatialData` from
+        // deriving PartialEq and Debug that nothing outside these tests uses.
         assert_eq!(
-            spatialdata_info_v3(&value),
+            spatialdata_info_v3(&value).map(|info| info.tag()),
             Some(String::from("SpatialData 0.2"))
         );
     }
@@ -930,7 +1018,7 @@ mod tests {
         });
 
         assert_eq!(
-            spatialdata_info_v3(&value),
+            spatialdata_info_v3(&value).map(|info| info.tag()),
             Some(String::from("SpatialData"))
         );
     }
@@ -959,7 +1047,7 @@ mod tests {
             }
         });
 
-        assert_eq!(spatialdata_info_v3(&value), None);
+        assert!(spatialdata_info_v3(&value).is_none());
 
         // Withholding the one tag leaves the other untouched: this is still
         // the OME-Zarr image it says it is.
@@ -973,16 +1061,16 @@ mod tests {
 
         // No marker at all -- an ordinary Zarr group.
         let plain = json!({ "zarr_format": 3, "node_type": "group", "attributes": {} });
-        assert_eq!(spatialdata_info_v3(&plain), None);
+        assert!(spatialdata_info_v3(&plain).is_none());
 
         // Present, but not an object. `get` on a string yields None, so this
         // costs no type check of its own.
         let not_an_object = json!({ "attributes": { "spatialdata_attrs": "0.2" } });
-        assert_eq!(spatialdata_info_v3(&not_an_object), None);
+        assert!(spatialdata_info_v3(&not_an_object).is_none());
 
         // An object, and a plausible one, but with no discriminator in it.
         let no_discriminator = json!({ "attributes": { "spatialdata_attrs": { "foo": "bar" } } });
-        assert_eq!(spatialdata_info_v3(&no_discriminator), None);
+        assert!(spatialdata_info_v3(&no_discriminator).is_none());
     }
 
     #[test]
@@ -1005,6 +1093,183 @@ mod tests {
 
         fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(info, Some(String::from("SpatialData 0.1")));
+        assert_eq!(
+            info.map(|info| info.tag()),
+            Some(String::from("SpatialData 0.1"))
+        );
+    }
+
+    #[test]
+    fn points_element_is_detected_from_v3_attributes() {
+        // A transcripts element, as a current Xenium store writes it: the kind
+        // in `encoding-type`, and beside it the scientific metadata this
+        // version deliberately does not display.
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "encoding-type": "ngff:points",
+                "axes": ["x", "y", "z"],
+                "coordinateTransformations": [],
+                "spatialdata_attrs": {
+                    "instance_key": "cell_id",
+                    "feature_key": "feature_name",
+                    "version": "0.2"
+                }
+            }
+        });
+
+        let info = spatialdata_info_v3(&value).expect("an element marker should be recognised");
+
+        // No version in the tag: the 0.2 above is this element's own encoding
+        // version, not the container version a root line shows.
+        assert_eq!(info.tag(), "SpatialData points");
+    }
+
+    #[test]
+    fn shapes_element_is_detected_from_v3_attributes() {
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "encoding-type": "ngff:shapes",
+                "axes": ["x", "y"],
+                "coordinateTransformations": [],
+                "spatialdata_attrs": { "version": "0.3" }
+            }
+        });
+
+        let info = spatialdata_info_v3(&value).expect("an element marker should be recognised");
+
+        assert_eq!(info.tag(), "SpatialData shapes");
+    }
+
+    #[test]
+    fn an_element_is_recognised_without_spatialdata_attrs() {
+        // The rule is the `encoding-type` value and nothing else. Every other
+        // points and shapes fixture in this file carries a `spatialdata_attrs`
+        // beside it, because a store written today does -- which could leave a
+        // reader believing that object is part of what is being matched.
+        //
+        // It is not, and the difference shows up in the oldest stores. One
+        // written before SpatialData recorded a software version has no root
+        // marker at all; requiring `spatialdata_attrs` here would leave its
+        // elements untagged as well, and the whole store would go unrecognised.
+        // Rasters are the ones that do need it -- see
+        // `spatialdata_raster_element`, which has nothing else to go on -- and
+        // the two rules are deliberately separate.
+        for (marker, expected) in [
+            ("ngff:points", "SpatialData points"),
+            ("ngff:shapes", "SpatialData shapes"),
+        ] {
+            let value = json!({
+                "zarr_format": 3,
+                "node_type": "group",
+                "attributes": { "encoding-type": marker }
+            });
+
+            assert_eq!(
+                spatialdata_info_v3(&value).map(|info| info.tag()),
+                Some(String::from(expected)),
+                "{marker:?} names its own kind, with nothing beside it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shapes_element_from_the_array_era_is_still_detected() {
+        let dir = env::temp_dir().join(format!("zarr-tree-test-sd-shapes-v1-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // The oldest shapes encoding, from a Zarr V2 store: the geometry lived
+        // in sibling Zarr arrays rather than in a Parquet file, `geos` recorded
+        // its type, and `axes` was written as JSON null.
+        //
+        // None of that changes the marker, which is the whole point of this
+        // test: recognition reads one key that every release has written the
+        // same way, so a format change we never look at cannot reach us.
+        fs::write(dir.join(".zgroup"), r#"{"zarr_format": 2}"#).unwrap();
+        fs::write(
+            dir.join(".zattrs"),
+            r#"{
+                "axes": null,
+                "coordinateTransformations": [],
+                "encoding-type": "ngff:shapes",
+                "spatialdata_attrs": {
+                    "geos": {"name": "POLYGON", "type": 3},
+                    "version": "0.1"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let info = spatialdata_info_v2(&dir);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            info.map(|info| info.tag()),
+            Some(String::from("SpatialData shapes"))
+        );
+    }
+
+    #[test]
+    fn unrecognised_encoding_types_produce_no_element_tag() {
+        // Four ways of not being an element we know, and one rule for all of
+        // them: print no element tag, and never fall back on directory names.
+
+        // Absent -- an ordinary Zarr group.
+        let plain = json!({ "attributes": {} });
+        assert!(spatialdata_info_v3(&plain).is_none());
+
+        // A real value from a real store, and not ours: AnnData writes this
+        // one. Matching the key rather than the value would tag it.
+        let anndata = json!({ "attributes": { "encoding-type": "anndata" } });
+        assert!(spatialdata_info_v3(&anndata).is_none());
+
+        // A kind we do not know. Not guessed at, not reported.
+        let unknown = json!({ "attributes": { "encoding-type": "ngff:something-new" } });
+        assert!(spatialdata_info_v3(&unknown).is_none());
+
+        // Present, but not a string. `as_str` yields None, so this costs no
+        // type check of its own.
+        let not_a_string = json!({ "attributes": { "encoding-type": 7 } });
+        assert!(spatialdata_info_v3(&not_a_string).is_none());
+    }
+
+    #[test]
+    fn a_root_marker_outranks_an_element_marker() {
+        // Contradictory metadata that no writer produces: the discriminator
+        // that makes a store root, and beside it an element kind. A group is
+        // one or the other and never both, so `spatialdata_info` has to choose
+        // -- and it chooses the root, because `spatialdata_root` is simply
+        // tried first.
+        //
+        // That ordering is the entire rule, which is why it is worth a test of
+        // its own. Swapping the two `or_else` arms would change what this
+        // prints, and nothing else in the suite would notice.
+        //
+        // The root wins on two grounds. Its marker is the stricter of the two
+        // -- a key nested inside an object, rather than one string at the top
+        // level -- so given input that cannot be trusted, it is the claim less
+        // likely to have been made by accident. And reading a root as an
+        // element would lose both the container version and the fact that this
+        // node is the store, where the reverse loses only a kind word.
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "spatialdata_attrs": {
+                    "version": "0.2",
+                    "spatialdata_software_version": "0.7.3"
+                },
+                "encoding-type": "ngff:points"
+            }
+        });
+
+        assert_eq!(
+            spatialdata_info_v3(&value).map(|info| info.tag()),
+            Some(String::from("SpatialData 0.2"))
+        );
     }
 }

@@ -36,6 +36,8 @@ example.zarr [group]
   metadata declares, and the paths it declares them at.
 - Recognises the root of a SpatialData store and tags it, e.g.
   `[group, SpatialData 0.2]`.
+- Recognises SpatialData points and shapes elements from their own metadata,
+  e.g. `[group, SpatialData points]`.
 - Degrades gracefully: metadata that cannot be read or parsed costs only that
   node's label or a single field, never the rest of the walk.
 
@@ -306,8 +308,8 @@ cargo clippy -- -D warnings  # lints, as CI runs them
 cargo fmt --check            # formatting, as CI runs it
 ```
 
-The suite is in two parts: 22 unit tests in `src/main.rs`, which cover metadata
-parsing directly, and 7 integration tests in `tests/cli.rs`, which run the
+The suite is in two parts: 28 unit tests in `src/main.rs`, which cover metadata
+parsing directly, and 8 integration tests in `tests/cli.rs`, which run the
 compiled binary against throwaway fixture stores and assert on what it prints.
 
 CI runs `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` on
@@ -330,12 +332,14 @@ every push and pull request.
   count; whether a declared dataset path exists), and coordinate
   transformations, `omero`, labels and plate/well metadata are not read. No
   scale factors, pixel sizes or physical extents are calculated.
-- SpatialData support goes no further than recognising a store root and showing
-  its container version. The element types — images, labels, points, shapes and
-  tables — are not classified, and nothing inside them is read: `points.parquet`,
-  `shapes.parquet` and the AnnData tables are left alone.
-- Stores written before SpatialData recorded a version carry no marker at all
-  and are not recognised. Nothing is inferred from directory names.
+- SpatialData support goes no further than recognising a store root and its
+  points and shapes elements. Images, labels and tables are not classified, and
+  nothing inside an element is read: `points.parquet`, `shapes.parquet` and the
+  AnnData tables are left alone.
+- A store root written before SpatialData recorded a software version carries
+  no root marker and is not recognised as one; its points and shapes elements
+  still are, because those name themselves in a key such a store does carry.
+  Nothing is inferred from directory names in any case.
 - Symlinked directories are listed but not followed.
 
 ## Roadmap
