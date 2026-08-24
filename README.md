@@ -530,7 +530,7 @@ cargo build                  # debug build -> target/debug/zarr-tree
 cargo run -- <directory>     # build + run
 cargo test                   # run all tests
 cargo test -- --nocapture    # let tests print to stdout
-cargo clippy -- -D warnings  # lints, as CI runs them
+cargo clippy --all-targets -- -D warnings  # lints, as CI runs them
 cargo fmt --check            # formatting, as CI runs it
 ```
 
@@ -538,8 +538,8 @@ The suite is in two parts: 37 unit tests in `src/main.rs`, which cover metadata
 parsing directly, and 11 integration tests in `tests/cli.rs`, which run the
 compiled binary against throwaway fixture stores and assert on what it prints.
 
-CI runs `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` on
-every push and pull request.
+CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
+`cargo test` on every push and pull request.
 
 ## Limitations
 
@@ -581,6 +581,14 @@ every push and pull request.
   but not the path, and there is no way to skip past it: the text output
   keeps whatever it had already printed, while `--json` prints nothing at
   all, since the whole document is built before any of it is written.
+- Arguments are read with `std::env::args`, which panics on an argument that
+  is not valid UTF-8. On a system where such a path can exist, that happens
+  before any argument validation runs, so the failure is a panic rather than
+  the usual message and exit status 1.
+- `--json` builds the whole document in memory before writing any of it, while
+  the text output is streamed as the walk proceeds. So peak memory grows with
+  the number of nodes in the tree, and an error part-way through a walk
+  produces no JSON at all rather than a partial document.
 
 ## Roadmap
 
