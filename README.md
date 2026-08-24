@@ -40,6 +40,7 @@ example.zarr [group]
   e.g. `[group, SpatialData points]`, and tells a segmentation from an image by
   its OME-Zarr metadata rather than by its directory name.
 - Limits how far it descends with `--depth N`.
+- Prints the same walk as JSON with `--json`, for `jq` and scripts.
 - Sits quietly at the producing end of a pipe: `| head` ends the run with no
   panic and no error.
 - Degrades gracefully: metadata that cannot be read or parsed costs only that
@@ -276,6 +277,7 @@ usage: zarr-tree [OPTIONS] <DIRECTORY>
 
 ```
         --depth <N>  Descend at most N levels below the root
+        --json       Print the same tree as JSON
     -h, --help       Print help
     -V, --version    Print version
 ```
@@ -288,6 +290,12 @@ cannot be inspected.
 its own, `1` adds its direct children, and so on. Left out, the whole store is
 walked. A node that is shown keeps its own metadata rows, and arrays are leaves
 at any depth.
+
+`--json` prints the same walk as one JSON document, for piping into `jq` or
+reading from a script. It combines with `--depth`. Every node carries its
+`name`, its `kind` and its `children`; the `array`, `ome` and `spatialdata`
+sections appear only on the nodes they apply to, and a field inside one is
+`null` where the tree would print `?`.
 
 ## Example output
 
@@ -326,7 +334,7 @@ cargo fmt --check            # formatting, as CI runs it
 ```
 
 The suite is in two parts: 37 unit tests in `src/main.rs`, which cover metadata
-parsing directly, and 10 integration tests in `tests/cli.rs`, which run the
+parsing directly, and 11 integration tests in `tests/cli.rs`, which run the
 compiled binary against throwaway fixture stores and assert on what it prints.
 
 CI runs `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` on
@@ -338,7 +346,7 @@ every push and pull request.
 - Only `shape`, `chunks`/`chunk_shape` and `dtype`/`data_type` are read.
   Codecs, compressors, fill values, dimension names and user attributes are
   not shown.
-- No output options beyond `--depth`: no filtering, no JSON output, no colour.
+- No output options beyond `--depth` and `--json`: no filtering, no colour.
 - V2 dtypes are passed through as stored and V3 dtypes given in object form
   (the extension syntax) are not interpreted.
 - Sharding is not understood; a sharded array shows its declared chunk shape

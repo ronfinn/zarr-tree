@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// What kind of Zarr node a directory is, as far as its metadata files reveal.
 enum NodeKind {
@@ -15,8 +15,7 @@ enum NodeKind {
     Unknown,
 }
 
-/// What a group's attributes say about it, already formatted for printing --
-/// the same approach `ArrayMeta` takes for shape, chunks and dtype.
+/// What a group's attributes say about it, beyond its being a group.
 ///
 /// The two fields are independent facts, read by two conventions that know
 /// nothing about each other. A group may carry either, both, or -- as almost
@@ -82,29 +81,60 @@ impl SpatialData {
             SpatialData::Labels => String::from("SpatialData labels"),
         }
     }
+
+    /// The kind on its own, without the convention in front of it, for output
+    /// that has already said which convention it is talking about.
+    fn kind(&self) -> &'static str {
+        match self {
+            SpatialData::Root(_) => "root",
+            SpatialData::Points => "points",
+            SpatialData::Shapes => "shapes",
+            SpatialData::Table => "table",
+            SpatialData::Image => "image",
+            SpatialData::Labels => "labels",
+        }
+    }
+
+    /// The container format version, which only a store root records.
+    fn version(&self) -> Option<&str> {
+        match self {
+            SpatialData::Root(version) => version.as_deref(),
+            _ => None,
+        }
+    }
 }
 
-/// The three fields shown underneath an array, already formatted for printing.
-/// Each is optional on its own, so metadata missing `chunks` still shows the
-/// shape it does have.
+/// The three fields shown underneath an array. Each is optional on its own, so
+/// metadata missing `chunks` still shows the shape it does have.
+///
+/// The two dimension lists are kept as the values the file held rather than as
+/// finished text, because two renderers now draw on them and they want
+/// different things: the tree wants `[4096, 4096]`, and `--json` wants a real
+/// JSON array. Formatting once, here, would have forced the second to unpick
+/// the first.
+///
+/// Nothing interprets the entries. A dimension is copied across whatever it
+/// was written as, so a malformed `"shape": [1, "x"]` survives to the output
+/// instead of being dropped on the way.
 struct ArrayMeta {
-    shape: Option<String>,
-    chunks: Option<String>,
+    shape: Option<Vec<Value>>,
+    chunks: Option<Vec<Value>>,
     dtype: Option<String>,
 }
 
-/// What an OME-Zarr image group carries, already formatted for printing -- the
-/// same approach `ArrayMeta` takes for shape, chunks and dtype.
+/// What an OME-Zarr image group carries.
 ///
-/// The `Option` sits outside this struct rather than around `tag`: a group
-/// either is an OME-Zarr image, in which case it always has a tag, or it is an
-/// ordinary group and there is nothing here at all.
+/// The `Option` sits outside this struct rather than around its fields: a group
+/// either is an OME-Zarr image, in which case it always has at least a version
+/// slot, or it is an ordinary group and there is nothing here at all.
 struct OmeInfo {
-    /// The label tag: "OME-Zarr 0.5", or "OME-Zarr" when no version was read.
-    tag: String,
-    /// The axes row, e.g. "c, z, y, x". `None` when the metadata carries no
-    /// axes (OME-NGFF 0.1 and 0.2) or we could not read them.
-    axes: Option<String>,
+    /// The metadata version, exactly as stored. `None` when the file records
+    /// none, which real 0.4 stores often do not.
+    version: Option<String>,
+    /// The axis names, in the order the metadata lists them. `None` when the
+    /// metadata carries no axes (OME-NGFF 0.1 and 0.2) or we could not read
+    /// them.
+    axes: Option<Vec<String>>,
     /// The declared resolution levels, as the paths the metadata lists, in the
     /// order it lists them. `None` when there is no usable `datasets` array.
     ///
@@ -113,6 +143,20 @@ struct OmeInfo {
     /// fact shown twice. Keeping the list is what stops the two from drifting:
     /// the count is simply its length.
     datasets: Option<Vec<String>>,
+}
+
+impl OmeInfo {
+    /// The label tag: "OME-Zarr 0.5", or "OME-Zarr" when no version was read.
+    ///
+    /// Built here rather than stored, so that the version and the text made
+    /// from it cannot drift apart -- the same reason `pyramid levels` is the
+    /// length of `datasets` rather than a number of its own.
+    fn tag(&self) -> String {
+        match &self.version {
+            Some(version) => format!("OME-Zarr {version}"),
+            None => String::from("OME-Zarr"),
+        }
+    }
 }
 
 /// The text printed by `--help`.
@@ -133,6 +177,8 @@ OPTIONS:
         --depth <N>  Descend at most N levels below the root.
                      0 shows the root on its own. Omitted, the whole store is
                      walked. Arrays are leaves at any depth.
+        --json       Print the same tree as JSON, one object per node.
+                     Combines with --depth.
     -h, --help       Print help
     -V, --version    Print version";
 
@@ -148,6 +194,9 @@ struct Options {
     /// How many levels below the root to descend, or `None` for all of them.
     /// `Some(0)` shows the root and nothing under it.
     depth: Option<usize>,
+    /// Print JSON instead of the tree. The two show the same facts about the
+    /// same nodes; only the shape of the output differs.
+    json: bool,
 }
 
 /// What `parse_args` made of the command line.
@@ -182,7 +231,7 @@ impl NodeKind {
                 // function hands back an owned String either way, so there is
                 // nothing to be gained by borrowing here.
                 if let Some(ome) = &meta.ome {
-                    tags.push(ome.tag.clone());
+                    tags.push(ome.tag());
                 }
                 if let Some(spatialdata) = &meta.spatialdata {
                     tags.push(spatialdata.tag());
@@ -191,6 +240,16 @@ impl NodeKind {
             }
             NodeKind::Array(_) => String::from("[array]"),
             NodeKind::Unknown => String::from("[unknown]"),
+        }
+    }
+
+    /// The Zarr node kind on its own, without the brackets the tree draws
+    /// around it or the tags it collects inside them.
+    fn kind(&self) -> &'static str {
+        match self {
+            NodeKind::Group(_) => "group",
+            NodeKind::Array(_) => "array",
+            NodeKind::Unknown => "unknown",
         }
     }
 }
@@ -279,6 +338,14 @@ fn run() -> io::Result<()> {
     // node below it is named by its directory.
     let root_name = options.path.trim_end_matches('/');
 
+    if options.json {
+        let tree = json_tree(root_name, root, options.depth)?;
+        // Indented rather than compact: this is still a command a person runs
+        // and reads, and `jq` does not mind either way.
+        writeln!(out, "{}", serde_json::to_string_pretty(&tree)?)?;
+        return out.flush();
+    }
+
     let root_kind = classify(root);
     writeln!(out, "{root_name} {}", root_kind.label())?;
 
@@ -306,6 +373,7 @@ fn run() -> io::Result<()> {
 fn parse_args(args: &[String]) -> Result<Request, String> {
     let mut path: Option<&str> = None;
     let mut depth: Option<usize> = None;
+    let mut json = false;
 
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -327,6 +395,8 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
                         .map_err(|_| format!("--depth needs a whole number, not {value:?}"))?,
                 );
             }
+            // Repeating it is not an error: it asks for the same thing twice.
+            "--json" => json = true,
             // A leading dash we do not know is a mistyped option rather than a
             // directory. The cost of reading it that way is that a directory
             // whose name begins with `-` can no longer be inspected -- the
@@ -345,6 +415,7 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
     Ok(Request::Walk(Options {
         path: String::from(path),
         depth,
+        json,
     }))
 }
 
@@ -386,7 +457,7 @@ fn print_tree(
     for (i, path) in subdirs.iter().enumerate() {
         let is_last = i == subdirs.len() - 1;
         let connector = if is_last { "└── " } else { "├── " };
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let name = node_name(path);
         let kind = classify(path);
         writeln!(out, "{prefix}{connector}{name} {}", kind.label())?;
 
@@ -450,6 +521,19 @@ fn child_dirs(dir: &Path, depth: Option<usize>) -> io::Result<Vec<PathBuf>> {
     subdirs.sort();
 
     Ok(subdirs)
+}
+
+/// The name a node is listed under: its directory name.
+///
+/// A path with no final component -- which the walk never produces, since
+/// every entry comes from `read_dir` -- yields an empty name rather than
+/// failing. A name that is not valid UTF-8 keeps its readable parts, with the
+/// rest replaced, which is what `to_string_lossy` is for.
+fn node_name(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Decide what kind of Zarr node `dir` is by looking at the metadata files
@@ -543,13 +627,10 @@ fn ome_info(ome: &Value, version: Option<&Value>) -> Option<OmeInfo> {
     // `first()` the third.
     let first = ome.get("multiscales")?.as_array()?.first()?;
 
-    // Shown exactly as stored, and never checked against the versions we happen
+    // Kept exactly as stored, and never checked against the versions we happen
     // to know about: this tool reports metadata rather than validating it. A
     // version that is absent, or is not a string, just leaves the tag bare.
-    let tag = match version.and_then(|value| value.as_str()) {
-        Some(version) => format!("OME-Zarr {version}"),
-        None => String::from("OME-Zarr"),
-    };
+    let version = version.and_then(|value| value.as_str()).map(String::from);
 
     // Axes belong to an individual multiscale rather than to the group, so they
     // come from that same first entry in both layouts -- the one part of this
@@ -560,8 +641,8 @@ fn ome_info(ome: &Value, version: Option<&Value>) -> Option<OmeInfo> {
     // the axes it needs no per-version handling at all. What 0.4 added to each
     // entry, `coordinateTransformations`, is not read.
     Some(OmeInfo {
-        tag,
-        axes: format_axes(first.get("axes")),
+        version,
+        axes: axis_names(first.get("axes")),
         datasets: dataset_paths(first.get("datasets")),
     })
 }
@@ -753,15 +834,15 @@ fn group_rows(kind: &NodeKind) -> Vec<String> {
     // `let ... else` matches one pattern and takes an early exit when it does
     // not fit, which reads better here than a `match` whose other arm is just
     // an empty list.
-    // The `..` says the rest of GroupMeta is not needed here: a SpatialData
-    // root has nothing to add below its own line in this version.
+    // The `..` says the rest of GroupMeta is not needed here: no SpatialData
+    // marker adds a row below its own line in this version.
     let NodeKind::Group(GroupMeta { ome: Some(ome), .. }) = kind else {
         return Vec::new();
     };
 
     let mut rows = Vec::new();
     if let Some(axes) = &ome.axes {
-        rows.push(format!("axes: {axes}"));
+        rows.push(format!("axes: {}", axes.join(", ")));
     }
     // Both rows come from the same list, so they appear and vanish together.
     if let Some(datasets) = &ome.datasets {
@@ -795,8 +876,8 @@ fn array_meta_v2(path: &Path) -> ArrayMeta {
     };
 
     ArrayMeta {
-        shape: format_dims(value.get("shape")),
-        chunks: format_dims(value.get("chunks")),
+        shape: dims(value.get("shape")),
+        chunks: dims(value.get("chunks")),
         // Shown exactly as stored, in V2's NumPy notation ("<u2", "|u1").
         dtype: value
             .get("dtype")
@@ -816,8 +897,8 @@ fn array_meta_v3(value: &Value) -> ArrayMeta {
         .and_then(|config| config.get("chunk_shape"));
 
     ArrayMeta {
-        shape: format_dims(value.get("shape")),
-        chunks: format_dims(chunk_shape),
+        shape: dims(value.get("shape")),
+        chunks: dims(chunk_shape),
         // The object form used by dtype extensions is not interpreted.
         dtype: value
             .get("data_type")
@@ -826,16 +907,26 @@ fn array_meta_v3(value: &Value) -> ArrayMeta {
     }
 }
 
-/// Render a JSON array of numbers as `[4096, 4096]`, or `None` if the value is
-/// missing or is not an array.
-fn format_dims(value: Option<&Value>) -> Option<String> {
-    let items = value?.as_array()?;
-    let dims: Vec<String> = items.iter().map(|item| item.to_string()).collect();
-    Some(format!("[{}]", dims.join(", ")))
+/// Read a dimension list -- a `shape`, a `chunks`, a `chunk_shape` -- as the
+/// values it holds, or `None` if it is missing or is not an array.
+///
+/// The entries are copied rather than interpreted: whatever the file said a
+/// dimension was, that is what comes out.
+fn dims(value: Option<&Value>) -> Option<Vec<Value>> {
+    Some(value?.as_array()?.clone())
 }
 
-/// Render a `multiscales` entry's `axes` as `c, z, y, x`, or `None` when there
-/// is nothing to show.
+/// Render a dimension list as `[4096, 4096]`.
+///
+/// `Value::to_string` gives each entry its JSON spelling, so a number prints
+/// as a number and anything else prints as whatever it is.
+fn format_dims(dims: &[Value]) -> String {
+    let items: Vec<String> = dims.iter().map(|item| item.to_string()).collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// Read a `multiscales` entry's `axes` as the list of names it declares, or
+/// `None` when there is nothing to show.
 ///
 /// Both spellings are handled in one pass: OME-NGFF 0.3 stores each axis as a
 /// bare dimension name, 0.4 and 0.5 as an object with a `name`. Only the name
@@ -843,24 +934,26 @@ fn format_dims(value: Option<&Value>) -> Option<String> {
 ///
 /// An entry we cannot read a name from becomes `?` rather than being dropped,
 /// so the number of axes shown always matches the number the file declares.
-fn format_axes(value: Option<&Value>) -> Option<String> {
+fn axis_names(value: Option<&Value>) -> Option<Vec<String>> {
     let items = value?.as_array()?;
     if items.is_empty() {
         return None;
     }
 
-    let names: Vec<&str> = items
+    let names: Vec<String> = items
         .iter()
         .map(|item| {
             // Try the 0.3 form, then the 0.4/0.5 form, then give up on this
             // one entry alone.
-            item.as_str()
+            let name = item
+                .as_str()
                 .or_else(|| item.get("name").and_then(|name| name.as_str()))
-                .unwrap_or("?")
+                .unwrap_or("?");
+            String::from(name)
         })
         .collect();
 
-    Some(names.join(", "))
+    Some(names)
 }
 
 /// Read a `multiscales` entry's `datasets` as the list of paths it declares,
@@ -871,7 +964,7 @@ fn format_axes(value: Option<&Value>) -> Option<String> {
 /// legal -- so nothing here sorts, renumbers or interprets them.
 ///
 /// An entry we cannot read a path from becomes `?` rather than being dropped,
-/// the same way `format_axes` treats a nameless axis: dropping it would report
+/// the same way `axis_names` treats a nameless axis: dropping it would report
 /// a three-level pyramid as a two-level one.
 fn dataset_paths(value: Option<&Value>) -> Option<Vec<String>> {
     let items = value?.as_array()?;
@@ -900,9 +993,15 @@ fn dataset_paths(value: Option<&Value>) -> Option<Vec<String>> {
 /// All three rows are always printed, in the same order, so the closing
 /// connector is always on `dtype`. A field we could not read shows as `?`.
 fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::Result<()> {
+    // The dimension lists are drawn here rather than kept ready-made, because
+    // `--json` wants the same two facts as JSON arrays. Rendering late is what
+    // lets one reading serve both.
+    let shape = meta.shape.as_deref().map(format_dims);
+    let chunks = meta.chunks.as_deref().map(format_dims);
+
     let rows = [
-        ("shape:", &meta.shape),
-        ("chunks:", &meta.chunks),
+        ("shape:", &shape),
+        ("chunks:", &chunks),
         ("dtype:", &meta.dtype),
     ];
 
@@ -920,6 +1019,92 @@ fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::
     Ok(())
 }
 
+/// The whole tree under `dir` as one JSON value, ready to be printed.
+///
+/// This walks the same directories as `print_tree` and asks `classify` the
+/// same questions -- it is a second *renderer*, not a second reading of the
+/// metadata. Every fact below comes out of the same `NodeKind` the tree
+/// prints, so the two outputs cannot disagree about what a store contains.
+///
+/// The walk is duplicated rather than shared through a tree of nodes built
+/// once, because building one would cost the tree its streaming: today
+/// `zarr-tree big.zarr | head` prints its first lines immediately and stops as
+/// soon as the reader does. JSON has no such option -- a document is a whole
+/// or it is nothing -- so only this side pays for being assembled in memory.
+///
+/// Each node carries its `name`, its Zarr `kind`, and its `children`. The
+/// metadata sections -- `array`, `ome`, `spatialdata` -- appear only on the
+/// nodes they apply to, and a field inside one is `null` when the file did not
+/// give us a readable value. That is the same rule the tree follows when it
+/// prints `?`.
+fn json_tree(name: &str, dir: &Path, depth: Option<usize>) -> io::Result<Value> {
+    let kind = classify(dir);
+
+    let mut node = json!({
+        "name": name,
+        "kind": kind.kind(),
+    });
+
+    match &kind {
+        NodeKind::Array(meta) => node["array"] = json_array_meta(meta),
+        NodeKind::Group(meta) => {
+            if let Some(ome) = &meta.ome {
+                node["ome"] = json_ome(ome);
+            }
+            if let Some(spatialdata) = &meta.spatialdata {
+                node["spatialdata"] = json!({
+                    "kind": spatialdata.kind(),
+                    "version": spatialdata.version(),
+                });
+            }
+        }
+        NodeKind::Unknown => {}
+    }
+
+    // Arrays are leaves here for the same reason they are in the tree: what
+    // lies beneath is chunk storage. Their `children` is empty rather than
+    // absent, so a reader can walk every node the same way.
+    let mut children = Vec::new();
+    if !matches!(kind, NodeKind::Array(_)) {
+        for path in child_dirs(dir, depth)? {
+            children.push(json_tree(
+                &node_name(&path),
+                &path,
+                depth.map(|depth| depth - 1),
+            )?);
+        }
+    }
+    node["children"] = Value::Array(children);
+
+    Ok(node)
+}
+
+/// An array's three fields, with `null` where the tree would print `?`.
+fn json_array_meta(meta: &ArrayMeta) -> Value {
+    json!({
+        // Real JSON arrays rather than the `[4096, 4096]` text the tree draws,
+        // which is the whole reason `ArrayMeta` keeps the values it was given.
+        "shape": meta.shape,
+        "chunks": meta.chunks,
+        "dtype": meta.dtype,
+    })
+}
+
+/// An OME-Zarr image group's metadata.
+///
+/// `pyramid_levels` is the length of `datasets`, exactly as the tree's row is,
+/// so the two numbers cannot drift apart. Both are `null` together when the
+/// metadata declares no usable `datasets`.
+fn json_ome(ome: &OmeInfo) -> Value {
+    json!({
+        "tag": ome.tag(),
+        "version": ome.version,
+        "axes": ome.axes,
+        "pyramid_levels": ome.datasets.as_ref().map(|datasets| datasets.len()),
+        "datasets": ome.datasets,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     // `tests` is a child module of the crate root, so it can already see the
@@ -932,6 +1117,18 @@ mod tests {
     /// name, owned. `env::args` hands back `String`s, so the tests do too.
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| String::from(*item)).collect()
+    }
+
+    /// The text the tree draws for a dimension list, so that tests about
+    /// `shape` and `chunks` keep asserting on what a reader sees rather than
+    /// on how the values happen to be stored.
+    fn shown(dims: &Option<Vec<Value>>) -> Option<String> {
+        dims.as_deref().map(format_dims)
+    }
+
+    /// The same idea for axis names, which the tree joins into one row.
+    fn joined(names: &Option<Vec<String>>) -> Option<String> {
+        names.as_ref().map(|names| names.join(", "))
     }
 
     #[test]
@@ -1015,8 +1212,8 @@ mod tests {
         // after the panic would never run.
         fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(meta.shape, Some(String::from("[4096, 4096]")));
-        assert_eq!(meta.chunks, Some(String::from("[512, 512]")));
+        assert_eq!(shown(&meta.shape), Some(String::from("[4096, 4096]")));
+        assert_eq!(shown(&meta.chunks), Some(String::from("[512, 512]")));
         // V2 dtype is passed through untouched, in NumPy notation.
         assert_eq!(meta.dtype, Some(String::from("<u2")));
     }
@@ -1035,8 +1232,8 @@ mod tests {
 
         let meta = array_meta_v3(&value);
 
-        assert_eq!(meta.shape, Some(String::from("[4096, 4096]")));
-        assert_eq!(meta.chunks, Some(String::from("[512, 512]")));
+        assert_eq!(shown(&meta.shape), Some(String::from("[4096, 4096]")));
+        assert_eq!(shown(&meta.chunks), Some(String::from("[512, 512]")));
         assert_eq!(meta.dtype, Some(String::from("uint16")));
     }
 
@@ -1049,19 +1246,32 @@ mod tests {
 
         let meta = array_meta_v3(&value);
 
-        assert_eq!(meta.shape, Some(String::from("[4096, 4096]")));
-        assert_eq!(meta.chunks, None);
+        assert_eq!(shown(&meta.shape), Some(String::from("[4096, 4096]")));
+        assert_eq!(shown(&meta.chunks), None);
         assert_eq!(meta.dtype, None);
     }
 
     #[test]
-    fn format_dims_renders_a_json_array() {
+    fn dimensions_are_read_as_stored_and_rendered_on_demand() {
         let value = json!([128, 256, 256]);
+        let read = dims(Some(&value)).expect("a list of dimensions");
 
-        assert_eq!(
-            format_dims(Some(&value)),
-            Some(String::from("[128, 256, 256]"))
-        );
+        // Kept as the values the file held, so `--json` can hand back a real
+        // JSON array...
+        assert_eq!(read, vec![json!(128), json!(256), json!(256)]);
+        // ...and rendered into the tree's text only when the tree asks.
+        assert_eq!(format_dims(&read), "[128, 256, 256]");
+
+        // Entries are copied rather than interpreted, so a malformed list
+        // survives to the output instead of being dropped on the way.
+        let malformed = json!([1, "x", null]);
+        let read = dims(Some(&malformed)).expect("a list of three entries");
+        assert_eq!(format_dims(&read), "[1, \"x\", null]");
+
+        // Missing, or present but not a list: nothing to show.
+        assert_eq!(dims(None), None);
+        let not_a_list = json!("4096");
+        assert_eq!(dims(Some(&not_a_list)), None);
     }
 
     #[test]
@@ -1103,8 +1313,8 @@ mod tests {
 
         fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(meta.shape, Some(String::from("[10]")));
-        assert_eq!(meta.chunks, Some(String::from("[10]")));
+        assert_eq!(shown(&meta.shape), Some(String::from("[10]")));
+        assert_eq!(shown(&meta.chunks), Some(String::from("[10]")));
         assert_eq!(meta.dtype, Some(String::from("<M8[ns]")));
     }
 
@@ -1135,8 +1345,8 @@ mod tests {
 
         let info = ome_info_v3(&value).expect("a V3 image group should be recognised");
 
-        assert_eq!(info.tag, "OME-Zarr 0.5");
-        assert_eq!(info.axes, Some(String::from("c, y, x")));
+        assert_eq!(info.tag(), "OME-Zarr 0.5");
+        assert_eq!(joined(&info.axes), Some(String::from("c, y, x")));
         assert_eq!(info.datasets, Some(vec![String::from("0")]));
     }
 
@@ -1159,7 +1369,7 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
 
         let info = info.expect("multiscales alone should make this an image group");
-        assert_eq!(info.tag, "OME-Zarr");
+        assert_eq!(info.tag(), "OME-Zarr");
         // That fixture carries no axes, so there is no row to print.
         assert_eq!(info.axes, None);
         // Its datasets, on the other hand, are laid out the same way in V2 as
@@ -1187,7 +1397,10 @@ mod tests {
         // OME-NGFF 0.3 stores each axis as a bare dimension name.
         let value = json!(["c", "y", "x"]);
 
-        assert_eq!(format_axes(Some(&value)), Some(String::from("c, y, x")));
+        assert_eq!(
+            joined(&axis_names(Some(&value))),
+            Some(String::from("c, y, x"))
+        );
     }
 
     #[test]
@@ -1201,7 +1414,10 @@ mod tests {
             { "name": "x", "type": "space", "unit": "micrometer" }
         ]);
 
-        assert_eq!(format_axes(Some(&value)), Some(String::from("c, y, x")));
+        assert_eq!(
+            joined(&axis_names(Some(&value))),
+            Some(String::from("c, y, x"))
+        );
     }
 
     #[test]
@@ -1215,7 +1431,10 @@ mod tests {
             { "name": "x" }
         ]);
 
-        assert_eq!(format_axes(Some(&value)), Some(String::from("y, ?, x")));
+        assert_eq!(
+            joined(&axis_names(Some(&value))),
+            Some(String::from("y, ?, x"))
+        );
     }
 
     #[test]
@@ -1224,15 +1443,15 @@ mod tests {
         // them: print no row, and never guess one from the arrays.
 
         // No axes key at all -- OME-NGFF 0.1 and 0.2.
-        assert_eq!(format_axes(None), None);
+        assert_eq!(axis_names(None), None);
 
         // Present, but nothing we can walk over.
         let not_an_array = json!("tczyx");
-        assert_eq!(format_axes(Some(&not_an_array)), None);
+        assert_eq!(axis_names(Some(&not_an_array)), None);
 
         // Present and walkable, but empty.
         let empty = json!([]);
-        assert_eq!(format_axes(Some(&empty)), None);
+        assert_eq!(axis_names(Some(&empty)), None);
     }
 
     #[test]

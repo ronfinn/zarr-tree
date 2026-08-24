@@ -11,6 +11,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use serde_json::{Value, json};
+
 /// A fresh, empty directory of our own under the system temp directory.
 ///
 /// The process id separates two `cargo test` runs happening at once; `name`
@@ -861,6 +863,180 @@ fn spatialdata_elements_are_tagged_but_their_containers_are_not() {
         !stdout.contains("shapes.parquet"),
         "a file is not a node in this tree:\n{stdout}"
     );
+}
+
+#[test]
+fn json_output_says_the_same_things_the_tree_says() {
+    // One store carrying every kind of fact the two outputs share: a
+    // SpatialData root, an OME-Zarr image element under it, that image's
+    // resolution array, and a node whose metadata cannot be read at all.
+    let dir = fixture_dir("json");
+    let root = dir.join("experiment.zarr");
+
+    write_file(
+        &root.join("zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "spatialdata_attrs": {
+                    "version": "0.2",
+                    "spatialdata_software_version": "0.7.1"
+                }
+            }
+        }"#,
+    );
+    write_file(
+        &root.join("images/zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group", "attributes": {}}"#,
+    );
+    write_file(
+        &root.join("images/morphology/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "ome": {
+                    "version": "0.5",
+                    "multiscales": [
+                        {
+                            "axes": [{ "name": "y" }, { "name": "x" }],
+                            "datasets": [{ "path": "s0" }, { "path": "s1" }]
+                        }
+                    ]
+                },
+                "spatialdata_attrs": { "version": "0.3" }
+            }
+        }"#,
+    );
+    write_file(
+        &root.join("images/morphology/s0/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [2048, 2048],
+            "chunk_grid": {
+                "name": "regular",
+                "configuration": { "chunk_shape": [512, 512] }
+            },
+            "data_type": "uint16"
+        }"#,
+    );
+    // An array whose metadata says nothing but its shape, so the two
+    // unreadable fields have somewhere to show up as null.
+    write_file(
+        &root.join("images/morphology/s1/.zarray"),
+        r#"{"zarr_format": 2, "shape": [1024, 1024]}"#,
+    );
+    // And a node that is not a Zarr node at all.
+    write_file(&root.join("misc/zarr.json"), r#"{"zarr_format": 3,"#);
+
+    let path = root.to_str().unwrap().to_string();
+    let output = run(&["--json", &path]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let text = String::from_utf8_lossy(&run(&[&path]).stdout).into_owned();
+    let shallow = run(&["--json", "--depth", "1", &path]);
+    let shallow_stdout = String::from_utf8_lossy(&shallow.stdout).into_owned();
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert!(
+        output.status.success(),
+        "expected success; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Valid JSON, and one object at the top rather than a stream of them.
+    let tree: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("--json should print valid JSON: {error}\n{stdout}"));
+
+    // The root is named by the path as it was typed, exactly as the tree's
+    // first line names it.
+    assert_eq!(tree["name"], json!(path));
+    assert_eq!(tree["kind"], json!("group"));
+    assert_eq!(
+        tree["spatialdata"],
+        json!({ "kind": "root", "version": "0.2" })
+    );
+    // A group is not an array, so it has no array section at all.
+    assert_eq!(tree.get("array"), None);
+
+    // `children` is always present, so a reader can walk every node the same
+    // way. Descending it finds the same nodes the tree indents.
+    let child = |node: &Value, name: &str| -> Value {
+        node["children"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{node} should have children"))
+            .iter()
+            .find(|child| child["name"] == json!(name))
+            .unwrap_or_else(|| panic!("no child named {name:?} in {node}"))
+            .clone()
+    };
+
+    let images = child(&tree, "images");
+    // An ordinary container group: no metadata sections of any kind.
+    assert_eq!(images.get("ome"), None);
+    assert_eq!(images.get("spatialdata"), None);
+
+    let morphology = child(&images, "morphology");
+    assert_eq!(
+        morphology["ome"],
+        json!({
+            "tag": "OME-Zarr 0.5",
+            "version": "0.5",
+            "axes": ["y", "x"],
+            // The count is the length of the list beside it, so the two can
+            // never disagree -- the same rule the tree's two rows follow.
+            "pyramid_levels": 2,
+            "datasets": ["s0", "s1"]
+        })
+    );
+    assert_eq!(
+        morphology["spatialdata"],
+        json!({ "kind": "image", "version": null })
+    );
+
+    let s0 = child(&morphology, "s0");
+    assert_eq!(s0["kind"], json!("array"));
+    // Real JSON arrays, not the `[2048, 2048]` text the tree draws.
+    assert_eq!(
+        s0["array"],
+        json!({ "shape": [2048, 2048], "chunks": [512, 512], "dtype": "uint16" })
+    );
+    // Arrays are leaves, and say so with an empty list rather than by omission.
+    assert_eq!(s0["children"], json!([]));
+
+    // What the tree prints as `?` is null here, consistently.
+    let s1 = child(&morphology, "s1");
+    assert_eq!(
+        s1["array"],
+        json!({ "shape": [1024, 1024], "chunks": null, "dtype": null })
+    );
+
+    // A node we cannot classify is `unknown` in both outputs.
+    assert_eq!(child(&tree, "misc")["kind"], json!("unknown"));
+
+    // The text output is untouched by any of this.
+    let text_lines = lines(&text);
+    for expected in [
+        "morphology [group, OME-Zarr 0.5, SpatialData image]",
+        "axes: y, x",
+        "pyramid levels: 2",
+        "datasets: s0, s1",
+        "s0 [array]",
+        "shape: [2048, 2048]",
+        "chunks: [512, 512]",
+        "dtype: uint16",
+        "chunks: ?",
+        "dtype: ?",
+        "misc [unknown]",
+    ] {
+        assert!(has(&text_lines, expected), "missing {expected:?}\n{text}");
+    }
+
+    // And --json honours --depth, which is the same walk underneath.
+    let shallow: Value = serde_json::from_str(&shallow_stdout).expect("valid JSON");
+    assert_eq!(child(&shallow, "images")["children"], json!([]));
 }
 
 #[test]
