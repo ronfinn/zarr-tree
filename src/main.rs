@@ -127,11 +127,38 @@ zarr-tree
 Explore the structure and metadata of a local Zarr store.
 
 USAGE:
-    zarr-tree <DIRECTORY>
+    zarr-tree [OPTIONS] <DIRECTORY>
 
 OPTIONS:
+        --depth <N>  Descend at most N levels below the root.
+                     0 shows the root on its own. Omitted, the whole store is
+                     walked. Arrays are leaves at any depth.
     -h, --help       Print help
     -V, --version    Print version";
+
+/// The one-line reminder printed on stderr when the command line does not make
+/// sense. Kept in step with the USAGE section above by hand: there are two of
+/// them because one is an answer and the other is a complaint.
+const USAGE: &str = "usage: zarr-tree [OPTIONS] <DIRECTORY>";
+
+/// What the command line asked for.
+struct Options {
+    /// The directory to walk, exactly as it was typed.
+    path: String,
+    /// How many levels below the root to descend, or `None` for all of them.
+    /// `Some(0)` shows the root and nothing under it.
+    depth: Option<usize>,
+}
+
+/// What `parse_args` made of the command line.
+///
+/// The two flags are answered without touching the filesystem, so they are
+/// variants of their own rather than fields nothing else would look at.
+enum Request {
+    Walk(Options),
+    Help,
+    Version,
+}
 
 impl NodeKind {
     /// The tag printed after a directory name.
@@ -203,48 +230,42 @@ fn main() {
 /// trait object: the functions below neither know nor care that this is
 /// standard output.
 fn run() -> io::Result<()> {
-    // args[0] is the program itself, so we expect exactly two entries.
+    // args[0] is the program itself, so the command line proper starts at 1.
     let args: Vec<String> = env::args().collect();
-
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-
-    // A lone flag is answered before anything else. Both arms return from
-    // run, so a flag never reaches the path checks below and every other
-    // argument falls through to exactly the code that handled it before.
-    //
-    // The cost of parsing this simply is that a directory actually named "-h"
-    // or "-V" can no longer be inspected.
-    if args.len() == 2 {
-        // args[1] is a String; as_str() borrows it as a &str so it can be
-        // matched against string literals.
-        match args[1].as_str() {
-            "-h" | "--help" => {
-                writeln!(out, "{HELP}")?;
-                return out.flush();
-            }
-            "-V" | "--version" => {
-                // env! reads the variable when the crate is compiled, so this
-                // is a plain string literal in the binary. Cargo fills it in
-                // from the version field in Cargo.toml, which is why the two
-                // cannot drift apart.
-                writeln!(out, "zarr-tree {}", env!("CARGO_PKG_VERSION"))?;
-                return out.flush();
-            }
-            _ => {}
-        }
-    }
 
     // The argument errors exit directly. They are settled before anything is
     // written, they belong on stderr rather than in the tree, and routing them
     // through the `io::Result` would mean inventing an io::Error for something
     // that is not an I/O failure at all.
-    if args.len() != 2 {
-        eprintln!("usage: zarr-tree <directory>");
-        process::exit(1);
-    }
+    let request = match parse_args(&args[1..]) {
+        Ok(request) => request,
+        Err(message) => {
+            eprintln!("error: {message}");
+            eprintln!("{USAGE}");
+            process::exit(1);
+        }
+    };
 
-    let root = Path::new(&args[1]);
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    let options = match request {
+        Request::Help => {
+            writeln!(out, "{HELP}")?;
+            return out.flush();
+        }
+        Request::Version => {
+            // env! reads the variable when the crate is compiled, so this is a
+            // plain string literal in the binary. Cargo fills it in from the
+            // version field in Cargo.toml, which is why the two cannot drift
+            // apart.
+            writeln!(out, "zarr-tree {}", env!("CARGO_PKG_VERSION"))?;
+            return out.flush();
+        }
+        Request::Walk(options) => options,
+    };
+
+    let root = Path::new(&options.path);
     if !root.exists() {
         eprintln!("error: path does not exist: {}", root.display());
         process::exit(1);
@@ -254,20 +275,77 @@ fn run() -> io::Result<()> {
         process::exit(1);
     }
 
-    let root_name = args[1].trim_end_matches('/');
+    // The root is named by the path as it was typed, in both outputs. Every
+    // node below it is named by its directory.
+    let root_name = options.path.trim_end_matches('/');
+
     let root_kind = classify(root);
     writeln!(out, "{root_name} {}", root_kind.label())?;
 
     // An array is a leaf here too: its metadata takes the place of the walk.
     match &root_kind {
         NodeKind::Array(meta) => print_array_meta(&mut out, meta, "")?,
-        _ => print_tree(&mut out, root, "", &group_rows(&root_kind))?,
+        _ => print_tree(&mut out, root, "", &group_rows(&root_kind), options.depth)?,
     }
 
     // Stdout flushes itself when the process ends, but it swallows any error
     // in doing so. Flushing here is what puts a late `BrokenPipe` in front of
     // the handler above instead of losing it.
     out.flush()
+}
+
+/// Read the command line, or say what is wrong with it.
+///
+/// `args` is everything after the program name. Hand-written rather than
+/// reached for a crate: three options and one directory is a short enough
+/// grammar that a loop over the arguments says all there is to say, and the
+/// package still has one dependency.
+///
+/// The loop holds its iterator rather than using a `for`, because `--depth`
+/// has to reach forward and take the value that follows it.
+fn parse_args(args: &[String]) -> Result<Request, String> {
+    let mut path: Option<&str> = None;
+    let mut depth: Option<usize> = None;
+
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            // Answered on sight, so neither reaches the checks below and a
+            // `--help` anywhere on the line still prints the help.
+            "-h" | "--help" => return Ok(Request::Help),
+            "-V" | "--version" => return Ok(Request::Version),
+            "--depth" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| String::from("--depth needs a number, as in --depth 2"))?;
+                // `usize` does the validating: a negative number and anything
+                // that is not a number at all both fail to parse, and the
+                // message quotes what was actually typed.
+                depth = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("--depth needs a whole number, not {value:?}"))?,
+                );
+            }
+            // A leading dash we do not know is a mistyped option rather than a
+            // directory. The cost of reading it that way is that a directory
+            // whose name begins with `-` can no longer be inspected -- the
+            // same trade `-h` and `-V` already made.
+            other if other.starts_with('-') => return Err(format!("unknown option: {other}")),
+            other => {
+                if path.is_some() {
+                    return Err(String::from("expected exactly one directory"));
+                }
+                path = Some(other);
+            }
+        }
+    }
+
+    let path = path.ok_or_else(|| String::from("expected a directory"))?;
+    Ok(Request::Walk(Options {
+        path: String::from(path),
+        depth,
+    }))
 }
 
 /// Print the directories inside `dir`, one line each, indented by `prefix`.
@@ -277,19 +355,23 @@ fn run() -> io::Result<()> {
 /// is the one place that already knows whether any children follow them, which
 /// is what decides the last connector. An empty slice means there is nothing to
 /// print above the children.
-fn print_tree(out: &mut dyn Write, dir: &Path, prefix: &str, rows: &[String]) -> io::Result<()> {
-    // Collect first: read_dir returns entries in arbitrary order, and we need
-    // to know which child is last before we can draw its connector.
-    let mut subdirs: Vec<PathBuf> = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        // file_type() does not follow symlinks, so a link pointing back at an
-        // ancestor cannot send us into infinite recursion.
-        if entry.file_type()?.is_dir() {
-            subdirs.push(entry.path());
-        }
-    }
-    subdirs.sort();
+///
+/// `out` is where the lines go. It was already returning `io::Result` for the
+/// directory reads; writes now join them, so a closed pipe stops the walk the
+/// same way an unreadable directory does.
+///
+/// `depth` is how many more levels below `dir` may be listed, or `None` for
+/// all of them. `Some(0)` means this node is as deep as the output goes: its
+/// own metadata rows still print, because those describe the node itself
+/// rather than anything below it.
+fn print_tree(
+    out: &mut dyn Write,
+    dir: &Path,
+    prefix: &str,
+    rows: &[String],
+    depth: Option<usize>,
+) -> io::Result<()> {
+    let subdirs = child_dirs(dir, depth)?;
 
     // This directory's own metadata, above its children. Metadata rows keep
     // the shorter two-dash stem that tells them apart from node rows.
@@ -319,12 +401,55 @@ fn print_tree(out: &mut dyn Write, dir: &Path, prefix: &str, rows: &[String]) ->
         // directory, V2 chunk keys), an implementation detail rather than
         // structure worth showing. The metadata rows go there instead.
         match &kind {
+            // Arrays are leaves at any depth: what lies beneath them is chunk
+            // storage, so the limit has nothing to say here. Their metadata
+            // rows describe the array itself and print as they always did.
             NodeKind::Array(meta) => print_array_meta(out, meta, &child_prefix)?,
-            _ => print_tree(out, path, &child_prefix, &group_rows(&kind))?,
+            // One level spent. `map` leaves `None` as `None`, which is how an
+            // unlimited walk stays unlimited without a second branch.
+            _ => print_tree(
+                out,
+                path,
+                &child_prefix,
+                &group_rows(&kind),
+                depth.map(|depth| depth - 1),
+            )?,
         }
     }
 
     Ok(())
+}
+
+/// The subdirectories of `dir`, sorted, and honouring the depth limit.
+///
+/// Collected rather than streamed because the tree needs to know which child is
+/// last before it can draw a connector, and `read_dir` returns entries in
+/// arbitrary order.
+///
+/// `Some(0)` means this node is as deep as the output goes, and the directory
+/// is then not read at all. That is not only cheaper on a store full of chunk
+/// files: an empty list is also exactly what a node with no children has, so
+/// neither renderer needs a rule of its own for the limit.
+///
+/// Both renderers call this, which is what keeps them agreeing about which
+/// children exist and in what order.
+fn child_dirs(dir: &Path, depth: Option<usize>) -> io::Result<Vec<PathBuf>> {
+    if depth == Some(0) {
+        return Ok(Vec::new());
+    }
+
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        // file_type() does not follow symlinks, so a link pointing back at an
+        // ancestor cannot send us into infinite recursion.
+        if entry.file_type()?.is_dir() {
+            subdirs.push(entry.path());
+        }
+    }
+    subdirs.sort();
+
+    Ok(subdirs)
 }
 
 /// Decide what kind of Zarr node `dir` is by looking at the metadata files
@@ -802,6 +927,73 @@ mod tests {
     // scope so we can call them unqualified.
     use super::*;
     use serde_json::json;
+
+    /// A command line, as `parse_args` wants it: everything after the program
+    /// name, owned. `env::args` hands back `String`s, so the tests do too.
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| String::from(*item)).collect()
+    }
+
+    #[test]
+    fn parse_args_reads_a_directory_and_an_optional_depth() {
+        let Ok(Request::Walk(options)) = parse_args(&args(&["store.zarr"])) else {
+            panic!("a lone directory is a valid command line");
+        };
+        assert_eq!(options.path, "store.zarr");
+        // No `--depth` means no limit, which is what every invocation before
+        // the option existed asked for.
+        assert_eq!(options.depth, None);
+
+        // Either order: the option before the directory, or after it.
+        for line in [
+            ["--depth", "2", "store.zarr"],
+            ["store.zarr", "--depth", "2"],
+        ] {
+            let Ok(Request::Walk(options)) = parse_args(&args(&line)) else {
+                panic!("{line:?} is a valid command line");
+            };
+            assert_eq!(options.path, "store.zarr");
+            assert_eq!(options.depth, Some(2));
+        }
+
+        // Zero is a depth like any other, and means the root on its own.
+        let Ok(Request::Walk(options)) = parse_args(&args(&["--depth", "0", "store.zarr"])) else {
+            panic!("zero is a valid depth");
+        };
+        assert_eq!(options.depth, Some(0));
+    }
+
+    #[test]
+    fn parse_args_answers_a_flag_wherever_it_appears() {
+        // Answered on sight, so a flag beside a directory is still a flag.
+        assert!(matches!(
+            parse_args(&args(&["store.zarr", "--help"])),
+            Ok(Request::Help)
+        ));
+        assert!(matches!(parse_args(&args(&["-V"])), Ok(Request::Version)));
+    }
+
+    #[test]
+    fn parse_args_rejects_a_command_line_it_cannot_use() {
+        // Every rejection names what was wrong, and none of them panics.
+        for (line, expected) in [
+            (vec!["--depth"], "--depth needs a number"),
+            // `usize` refuses both of these, so no check of ours has to.
+            (vec!["--depth", "-1", "store.zarr"], "whole number"),
+            (vec!["--depth", "two", "store.zarr"], "whole number"),
+            (vec!["--nope", "store.zarr"], "unknown option"),
+            (vec!["one.zarr", "two.zarr"], "exactly one directory"),
+            (vec![], "expected a directory"),
+        ] {
+            let error = parse_args(&args(&line))
+                .err()
+                .unwrap_or_else(|| panic!("{line:?} should not be accepted"));
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} in {error:?} for {line:?}"
+            );
+        }
+    }
 
     #[test]
     fn v2_metadata_is_read_from_a_zarray_file() {

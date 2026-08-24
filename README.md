@@ -39,6 +39,7 @@ example.zarr [group]
 - Recognises SpatialData elements — images, labels, points, shapes and tables —
   e.g. `[group, SpatialData points]`, and tells a segmentation from an image by
   its OME-Zarr metadata rather than by its directory name.
+- Limits how far it descends with `--depth N`.
 - Sits quietly at the producing end of a pipe: `| head` ends the run with no
   panic and no error.
 - Degrades gracefully: metadata that cannot be read or parsed costs only that
@@ -257,23 +258,36 @@ with rustc 1.98.0.
 ## Usage
 
 ```sh
-zarr-tree <directory>
+zarr-tree [OPTIONS] <directory>
 ```
 
-Exactly one argument, a path to a local directory. Anything else prints a usage
-line and exits with status 1:
+Exactly one directory, plus any of the options below in any order. Anything
+else names what was wrong and exits with status 1:
 
 ```
 $ zarr-tree
-usage: zarr-tree <directory>
+error: expected a directory
+usage: zarr-tree [OPTIONS] <DIRECTORY>
+
+$ zarr-tree --depth two store.zarr
+error: --depth needs a whole number, not "two"
+usage: zarr-tree [OPTIONS] <DIRECTORY>
 ```
 
-Two flags are recognised, each on its own:
-
 ```
+        --depth <N>  Descend at most N levels below the root
     -h, --help       Print help
     -V, --version    Print version
 ```
+
+An argument beginning with `-` that is not one of these is read as a mistyped
+option rather than as a directory, so a directory whose name starts with `-`
+cannot be inspected.
+
+`--depth N` limits how far below the root the walk goes. `0` shows the root on
+its own, `1` adds its direct children, and so on. Left out, the whole store is
+walked. A node that is shown keeps its own metadata rows, and arrays are leaves
+at any depth.
 
 ## Example output
 
@@ -311,8 +325,8 @@ cargo clippy -- -D warnings  # lints, as CI runs them
 cargo fmt --check            # formatting, as CI runs it
 ```
 
-The suite is in two parts: 34 unit tests in `src/main.rs`, which cover metadata
-parsing directly, and 9 integration tests in `tests/cli.rs`, which run the
+The suite is in two parts: 37 unit tests in `src/main.rs`, which cover metadata
+parsing directly, and 10 integration tests in `tests/cli.rs`, which run the
 compiled binary against throwaway fixture stores and assert on what it prints.
 
 CI runs `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` on
@@ -324,7 +338,7 @@ every push and pull request.
 - Only `shape`, `chunks`/`chunk_shape` and `dtype`/`data_type` are read.
   Codecs, compressors, fill values, dimension names and user attributes are
   not shown.
-- No output options: no depth limit, no filtering, no JSON output, no colour.
+- No output options beyond `--depth`: no filtering, no JSON output, no colour.
 - V2 dtypes are passed through as stored and V3 dtypes given in object form
   (the extension syntax) are not interpreted.
 - Sharding is not understood; a sharded array shows its declared chunk shape
@@ -355,9 +369,8 @@ every push and pull request.
 
 Small, in roughly this order:
 
-1. A `--depth` flag for large stores.
-2. Show a node's user attributes when asked.
-3. Report V3 dtypes given in object form, instead of showing them as missing.
+1. Show a node's user attributes when asked.
+2. Report V3 dtypes given in object form, instead of showing them as missing.
 
 Remote stores, and anything beyond lightweight OME-Zarr and SpatialData
 recognition, are out of scope for now.

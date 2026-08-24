@@ -864,6 +864,125 @@ fn spatialdata_elements_are_tagged_but_their_containers_are_not() {
 }
 
 #[test]
+fn depth_limits_how_far_the_walk_descends() {
+    // Three levels below the root, with an OME-Zarr image at the bottom so
+    // that both kinds of metadata row -- a group's and an array's -- have a
+    // chance to be cut off with them.
+    let dir = fixture_dir("depth");
+    let root = dir.join("deep.zarr");
+
+    write_file(
+        &root.join("zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group"}"#,
+    );
+    write_file(
+        &root.join("outer/zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group"}"#,
+    );
+    write_file(
+        &root.join("outer/image/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "ome": {
+                    "version": "0.5",
+                    "multiscales": [
+                        {
+                            "axes": [{ "name": "y" }, { "name": "x" }],
+                            "datasets": [{ "path": "0" }]
+                        }
+                    ]
+                }
+            }
+        }"#,
+    );
+    write_file(
+        &root.join("outer/image/0/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [64, 64],
+            "chunk_grid": {
+                "name": "regular",
+                "configuration": { "chunk_shape": [32, 32] }
+            },
+            "data_type": "uint8"
+        }"#,
+    );
+
+    let at = |args: &[&str]| {
+        let output = run(args);
+        assert!(
+            output.status.success(),
+            "expected success for {args:?}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let path = root.to_str().unwrap().to_string();
+    let unlimited = at(&[&path]);
+    let depth0 = at(&["--depth", "0", &path]);
+    let depth1 = at(&["--depth", "1", &path]);
+    let depth2 = at(&["--depth", "2", &path]);
+    let depth3 = at(&["--depth", "3", &path]);
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    // The root on its own, and nothing below it.
+    assert_eq!(
+        depth0.lines().count(),
+        1,
+        "--depth 0 should print the root alone:\n{depth0}"
+    );
+    assert!(has(&lines(&depth0), "deep.zarr [group]"));
+
+    // One level: the direct child, and not its child.
+    assert!(has(&lines(&depth1), "outer [group]"), "\n{depth1}");
+    assert!(!depth1.contains("image"), "\n{depth1}");
+
+    // Two levels: the image group appears, and its own metadata rows come
+    // with it -- those describe the node itself, not anything below it.
+    let depth2_lines = lines(&depth2);
+    for expected in [
+        "image [group, OME-Zarr 0.5]",
+        "axes: y, x",
+        "pyramid levels: 1",
+        "datasets: 0",
+    ] {
+        assert!(
+            has(&depth2_lines, expected),
+            "missing {expected:?}\n{depth2}"
+        );
+    }
+    // But the array below it is one level too far.
+    assert!(!depth2.contains("[array]"), "\n{depth2}");
+
+    // Three levels: the array itself, and an array is a leaf at any depth --
+    // its three rows print in full, as they always do.
+    let depth3_lines = lines(&depth3);
+    for expected in [
+        "0 [array]",
+        "shape: [64, 64]",
+        "chunks: [32, 32]",
+        "dtype: uint8",
+    ] {
+        assert!(
+            has(&depth3_lines, expected),
+            "missing {expected:?}\n{depth3}"
+        );
+    }
+
+    // And with no option at all the output is exactly what it always was: a
+    // depth deeper than the store changes nothing.
+    assert_eq!(
+        unlimited, depth3,
+        "an unlimited walk and a walk deeper than the store should agree"
+    );
+}
+
+#[test]
 fn a_reader_that_stops_reading_ends_the_run_quietly() {
     // What `zarr-tree store.zarr | head` does, without needing `head`: give
     // the process a pipe, then close our end of it and never read a byte.
