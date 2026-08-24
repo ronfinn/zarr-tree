@@ -983,6 +983,9 @@ fn json_output_says_the_same_things_the_tree_says() {
         morphology["ome"],
         json!({
             "tag": "OME-Zarr 0.5",
+            // Which of the three OME-Zarr groups this is, so a reader need not
+            // unpick the tag to find out.
+            "kind": "image",
             "version": "0.5",
             "axes": ["y", "x"],
             // The count is the length of the list beside it, so the two can
@@ -1326,4 +1329,124 @@ fn a_sharded_array_reports_its_chunks_and_its_shards_separately() {
         json!({ "shape": [1024, 1024], "chunks": [64, 64], "dtype": "uint16" })
     );
     assert_eq!(child("plain")["array"].get("shards"), None);
+}
+
+#[test]
+fn an_hcs_plate_and_its_wells_are_tagged_from_metadata_not_from_their_names() {
+    let dir = fixture_dir("hcs");
+    let root = dir.join("plate.ome.zarr");
+
+    // A plate as ome-zarr-py writes one. The row and column groups it declares
+    // carry no metadata of their own, which is why only the plate and the wells
+    // below them are tagged.
+    write_file(
+        &root.join("zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {"ome": {"version": "0.5", "plate": {
+                "rows": [{"name": "A"}, {"name": "B"}],
+                "columns": [{"name": "1"}],
+                "wells": [
+                    {"path": "A/1", "rowIndex": 0, "columnIndex": 0},
+                    {"path": "B/1", "rowIndex": 1, "columnIndex": 0}
+                ]
+            }}}
+        }"#,
+    );
+
+    for row in ["A", "B"] {
+        // A row group: a plain Zarr group, and nothing more is claimed of it.
+        write_file(
+            &root.join(row).join("zarr.json"),
+            r#"{"zarr_format": 3, "node_type": "group"}"#,
+        );
+        write_file(
+            &root.join(row).join("1/zarr.json"),
+            r#"{
+                "zarr_format": 3,
+                "node_type": "group",
+                "attributes": {"ome": {"version": "0.5", "well": {"images": [{"path": "0"}]}}}
+            }"#,
+        );
+        // The field of view inside the well is an ordinary OME-Zarr image, and
+        // is still labelled exactly as it was before plates were recognised.
+        write_file(
+            &root.join(row).join("1/0/zarr.json"),
+            r#"{
+                "zarr_format": 3,
+                "node_type": "group",
+                "attributes": {"ome": {"version": "0.5", "multiscales": [{
+                    "axes": [{"name": "y"}, {"name": "x"}],
+                    "datasets": [{"path": "s0"}]
+                }]}}
+            }"#,
+        );
+    }
+
+    // A group named exactly like a well, in a store that never said it was one.
+    let decoy = dir.join("decoy.zarr");
+    write_file(
+        &decoy.join("zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group"}"#,
+    );
+    write_file(
+        &decoy.join("A/zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group"}"#,
+    );
+    write_file(
+        &decoy.join("A/1/zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group"}"#,
+    );
+
+    let path = root.to_str().unwrap().to_string();
+    let text = String::from_utf8_lossy(&run(&[&path]).stdout).into_owned();
+    let output = run(&["--json", "--depth", "1", &path]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let decoy_path = decoy.to_str().unwrap().to_string();
+    let decoy_text = String::from_utf8_lossy(&run(&[&decoy_path]).stdout).into_owned();
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    let rows = lines(&text);
+    // The plate is tagged, and says how big it declares itself to be.
+    assert!(
+        has(&rows, "plate.ome.zarr [group, OME-Zarr 0.5 plate]"),
+        "{text}"
+    );
+    for expected in ["rows: 2", "columns: 1", "wells: 2"] {
+        assert!(has(&rows, expected), "expected {expected:?} in:\n{text}");
+    }
+    // The row groups claim nothing, the wells are tagged, and the image inside
+    // a well keeps the bare label it has always had.
+    assert!(has(&rows, "A [group]"), "{text}");
+    assert!(has(&rows, "1 [group, OME-Zarr 0.5 well]"), "{text}");
+    assert!(has(&rows, "0 [group, OME-Zarr 0.5]"), "{text}");
+    // A well is tagged and nothing more.
+    assert!(!has(&rows, "images:"), "{text}");
+
+    // Identically named groups with no metadata stay ordinary groups: the
+    // names `A` and `1` are not what makes a plate.
+    let decoy_rows = lines(&decoy_text);
+    assert!(!has(&decoy_rows, "plate"), "{decoy_text}");
+    assert!(!has(&decoy_rows, "well"), "{decoy_text}");
+
+    let tree: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("--json should print valid JSON: {error}\n{stdout}"));
+    assert_eq!(
+        tree["ome"],
+        json!({
+            "tag": "OME-Zarr 0.5 plate",
+            "kind": "plate",
+            "version": "0.5",
+            "rows": 2,
+            "columns": 1,
+            "wells": 2,
+            // A plate has no multiscale of its own, so the image fields are
+            // null the same way any unread field is.
+            "axes": null,
+            "pyramid_levels": null,
+            "datasets": null,
+        })
+    );
 }

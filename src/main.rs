@@ -127,12 +127,64 @@ struct ArrayMeta {
     dtype: Option<String>,
 }
 
-/// What an OME-Zarr image group carries.
+/// Which kind of OME-Zarr group this is.
+///
+/// The three are told apart by which key the metadata carries -- `multiscales`,
+/// `plate` or `well` -- and never by what the group or its children are called.
+/// A plate's wells really are named `A`, `B`, `1`, `2`, and a store is free to
+/// use those names for anything at all.
+enum OmeKind {
+    /// A multiscale image: the only kind this tool recognised before HCS, and
+    /// the only one that carries axes and datasets.
+    Image,
+    /// A high-content-screening plate. The three counts are the lengths of the
+    /// lists the metadata declares, each `None` on its own when that list is
+    /// missing or is not a list -- nothing here is counted from the directories
+    /// on disk, so a plate that declares 96 wells says 96 whether or not 96
+    /// were written.
+    Plate {
+        rows: Option<usize>,
+        columns: Option<usize>,
+        wells: Option<usize>,
+    },
+    /// A single well of a plate. Tagged and nothing more: what a well holds is
+    /// its images, and those are the child groups the tree already prints.
+    Well,
+}
+
+impl OmeKind {
+    /// The word that follows the version in a label, or `None` for an image.
+    ///
+    /// An image keeps the bare `OME-Zarr 0.5` it has always had, which is what
+    /// leaves ordinary image output untouched by any of this.
+    fn suffix(&self) -> Option<&'static str> {
+        match self {
+            OmeKind::Image => None,
+            OmeKind::Plate { .. } => Some("plate"),
+            OmeKind::Well => Some("well"),
+        }
+    }
+
+    /// The kind on its own, for output that has already said it is talking
+    /// about OME-Zarr.
+    fn name(&self) -> &'static str {
+        match self {
+            OmeKind::Image => "image",
+            OmeKind::Plate { .. } => "plate",
+            OmeKind::Well => "well",
+        }
+    }
+}
+
+/// What an OME-Zarr group carries.
 ///
 /// The `Option` sits outside this struct rather than around its fields: a group
-/// either is an OME-Zarr image, in which case it always has at least a version
-/// slot, or it is an ordinary group and there is nothing here at all.
+/// either is an OME-Zarr group of some kind, in which case it always has a kind
+/// and at least a version slot, or it is an ordinary group and there is nothing
+/// here at all.
 struct OmeInfo {
+    /// Which of the three kinds this is. See `OmeKind`.
+    kind: OmeKind,
     /// The metadata version, exactly as stored. `None` when the file records
     /// none, which real 0.4 stores often do not.
     version: Option<String>,
@@ -151,16 +203,24 @@ struct OmeInfo {
 }
 
 impl OmeInfo {
-    /// The label tag: "OME-Zarr 0.5", or "OME-Zarr" when no version was read.
+    /// The label tag: "OME-Zarr 0.5", or "OME-Zarr" when no version was read,
+    /// with the kind appended for a plate or a well -- "OME-Zarr 0.5 plate".
     ///
     /// Built here rather than stored, so that the version and the text made
     /// from it cannot drift apart -- the same reason `pyramid levels` is the
     /// length of `datasets` rather than a number of its own.
     fn tag(&self) -> String {
-        match &self.version {
+        let mut tag = match &self.version {
             Some(version) => format!("OME-Zarr {version}"),
             None => String::from("OME-Zarr"),
+        };
+
+        if let Some(suffix) = self.kind.suffix() {
+            tag.push(' ');
+            tag.push_str(suffix);
         }
+
+        tag
     }
 }
 
@@ -619,37 +679,88 @@ fn ome_info_v3(value: &Value) -> Option<OmeInfo> {
     ome_info(ome, ome.get("version"))
 }
 
-/// Collect what we display about an OME-Zarr image group, or `None` if this is
-/// an ordinary Zarr group.
+/// Collect what we display about an OME-Zarr group, or `None` if this is an
+/// ordinary Zarr group.
 ///
 /// `ome` is whichever object holds the OME-Zarr keys -- the whole `.zattrs` for
 /// V2, `attributes.ome` for V3 -- and `version` is passed in separately because
 /// that is the only other thing the two layouts disagree about.
+///
+/// The three kinds are tried in turn, and the first key found decides. They do
+/// not overlap in practice: a group is an image, a plate or a well, and the
+/// metadata says which by which key it wrote.
 fn ome_info(ome: &Value, version: Option<&Value>) -> Option<OmeInfo> {
-    // A `multiscales` key holding a non-empty array is what makes a group an
-    // image. Missing, the wrong JSON type, or empty all mean it is not one:
-    // `?` handles the first two without any error handling of ours, and
-    // `first()` the third.
-    let first = ome.get("multiscales")?.as_array()?.first()?;
-
     // Kept exactly as stored, and never checked against the versions we happen
     // to know about: this tool reports metadata rather than validating it. A
     // version that is absent, or is not a string, just leaves the tag bare.
-    let version = version.and_then(|value| value.as_str()).map(String::from);
+    let namespace_version =
+        |value: Option<&Value>| value.and_then(|value| value.as_str()).map(String::from);
 
-    // Axes belong to an individual multiscale rather than to the group, so they
-    // come from that same first entry in both layouts -- the one part of this
-    // metadata V2 and V3 already agree about.
-    //
-    // `datasets` is the one part of this metadata that has not changed shape
-    // since OME-NGFF 0.1 -- always a list of objects with a `path` -- so unlike
-    // the axes it needs no per-version handling at all. What 0.4 added to each
-    // entry, `coordinateTransformations`, is not read.
-    Some(OmeInfo {
-        version,
-        axes: axis_names(first.get("axes")),
-        datasets: dataset_paths(first.get("datasets")),
-    })
+    // A `multiscales` key holding a non-empty array is what makes a group an
+    // image. Missing, the wrong JSON type, or empty all mean it is not one.
+    if let Some(first) = ome
+        .get("multiscales")
+        .and_then(|value| value.as_array())
+        .and_then(|entries| entries.first())
+    {
+        // Axes belong to an individual multiscale rather than to the group, so
+        // they come from that same first entry in both layouts -- the one part
+        // of this metadata V2 and V3 already agree about.
+        //
+        // `datasets` is the one part of this metadata that has not changed
+        // shape since OME-NGFF 0.1 -- always a list of objects with a `path` --
+        // so unlike the axes it needs no per-version handling at all. What 0.4
+        // added to each entry, `coordinateTransformations`, is not read.
+        return Some(OmeInfo {
+            kind: OmeKind::Image,
+            version: namespace_version(version),
+            axes: axis_names(first.get("axes")),
+            datasets: dataset_paths(first.get("datasets")),
+        });
+    }
+
+    // Where the version comes from differs again for the HCS keys. V3 records
+    // it once for the whole `ome` namespace, but V2 has no namespace to record
+    // it in and puts it inside the `plate` or `well` object instead -- the same
+    // split `multiscales` has, in a different place. The object's own version
+    // wins where there is one, and the namespace answers otherwise.
+    let stored_version = |object: &Value| {
+        namespace_version(object.get("version")).or_else(|| namespace_version(version))
+    };
+
+    if let Some(plate) = ome.get("plate").filter(|plate| plate.is_object()) {
+        // Each count is the length of a declared list, and is missing on its
+        // own when that list is. Nothing is counted from the directories: a
+        // plate declaring 96 wells says 96 whether or not 96 were written.
+        let declared = |key: &str| {
+            plate
+                .get(key)
+                .and_then(|value| value.as_array())
+                .map(|entries| entries.len())
+        };
+
+        return Some(OmeInfo {
+            kind: OmeKind::Plate {
+                rows: declared("rows"),
+                columns: declared("columns"),
+                wells: declared("wells"),
+            },
+            version: stored_version(plate),
+            axes: None,
+            datasets: None,
+        });
+    }
+
+    if let Some(well) = ome.get("well").filter(|well| well.is_object()) {
+        return Some(OmeInfo {
+            kind: OmeKind::Well,
+            version: stored_version(well),
+            axes: None,
+            datasets: None,
+        });
+    }
+
+    None
 }
 
 /// Look for SpatialData metadata beside a Zarr V2 `.zgroup`.
@@ -853,6 +964,26 @@ fn group_rows(kind: &NodeKind) -> Vec<String> {
     if let Some(datasets) = &ome.datasets {
         rows.push(format!("pyramid levels: {}", datasets.len()));
         rows.push(format!("datasets: {}", datasets.join(", ")));
+    }
+    // A plate says how big it declares itself to be. Each count is independent,
+    // so a plate that declared only some of the three lists shows only those.
+    // A well adds no rows at all: its images are the child groups below it, and
+    // the tree is already printing them.
+    if let OmeKind::Plate {
+        rows: plate_rows,
+        columns,
+        wells,
+    } = &ome.kind
+    {
+        if let Some(count) = plate_rows {
+            rows.push(format!("rows: {count}"));
+        }
+        if let Some(count) = columns {
+            rows.push(format!("columns: {count}"));
+        }
+        if let Some(count) = wells {
+            rows.push(format!("wells: {count}"));
+        }
     }
     rows
 }
@@ -1156,14 +1287,40 @@ fn json_array_meta(meta: &ArrayMeta) -> Value {
 /// `pyramid_levels` is the length of `datasets`, exactly as the tree's row is,
 /// so the two numbers cannot drift apart. Both are `null` together when the
 /// metadata declares no usable `datasets`.
+///
+/// `kind` names which of the three OME-Zarr groups this is, so a reader can
+/// tell them apart without unpicking the tag. A plate's counts follow the same
+/// rule the tree's rows follow, and the same one `shards` follows on an array:
+/// a count that was not declared is left out rather than written as `null`,
+/// because only a plate has these to declare in the first place.
 fn json_ome(ome: &OmeInfo) -> Value {
-    json!({
+    let mut value = json!({
         "tag": ome.tag(),
+        "kind": ome.kind.name(),
         "version": ome.version,
         "axes": ome.axes,
         "pyramid_levels": ome.datasets.as_ref().map(|datasets| datasets.len()),
         "datasets": ome.datasets,
-    })
+    });
+
+    if let OmeKind::Plate {
+        rows,
+        columns,
+        wells,
+    } = &ome.kind
+    {
+        if let Some(count) = rows {
+            value["rows"] = json!(count);
+        }
+        if let Some(count) = columns {
+            value["columns"] = json!(count);
+        }
+        if let Some(count) = wells {
+            value["wells"] = json!(count);
+        }
+    }
+
+    value
 }
 
 #[cfg(test)]
@@ -1461,6 +1618,9 @@ mod tests {
         let info = ome_info_v3(&value).expect("a V3 image group should be recognised");
 
         assert_eq!(info.tag(), "OME-Zarr 0.5");
+        // An image is still a bare "OME-Zarr 0.5" with no kind appended, which
+        // is what leaves every existing image label untouched by HCS.
+        assert_eq!(info.kind.name(), "image");
         assert_eq!(joined(&info.axes), Some(String::from("c, y, x")));
         assert_eq!(info.datasets, Some(vec![String::from("0")]));
     }
@@ -1505,6 +1665,151 @@ mod tests {
         });
 
         assert!(ome_info_v3(&value).is_none());
+    }
+
+    #[test]
+    fn a_plate_is_recognised_and_reports_its_declared_counts() {
+        // A plate as ome-zarr-py writes one: an `ome.plate` object holding the
+        // three lists, and no `multiscales` anywhere.
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "ome": {
+                    "version": "0.5",
+                    "plate": {
+                        "version": "0.5",
+                        "rows": [{ "name": "A" }, { "name": "B" }],
+                        "columns": [{ "name": "1" }, { "name": "2" }, { "name": "3" }],
+                        "wells": [
+                            { "path": "A/1", "rowIndex": 0, "columnIndex": 0 },
+                            { "path": "A/2", "rowIndex": 0, "columnIndex": 1 },
+                            { "path": "B/1", "rowIndex": 1, "columnIndex": 0 }
+                        ]
+                    }
+                }
+            }
+        });
+
+        let info = ome_info_v3(&value).expect("an `ome.plate` object makes this a plate");
+
+        assert_eq!(info.tag(), "OME-Zarr 0.5 plate");
+        assert_eq!(info.kind.name(), "plate");
+        // The counts are the lengths of the declared lists. This fixture
+        // declares three wells on a two-by-three plate, and says three -- the
+        // occupancy of a plate is not this tool's business.
+        assert_eq!(
+            group_rows(&NodeKind::Group(GroupMeta {
+                ome: Some(info),
+                spatialdata: None,
+            })),
+            vec!["rows: 2", "columns: 3", "wells: 3"]
+        );
+    }
+
+    #[test]
+    fn a_plate_that_declares_no_lists_reports_no_counts() {
+        // The marker alone is enough to make it a plate. Counts we cannot take
+        // a length from are left out rather than guessed at.
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": { "ome": { "version": "0.4", "plate": { "rows": "two" } } }
+        });
+
+        let info = ome_info_v3(&value).expect("the marker alone makes this a plate");
+
+        assert_eq!(info.tag(), "OME-Zarr 0.4 plate");
+        assert!(
+            group_rows(&NodeKind::Group(GroupMeta {
+                ome: Some(info),
+                spatialdata: None,
+            }))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_well_is_recognised_and_adds_no_rows() {
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "ome": {
+                    "version": "0.5",
+                    "well": { "images": [{ "path": "0" }, { "path": "1" }] }
+                }
+            }
+        });
+
+        let info = ome_info_v3(&value).expect("an `ome.well` object makes this a well");
+
+        assert_eq!(info.tag(), "OME-Zarr 0.5 well");
+        assert_eq!(info.kind.name(), "well");
+        // A well is tagged and nothing more: the images it lists are the child
+        // groups the tree is already printing below it.
+        assert!(
+            group_rows(&NodeKind::Group(GroupMeta {
+                ome: Some(info),
+                spatialdata: None,
+            }))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_v2_plate_takes_its_version_from_the_plate_object() {
+        let dir = env::temp_dir().join(format!("zarr-tree-test-plate-v2-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // V2 has no `ome` namespace to record a version in, so the version sits
+        // inside the `plate` object -- the same split `multiscales` has, in a
+        // different place.
+        fs::write(
+            dir.join(".zattrs"),
+            r#"{"plate": {"version": "0.4", "rows": [{"name": "A"}], "columns": [{"name": "1"}]}}"#,
+        )
+        .unwrap();
+
+        let info = ome_info_v2(&dir);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        let info = info.expect("a V2 `plate` object makes this a plate");
+        assert_eq!(info.tag(), "OME-Zarr 0.4 plate");
+        // No `wells` list was declared, so no wells row -- the other two stand.
+        assert_eq!(
+            group_rows(&NodeKind::Group(GroupMeta {
+                ome: Some(info),
+                spatialdata: None,
+            })),
+            vec!["rows: 1", "columns: 1"]
+        );
+    }
+
+    #[test]
+    fn plate_and_well_names_alone_mean_nothing() {
+        // Everything here *looks* like a plate: a group called `A`, children
+        // called `1` and `2`, the word "plate" in a comment field. None of it
+        // is a marker, so none of it counts.
+        let named_like_a_plate = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": { "ome": { "version": "0.5", "name": "plate", "well": "A1" } }
+        });
+
+        // `ome.well` here is a string, not an object -- a value we cannot read
+        // a well out of is not a well.
+        assert!(ome_info_v3(&named_like_a_plate).is_none());
+
+        // And the same for a `plate` key that is not an object.
+        let plate_is_not_an_object = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": { "ome": { "version": "0.5", "plate": "96-well" } }
+        });
+
+        assert!(ome_info_v3(&plate_is_not_an_object).is_none());
     }
 
     #[test]
