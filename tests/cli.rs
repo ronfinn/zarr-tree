@@ -1235,3 +1235,95 @@ fn help_flag_prints_usage_and_exits_successfully() {
         );
     }
 }
+
+#[test]
+fn a_sharded_array_reports_its_chunks_and_its_shards_separately() {
+    let dir = fixture_dir("sharding");
+    let root = dir.join("dataset.zarr");
+
+    write_file(
+        &root.join("zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group"}"#,
+    );
+
+    // Two arrays chunked identically at 64x64. One stores those chunks inside
+    // 256x256 shards, so its chunk grid describes the shard rather than the
+    // chunk -- the two must still agree about what a chunk is.
+    write_file(
+        &root.join("sharded/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [1024, 1024],
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [256, 256]}},
+            "codecs": [{
+                "name": "sharding_indexed",
+                "configuration": {"chunk_shape": [64, 64], "codecs": [{"name": "bytes"}]}
+            }],
+            "data_type": "uint16"
+        }"#,
+    );
+    write_file(
+        &root.join("plain/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [1024, 1024],
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [64, 64]}},
+            "codecs": [{"name": "bytes"}],
+            "data_type": "uint16"
+        }"#,
+    );
+
+    let path = root.to_str().unwrap().to_string();
+    let text = String::from_utf8_lossy(&run(&[&path]).stdout).into_owned();
+    let output = run(&["--json", &path]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    let rows = lines(&text);
+    for expected in ["chunks: [64, 64]", "shards: [256, 256]"] {
+        assert!(has(&rows, expected), "expected {expected:?} in:\n{text}");
+    }
+    // The shard shape is never presented as a chunk shape.
+    assert!(
+        !has(&rows, "chunks: [256, 256]"),
+        "the shard shape leaked into the chunks row:\n{text}"
+    );
+
+    // `shards` sits between `chunks` and `dtype`, so `dtype` still closes the
+    // block -- for the sharded array and the unsharded one alike.
+    assert!(text.contains("├─ shards: [256, 256]"), "{text}");
+    assert_eq!(text.matches("└─ dtype:  uint16").count(), 2, "{text}");
+
+    let tree: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("--json should print valid JSON: {error}\n{stdout}"));
+    let child = |name: &str| -> Value {
+        tree["children"]
+            .as_array()
+            .expect("the root should have children")
+            .iter()
+            .find(|child| child["name"] == json!(name))
+            .unwrap_or_else(|| panic!("no child named {name:?} in {stdout}"))
+            .clone()
+    };
+
+    assert_eq!(
+        child("sharded")["array"],
+        json!({
+            "shape": [1024, 1024],
+            "chunks": [64, 64],
+            "shards": [256, 256],
+            "dtype": "uint16"
+        })
+    );
+    // An unsharded array has no shards to miss, so the key is absent rather
+    // than null -- null is reserved for a field we looked for and could not
+    // read.
+    assert_eq!(
+        child("plain")["array"],
+        json!({ "shape": [1024, 1024], "chunks": [64, 64], "dtype": "uint16" })
+    );
+    assert_eq!(child("plain")["array"].get("shards"), None);
+}

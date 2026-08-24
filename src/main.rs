@@ -116,9 +116,14 @@ impl SpatialData {
 /// Nothing interprets the entries. A dimension is copied across whatever it
 /// was written as, so a malformed `"shape": [1, "x"]` survives to the output
 /// instead of being dropped on the way.
+///
+/// `shards` is the one field that is absent rather than unread when it is
+/// `None`: only a V3 array using the sharding codec has shards at all, so
+/// every other array simply has nothing to say here.
 struct ArrayMeta {
     shape: Option<Vec<Value>>,
     chunks: Option<Vec<Value>>,
+    shards: Option<Vec<Value>>,
     dtype: Option<String>,
 }
 
@@ -871,6 +876,7 @@ fn array_meta_v2(path: &Path) -> ArrayMeta {
         return ArrayMeta {
             shape: None,
             chunks: None,
+            shards: None,
             dtype: None,
         };
     };
@@ -878,6 +884,8 @@ fn array_meta_v2(path: &Path) -> ArrayMeta {
     ArrayMeta {
         shape: dims(value.get("shape")),
         chunks: dims(value.get("chunks")),
+        // V2 has no sharding: there is one grid and `chunks` is it.
+        shards: None,
         // Shown exactly as stored, in V2's NumPy notation ("<u2", "|u1").
         dtype: value
             .get("dtype")
@@ -888,17 +896,47 @@ fn array_meta_v2(path: &Path) -> ArrayMeta {
 
 /// Collect the display metadata from an already-parsed Zarr V3 `zarr.json`.
 fn array_meta_v3(value: &Value) -> ArrayMeta {
-    // V3 keeps the chunk shape inside the chunk grid description. Only the
+    // V3 keeps the grid shape inside the chunk grid description. Only the
     // "regular" grid has a `chunk_shape`; any other grid simply yields None
     // here and the row shows as missing.
-    let chunk_shape = value
+    let grid_shape = value
         .get("chunk_grid")
         .and_then(|grid| grid.get("configuration"))
         .and_then(|config| config.get("chunk_shape"));
 
+    // Under the sharding codec the grid no longer describes the chunks: it
+    // describes the shards, and the chunks live inside them. The codec is
+    // found by its exact name, never guessed at from the shapes themselves.
+    let sharding = value
+        .get("codecs")
+        .and_then(|codecs| codecs.as_array())
+        .and_then(|codecs| {
+            codecs.iter().find(|codec| {
+                codec.get("name").and_then(|name| name.as_str()) == Some("sharding_indexed")
+            })
+        });
+
+    // Which shape is which is decided by whether the codec is *there*, not by
+    // whether its inner shape could be read. A sharding codec we cannot read
+    // through leaves `chunks` missing -- the `?` any unreadable field gets --
+    // rather than quietly falling back to the shard shape under the wrong
+    // name, which is the very mistake this branch exists to avoid.
+    let (chunks, shards) = match sharding {
+        Some(codec) => (
+            dims(
+                codec
+                    .get("configuration")
+                    .and_then(|config| config.get("chunk_shape")),
+            ),
+            dims(grid_shape),
+        ),
+        None => (dims(grid_shape), None),
+    };
+
     ArrayMeta {
         shape: dims(value.get("shape")),
-        chunks: dims(chunk_shape),
+        chunks,
+        shards,
         // The object form used by dtype extensions is not interpreted.
         dtype: value
             .get("data_type")
@@ -990,28 +1028,37 @@ fn dataset_paths(value: Option<&Value>) -> Option<Vec<String>> {
 
 /// Print the metadata rows that sit underneath an array line.
 ///
-/// All three rows are always printed, in the same order, so the closing
-/// connector is always on `dtype`. A field we could not read shows as `?`.
+/// `shape`, `chunks` and `dtype` are always printed, in that order. A sharded
+/// array gains a `shards` row between `chunks` and `dtype`; every other array
+/// prints exactly the three rows it always has. Whichever row ends up last
+/// carries the closing connector. A field we could not read shows as `?`.
 fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::Result<()> {
     // The dimension lists are drawn here rather than kept ready-made, because
-    // `--json` wants the same two facts as JSON arrays. Rendering late is what
+    // `--json` wants the same facts as JSON arrays. Rendering late is what
     // lets one reading serve both.
     let shape = meta.shape.as_deref().map(format_dims);
     let chunks = meta.chunks.as_deref().map(format_dims);
+    let shards = meta.shards.as_deref().map(format_dims);
 
-    let rows = [
-        ("shape:", &shape),
-        ("chunks:", &chunks),
-        ("dtype:", &meta.dtype),
-    ];
+    // A `Vec` rather than the fixed array this used to be, because the number
+    // of rows is no longer fixed. Everything else about the drawing is the
+    // same, including which name the padding is sized to -- "shards:" is the
+    // same width as "chunks:".
+    let mut rows = vec![("shape:", shape.as_deref()), ("chunks:", chunks.as_deref())];
+
+    if let Some(shards) = shards.as_deref() {
+        rows.push(("shards:", Some(shards)));
+    }
+
+    rows.push(("dtype:", meta.dtype.as_deref()));
+
+    // Taken before the rows are consumed below, so the closing connector lands
+    // on whichever row turned out to be last.
+    let last = rows.len() - 1;
 
     for (i, (name, value)) in rows.into_iter().enumerate() {
-        let connector = if i == rows.len() - 1 {
-            "└─ "
-        } else {
-            "├─ "
-        };
-        let value = value.as_deref().unwrap_or("?");
+        let connector = if i == last { "└─ " } else { "├─ " };
+        let value = value.unwrap_or("?");
         // Pad to the width of the longest name, "chunks:", so values line up.
         writeln!(out, "{prefix}{connector}{name:<7} {value}")?;
     }
@@ -1079,15 +1126,29 @@ fn json_tree(name: &str, dir: &Path, depth: Option<usize>) -> io::Result<Value> 
     Ok(node)
 }
 
-/// An array's three fields, with `null` where the tree would print `?`.
+/// An array's fields, with `null` where the tree would print `?`.
+///
+/// `shards` is the exception to that rule, and is left out altogether rather
+/// than written as `null`. The two say different things: `null` means the
+/// field was looked for and could not be read, which every array has a shape,
+/// chunks and a dtype to be. An unsharded array has no shards to miss, so the
+/// key is simply not applicable and does not appear.
 fn json_array_meta(meta: &ArrayMeta) -> Value {
-    json!({
+    let mut value = json!({
         // Real JSON arrays rather than the `[4096, 4096]` text the tree draws,
         // which is the whole reason `ArrayMeta` keeps the values it was given.
         "shape": meta.shape,
         "chunks": meta.chunks,
         "dtype": meta.dtype,
-    })
+    });
+
+    // Indexing a `Value` that holds an object inserts the key, which is the
+    // shortest way to add a field only sometimes.
+    if let Some(shards) = &meta.shards {
+        value["shards"] = json!(shards);
+    }
+
+    value
 }
 
 /// An OME-Zarr image group's metadata.
@@ -1235,6 +1296,9 @@ mod tests {
         assert_eq!(shown(&meta.shape), Some(String::from("[4096, 4096]")));
         assert_eq!(shown(&meta.chunks), Some(String::from("[512, 512]")));
         assert_eq!(meta.dtype, Some(String::from("uint16")));
+        // No sharding codec, so the grid shape is the chunk shape and there
+        // are no shards to speak of.
+        assert_eq!(shown(&meta.shards), None);
     }
 
     #[test]
@@ -1249,6 +1313,57 @@ mod tests {
         assert_eq!(shown(&meta.shape), Some(String::from("[4096, 4096]")));
         assert_eq!(shown(&meta.chunks), None);
         assert_eq!(meta.dtype, None);
+    }
+
+    #[test]
+    fn a_sharded_v3_array_reads_its_chunks_from_the_codec_not_the_grid() {
+        // Under the sharding codec the chunk grid describes the shard, and the
+        // chunks are the ones inside it. Reading the grid as the chunk shape
+        // is what this test exists to stop.
+        let value = json!({
+            "node_type": "array",
+            "shape": [1024, 1024],
+            "chunk_grid": {
+                "name": "regular",
+                "configuration": { "chunk_shape": [256, 256] }
+            },
+            "codecs": [{
+                "name": "sharding_indexed",
+                "configuration": {
+                    "chunk_shape": [64, 64],
+                    "codecs": [{ "name": "bytes" }]
+                }
+            }],
+            "data_type": "uint16"
+        });
+
+        let meta = array_meta_v3(&value);
+
+        assert_eq!(shown(&meta.chunks), Some(String::from("[64, 64]")));
+        assert_eq!(shown(&meta.shards), Some(String::from("[256, 256]")));
+    }
+
+    #[test]
+    fn an_unreadable_sharding_codec_leaves_the_chunks_missing() {
+        // The codec is there, so the grid shape is a shard and nothing else.
+        // With no inner shape to read, `chunks` goes missing and shows as `?`
+        // -- the grid shape is never borrowed to fill the gap, because doing
+        // so would print a shard under the name `chunks` all over again.
+        let value = json!({
+            "node_type": "array",
+            "shape": [1024, 1024],
+            "chunk_grid": {
+                "name": "regular",
+                "configuration": { "chunk_shape": [256, 256] }
+            },
+            "codecs": [{ "name": "sharding_indexed" }],
+            "data_type": "uint16"
+        });
+
+        let meta = array_meta_v3(&value);
+
+        assert_eq!(shown(&meta.chunks), None);
+        assert_eq!(shown(&meta.shards), Some(String::from("[256, 256]")));
     }
 
     #[test]
