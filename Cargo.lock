@@ -1955,6 +1955,7 @@ dependencies = [
  "object_store",
  "serde_json",
  "tokio",
+ "url",
 ]
 
 [[package]]

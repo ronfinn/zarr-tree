@@ -3,7 +3,7 @@
 [![CI](https://github.com/ronfinn/zarr-tree/actions/workflows/ci.yml/badge.svg)](https://github.com/ronfinn/zarr-tree/actions/workflows/ci.yml)
 
 A small Rust CLI for exploring the structure and metadata of Zarr stores, on
-this machine or in an S3 bucket.
+this machine, in an S3 bucket, or on an HTTP server.
 
 ```
 $ zarr-tree example.zarr
@@ -26,7 +26,8 @@ example.zarr [group]
 
 ## Features
 
-- Prints a tree of a Zarr store, given a directory or an `s3://` URI.
+- Prints a tree of a Zarr store, given a directory, an `s3://` URI or an
+  `http(s)://` URL.
 - Labels each directory as `[group]`, `[array]` or `[unknown]`.
 - Shows `shape`, `chunks` and `dtype` underneath every array.
 - Tells a Zarr V3 sharded array's inner chunks from its shards, and adds a
@@ -48,6 +49,10 @@ example.zarr [group]
 - Reads S3 with the same walk, the same output and the same options, stopping
   at arrays there too — so an array's chunk objects are never listed, however
   many millions of them there are.
+- Reads HTTP(S) the same way. Metadata comes from ordinary `GET`s; children
+  come from a WebDAV `PROPFIND`, so a full tree needs a server that supports
+  it, and a server that only does `GET` says so plainly instead of pretending
+  the store is missing.
 - Limits how far it descends with `--depth N`.
 - Prints the same walk as JSON with `--json`, for `jq` and scripts.
 - Sits quietly at the producing end of a pipe: `| head` ends the run with no
@@ -541,6 +546,69 @@ error: expected s3://bucket/prefix, not "s3://"
 usage: zarr-tree [OPTIONS] <STORE>
 ```
 
+### HTTP and HTTPS
+
+A store argument beginning with `http://` or `https://` is read from that
+server. Again nothing else changes: the same walk, the same tree, the same
+`--depth` and `--json`.
+
+```
+$ zarr-tree http://server.example/data/example.zarr
+http://server.example/data/example.zarr [group, OME-Zarr 0.5]
+├─ axes: y, x
+├─ pyramid levels: 1
+├─ datasets: 0
+├── 0 [array]
+│   ├─ shape:  [1024, 1024]
+│   ├─ chunks: [128, 128]
+│   ├─ shards: [512, 512]
+│   └─ dtype:  uint16
+└── labels [group]
+    └── cells [array]
+        ├─ shape:  [1024, 1024]
+        ├─ chunks: [256, 256]
+        └─ dtype:  uint8
+```
+
+**Listing needs WebDAV.** Metadata is read with ordinary `GET` requests, which
+every server supports. Finding a node's *children* is a different question, and
+HTTP has no operation for it — so `zarr-tree` asks with a WebDAV `PROPFIND`,
+`Depth: 1`. A server configured for WebDAV (Apache `mod_dav`, nginx
+`ngx_http_dav_module` with `PROPFIND`, ownCloud/Nextcloud, and most object
+gateways that offer a DAV endpoint) gives a full tree.
+
+An ordinary static file server does not. It is told apart from a missing store,
+because saying "not found" about a URL we have just read metadata from would be
+wrong:
+
+```
+$ zarr-tree --depth 1 https://static.example/data/example.zarr
+https://static.example/data/example.zarr [group, OME-Zarr 0.4]
+error: cannot list https://static.example/data/example.zarr: the server answers
+GET but not the WebDAV listing needed to find child nodes
+```
+
+Such a store can still be inspected one node at a time, since `--depth 0` needs
+no listing at all:
+
+```
+$ zarr-tree --depth 0 https://static.example/data/example.zarr
+https://static.example/data/example.zarr [group, OME-Zarr 0.4]
+├─ axes: c, z, y, x
+├─ pyramid levels: 3
+└─ datasets: 0, 1, 2
+```
+
+Directory-index pages are never scraped: an HTML listing is a page for people,
+not a protocol, and reading one would mean guessing at a server's theme.
+
+**URLs.** The URL is the store root, and internal paths resolve beneath it. A
+trailing slash makes no difference, and percent-escapes are decoded and
+re-applied per path segment rather than pasted together. A query string is kept
+and sent with every request, which is the one shape of access token a static
+server tends to want. There is no credential handling of any other kind: no
+`Authorization` header, no cookie, no `--user`.
+
 ### Depth
 
 `--depth N` limits how far below the root the walk goes. `0` shows the root on
@@ -691,8 +759,20 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
 
 ## Limitations
 
-- Local directories and S3 only. There is no HTTP, GCS or Azure backend, no
+- Local directories, S3 and HTTP(S) only. There is no GCS or Azure backend, no
   ZIP store, and no writing of any kind.
+- An HTTP(S) tree needs a server that answers WebDAV `PROPFIND`. On a static
+  server only `--depth 0` works, and there is no way to walk it: HTML
+  directory-index pages are deliberately not scraped, and consolidated Zarr
+  metadata (`.zmetadata`, `zarr.json` with `consolidated_metadata`) is not read
+  yet — that would be the way to walk a static server, and it is not
+  implemented.
+- HTTP(S) access is anonymous. Credentials, custom headers and client
+  certificates are not supported; a query string on the URL is passed through,
+  and that is all.
+- A WebDAV listing costs one `PROPFIND` per group, but a server that redirects
+  a collection URL to its trailing-slash form — Apache `mod_dav` does — turns
+  that into two requests. Nothing here follows up on that.
 - S3 credentials come from `AWS_*` environment variables, a web-identity token,
   a container credential endpoint or EC2 instance metadata. `~/.aws/credentials`
   is not read, and there is no `--profile`, `--region` or `--endpoint` flag:
@@ -766,10 +846,11 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
 
 Small, in roughly this order:
 
-1. Show a node's user attributes when asked.
-2. Report V3 dtypes given in object form, instead of showing them as missing.
+1. Read consolidated metadata, so a plain static HTTP server can be walked.
+2. Show a node's user attributes when asked.
+3. Report V3 dtypes given in object form, instead of showing them as missing.
 
-HTTP, GCS and Azure backends, and anything beyond lightweight OME-Zarr and
+GCS and Azure backends, and anything beyond lightweight OME-Zarr and
 SpatialData recognition, are out of scope for now.
 
 ## Why this project exists

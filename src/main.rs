@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::env;
 use std::fs;
 use std::io;
@@ -6,10 +7,12 @@ use std::path::PathBuf;
 use std::process;
 
 use object_store::aws::AmazonS3Builder;
+use object_store::http::HttpBuilder;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{ClientConfigKey, ObjectStore, ObjectStoreExt};
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
+use url::Url;
 
 /// What kind of Zarr node a directory is, as far as its metadata files reveal.
 enum NodeKind {
@@ -242,15 +245,20 @@ Explore the structure and metadata of a Zarr store.
 USAGE:
     zarr-tree [OPTIONS] <STORE>
 
-STORE is a directory on this machine, or an S3 URI:
+STORE is a directory on this machine, an S3 URI, or an HTTP(S) URL:
 
     zarr-tree /data/store.zarr
     zarr-tree s3://bucket/path/store.zarr
+    zarr-tree https://server.example/data/store.zarr
 
 S3 settings are read from the usual AWS_* environment variables. When none of
 them supplies a credential, requests are sent unsigned, which is what a public
 bucket wants; set AWS_SKIP_SIGNATURE=false to force the credential chain, and
 AWS_REGION when the bucket is not in us-east-1.
+
+Walking an HTTP(S) store needs a server that answers WebDAV PROPFIND, which is
+how children are found. Metadata is read with ordinary GETs, so a static server
+can still be inspected with --depth 0.
 
 OPTIONS:
         --depth <N>  Descend at most N levels below the root.
@@ -501,9 +509,10 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
 /// Where a walk reads its metadata from.
 ///
 /// Two things implement it: a directory on this machine, and a key prefix in
-/// an object store. Everything above it -- the walk, both renderers, and every
-/// function that interprets Zarr, OME-Zarr or SpatialData metadata -- is
-/// written once and never learns which one it is looking at.
+/// an object store -- an S3 bucket, or a path on an HTTP server. Everything
+/// above it -- the walk, both renderers, and every function that interprets
+/// Zarr, OME-Zarr or SpatialData metadata -- is written once and never learns
+/// which one it is looking at.
 ///
 /// Three methods, because a walk asks only three questions: what does this
 /// metadata file say, what lies immediately below this node, and is the root
@@ -560,9 +569,10 @@ fn child_path(parent: &str, name: &str) -> String {
 
 /// Where the positional argument points.
 ///
-/// The scheme decides, and only `s3://` names a remote store. Everything else
-/// is a path on this machine and is passed through untouched -- including a
-/// relative path that happens to contain `s3://` somewhere after its start.
+/// The scheme decides, and only `s3://`, `http://` and `https://` name a
+/// remote store. Everything else is a path on this machine and is passed
+/// through untouched -- including a relative path that happens to contain one
+/// of those somewhere after its start.
 enum Location {
     Local,
     /// A bucket, and the key prefix the store root sits at. The prefix is
@@ -571,28 +581,82 @@ enum Location {
         bucket: String,
         key: String,
     },
+    /// A server, and the path the store root sits at.
+    ///
+    /// Split the same way S3 is, and for the same reason: `object_store`'s
+    /// HTTP store wants one base URL and keys beneath it, and keys are what
+    /// come back from a listing. `base` is the origin -- scheme, host, port,
+    /// and any query string -- and `path` is everything after it.
+    Http {
+        base: String,
+        path: String,
+    },
 }
 
-/// Read an `s3://bucket/prefix` URI, or say what is wrong with it.
+/// Read a remote URI, or say what is wrong with it.
+///
+/// Anything without a scheme this understands is a local path, returned
+/// unread: a directory is whatever the filesystem says it is, and nothing here
+/// should have an opinion about its spelling.
 fn parse_location(target: &str) -> Result<Location, String> {
-    let Some(rest) = target.strip_prefix("s3://") else {
-        return Ok(Location::Local);
-    };
+    if let Some(rest) = target.strip_prefix("s3://") {
+        // A trailing slash is how a person writes a prefix, and an S3 key has
+        // no use for one: `s3://bucket/store.zarr/` and `s3://bucket/store.zarr`
+        // name the same place. The root line trims the same slash off the local
+        // spelling for the same reason.
+        let rest = rest.trim_end_matches('/');
+        let (bucket, key) = rest.split_once('/').unwrap_or((rest, ""));
 
-    // A trailing slash is how a person writes a prefix, and an S3 key has no
-    // use for one: `s3://bucket/store.zarr/` and `s3://bucket/store.zarr` name
-    // the same place. The root line trims the same slash off the local
-    // spelling for the same reason.
-    let rest = rest.trim_end_matches('/');
-    let (bucket, key) = rest.split_once('/').unwrap_or((rest, ""));
+        if bucket.is_empty() {
+            return Err(format!("expected s3://bucket/prefix, not {target:?}"));
+        }
 
-    if bucket.is_empty() {
-        return Err(format!("expected s3://bucket/prefix, not {target:?}"));
+        return Ok(Location::S3 {
+            bucket: String::from(bucket),
+            key: String::from(key),
+        });
     }
 
-    Ok(Location::S3 {
-        bucket: String::from(bucket),
-        key: String::from(key),
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return parse_http_location(target);
+    }
+
+    Ok(Location::Local)
+}
+
+/// Split an `http://` or `https://` URI into the base URL and the path
+/// beneath it.
+///
+/// Parsed rather than sliced. `object_store`'s HTTP store builds every request
+/// URL by extending its base URL's path segments, which percent-encodes each
+/// segment as it goes -- so the path it is given has to be *decoded*, and
+/// `Path::from_url_path` is what decodes it. Splitting the URI by hand would
+/// have meant deciding all of that here, wrongly.
+///
+/// The base is the origin and nothing else, because a listing answers with
+/// paths from the server root rather than from wherever the store happens to
+/// begin. Keeping the base at the root is what makes a read and a listing
+/// agree about what a key means.
+///
+/// A query string rides on the base, so it survives onto every request -- the
+/// one shape of access token a static server tends to want. A fragment is
+/// dropped: it never reaches a server anyway.
+fn parse_http_location(target: &str) -> Result<Location, String> {
+    // `Url::parse` is the whole of the validation. For `http` and `https` it
+    // requires a host, so `https://` and `http://?token=x` are refused here
+    // and nothing needs checking afterwards.
+    let url = Url::parse(target).map_err(|error| format!("invalid url {target:?}: {error}"))?;
+
+    let path = ObjectPath::from_url_path(url.path())
+        .map_err(|error| format!("invalid url path in {target:?}: {error}"))?;
+
+    let mut base = url.clone();
+    base.set_path("/");
+    base.set_fragment(None);
+
+    Ok(Location::Http {
+        base: base.to_string(),
+        path: String::from(path.as_ref()),
     })
 }
 
@@ -605,6 +669,7 @@ fn open_store(target: &str) -> io::Result<Box<dyn Store>> {
     match parse_location(target).map_err(io::Error::other)? {
         Location::Local => Ok(Box::new(LocalStore::new(target))),
         Location::S3 { bucket, key } => Ok(Box::new(RemoteStore::s3(target, &bucket, &key)?)),
+        Location::Http { base, path } => Ok(Box::new(RemoteStore::http(target, &base, &path)?)),
     }
 }
 
@@ -679,11 +744,36 @@ impl Store for LocalStore {
     }
 }
 
+/// Which object store is behind a `RemoteStore`.
+///
+/// The walk never asks: both answer `read` and `children` the same way, which
+/// is the whole point of `Store`. Their *failures* differ enough to be worth
+/// telling apart, and that is the only thing this is read for -- see
+/// `RemoteStore::diagnose`.
+#[derive(Clone, Copy, PartialEq)]
+enum Backend {
+    S3,
+    Http,
+}
+
+impl Backend {
+    /// What to call a root that is not there.
+    ///
+    /// One request cannot tell a missing bucket from a missing key, so S3 says
+    /// both. An HTTP URL has no such split.
+    fn missing(&self, uri: &str) -> String {
+        match self {
+            Backend::S3 => format!("no such bucket or prefix: {uri}"),
+            Backend::Http => format!("not found: {uri}"),
+        }
+    }
+}
+
 /// A Zarr store held under a key prefix in an object store.
 ///
-/// `s3` builds the one this program uses. The tests build the same type over
-/// `object_store`'s in-memory store, which is what lets the remote walk be
-/// tested with no network, no mock server and no AWS account.
+/// `s3` and `http` build the two this program uses. The tests build the same
+/// type over `object_store`'s in-memory store, which is what lets the remote
+/// walk be tested with no network, no mock server and no AWS account.
 struct RemoteStore {
     /// The runtime the requests are driven on. `object_store` is async
     /// throughout and zarr-tree is not, so every call below is run to
@@ -698,11 +788,30 @@ struct RemoteStore {
     prefix: ObjectPath,
     /// The URI as it was typed. Only the error messages read it.
     uri: String,
+    /// Which store this is. Only the error messages read it.
+    backend: Backend,
+    /// Whether any read has yet come back with something.
+    ///
+    /// Evidence, kept for one message. An HTTP listing is a WebDAV
+    /// `PROPFIND`, which an ordinary static server answers "method not
+    /// allowed" -- and `object_store` hands that back as the same
+    /// unclassified error a dead host would produce. One read having already
+    /// succeeded is what separates the two, and it is proof rather than a
+    /// guess: the metadata we are printing came off that very server.
+    ///
+    /// A `Cell` because `read` takes `&self`, as every `Store` method does.
+    /// Nothing here is threaded, and nothing else reads this.
+    reachable: Cell<bool>,
 }
 
 impl RemoteStore {
     /// Wrap an object store, with `prefix` as the store root.
-    fn new(store: impl ObjectStore + 'static, prefix: &str, uri: &str) -> io::Result<Self> {
+    fn new(
+        store: impl ObjectStore + 'static,
+        prefix: &str,
+        uri: &str,
+        backend: Backend,
+    ) -> io::Result<Self> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -712,6 +821,8 @@ impl RemoteStore {
             store: Box::new(store),
             prefix: ObjectPath::from(prefix),
             uri: String::from(uri),
+            backend,
+            reachable: Cell::new(false),
         })
     }
 
@@ -734,8 +845,34 @@ impl RemoteStore {
             builder = builder.with_skip_signature(true);
         }
 
-        let store = builder.build().map_err(|error| s3_error(uri, &error))?;
-        RemoteStore::new(store, key, uri)
+        let store = builder
+            .build()
+            .map_err(|error| remote_error(Backend::S3, uri, &error))?;
+        RemoteStore::new(store, key, uri, Backend::S3)
+    }
+
+    /// A path on an HTTP server.
+    ///
+    /// `base` is the origin, and every key is a path beneath it -- see
+    /// `parse_http_location` for why the split falls there. Nothing is
+    /// configured beyond that: there are no credentials, no headers and no
+    /// options of ours, so what reaches the server is a plain `GET` and, for a
+    /// listing, a WebDAV `PROPFIND`.
+    ///
+    /// `http://` is allowed only because the URI asked for it in so many
+    /// words. `object_store` refuses cleartext by default, which is the right
+    /// default for a URL it was handed rather than typed.
+    fn http(uri: &str, base: &str, path: &str) -> io::Result<Self> {
+        let mut builder = HttpBuilder::new().with_url(base);
+
+        if base.starts_with("http://") {
+            builder = builder.with_config(ClientConfigKey::AllowHttp, "true");
+        }
+
+        let store = builder
+            .build()
+            .map_err(|error| remote_error(Backend::Http, uri, &error))?;
+        RemoteStore::new(store, path, uri, Backend::Http)
     }
 
     /// The object key a store path lands on.
@@ -746,36 +883,70 @@ impl RemoteStore {
         ObjectPath::from(format!("{}/{path}", self.prefix))
     }
 
-    /// Why the store could not be reached, in one line.
+    /// Why a listing failed, in one line.
     ///
     /// A failed *listing* is the one thing `object_store` hands back
     /// unclassified: whatever went wrong, it arrives as a generic error with
-    /// S3's XML explanation attached, and the status that would have sorted it
-    /// is not reachable from outside the library. A failed *read* is sorted,
-    /// so one read of the same prefix is made purely to ask why -- an extra
-    /// request on the failing path, and only there.
+    /// the server's own explanation attached, and the status that would have
+    /// sorted it is not reachable from outside the library. A failed *read* is
+    /// sorted, so a read is what this asks with.
     ///
-    /// A prefix is not an object, so a bucket that can be read at all answers
-    /// "not found" here too. That is the right answer anyway: the listing
-    /// failed, and on a readable bucket only the name can have been wrong.
-    fn diagnose(&self) -> io::Error {
+    /// The two stores want different answers from that, because the listing
+    /// they failed at is a different operation. On S3 it is `ListObjectsV2`,
+    /// which every bucket supports, so a failure means the name was wrong. On
+    /// HTTP it is a WebDAV `PROPFIND`, which an ordinary static server does
+    /// not implement at all -- and telling somebody their store does not exist
+    /// when we have just printed metadata read from it would be plainly wrong.
+    ///
+    /// So on HTTP, any evidence that the server is there and serving files
+    /// settles it: either a read has already succeeded, or a read of this very
+    /// prefix does now.
+    fn diagnose(&self, error: &object_store::Error) -> io::Error {
+        let cannot_list = || {
+            io::Error::other(format!(
+                "cannot list {}: the server answers GET but not the WebDAV \
+                 listing needed to find child nodes",
+                self.uri
+            ))
+        };
+
+        // Some listing failures do arrive sorted -- a WebDAV `PROPFIND` that
+        // was refused, rather than not understood. Those say what they are and
+        // need no second request.
+        if let object_store::Error::NotFound { .. }
+        | object_store::Error::PermissionDenied { .. }
+        | object_store::Error::Unauthenticated { .. } = error
+        {
+            return remote_error(self.backend, &self.uri, error);
+        }
+
+        let http = self.backend == Backend::Http;
+        if http && self.reachable.get() {
+            return cannot_list();
+        }
+
+        // One extra request, on the failing path and only there.
         match self.runtime.block_on(self.store.head(&self.prefix)) {
+            // A resource that answers a read but not a listing. On S3 that
+            // proves nothing -- a key prefix is not an object, so reading one
+            // never succeeds -- but on HTTP it is the whole story.
+            Ok(_) if http => cannot_list(),
             Ok(_) | Err(object_store::Error::NotFound { .. }) => {
-                io::Error::other(format!("no such bucket or prefix: {}", self.uri))
+                io::Error::other(self.backend.missing(&self.uri))
             }
-            Err(error) => s3_error(&self.uri, &error),
+            Err(error) => remote_error(self.backend, &self.uri, &error),
         }
     }
 
     /// The immediate children and the objects of one prefix, in one request.
     fn list(&self, prefix: &ObjectPath) -> io::Result<object_store::ListResult> {
-        // One `ListObjectsV2` with `delimiter=/`. The keys directly under the
-        // prefix come back as objects, and everything deeper is folded into
-        // one common prefix per child -- so a child costs a line of a response
-        // rather than a request of its own.
+        // On S3 one `ListObjectsV2` with `delimiter=/`, on HTTP one WebDAV
+        // `PROPFIND` with `Depth: 1`. Both answer with the keys directly under
+        // the prefix and one entry per child collection beneath it -- so a
+        // child costs a line of a response rather than a request of its own.
         self.runtime
             .block_on(self.store.list_with_delimiter(Some(prefix)))
-            .map_err(|error| s3_error(&self.uri, &error))
+            .map_err(|error| self.diagnose(&error))
     }
 }
 
@@ -785,6 +956,10 @@ impl Store for RemoteStore {
         let bytes = self
             .runtime
             .block_on(async { self.store.get(&key).await.ok()?.bytes().await.ok() })?;
+
+        // Noted for one error message, and nothing else. See `reachable`.
+        self.reachable.set(true);
+
         String::from_utf8(bytes.to_vec()).ok()
     }
 
@@ -821,13 +996,10 @@ impl Store for RemoteStore {
         // is safe nowhere else: a prefix with no `.zarray` and no array
         // `zarr.json` is not an array, so it is not the prefix full of chunks
         // that `Store::check_root` warns about.
-        let listing = self.list(&self.prefix).map_err(|_| self.diagnose())?;
+        let listing = self.list(&self.prefix)?;
 
         if listing.objects.is_empty() && listing.common_prefixes.is_empty() {
-            return Err(io::Error::other(format!(
-                "no such bucket or prefix: {}",
-                self.uri
-            )));
+            return Err(io::Error::other(self.backend.missing(&self.uri)));
         }
         Ok(())
     }
@@ -863,7 +1035,7 @@ fn anonymous_by_default() -> bool {
     .any(|name| env::var_os(name).is_some())
 }
 
-/// The one line printed for a failed S3 request.
+/// The one line printed for a failed remote request.
 ///
 /// Four cases, because a person can act on each of the first three: the name
 /// is wrong, the credentials are not allowed, the credentials are not valid,
@@ -872,26 +1044,23 @@ fn anonymous_by_default() -> bool {
 ///
 /// Nothing here can print a secret. `object_store` puts no key, token or
 /// signature in an error, and the fourth case is cut to its first line anyway
-/// -- which is also what keeps a failure from spilling S3's whole XML
-/// explanation across the terminal.
-fn s3_error(uri: &str, error: &object_store::Error) -> io::Error {
+/// -- which is also what keeps a failure from spilling a whole XML response
+/// across the terminal.
+fn remote_error(backend: Backend, uri: &str, error: &object_store::Error) -> io::Error {
     let message = match error {
-        // A bucket that does not exist answers 404 as well, so this is both
-        // "no such bucket" and "no such key" -- from one request there is no
-        // telling which.
-        object_store::Error::NotFound { .. } => format!("no such bucket or prefix: {uri}"),
+        object_store::Error::NotFound { .. } => backend.missing(uri),
         object_store::Error::PermissionDenied { .. } => format!("permission denied: {uri}"),
         object_store::Error::Unauthenticated { .. } => format!("authentication failed: {uri}"),
-        other => format!("s3 request failed: {}", first_line(other)),
+        other => format!("request failed: {}", first_line(other)),
     };
     io::Error::other(message)
 }
 
 /// The first line of an error's own words, and no more.
 ///
-/// A failed request carries the whole response body in its message, and S3
-/// answers in XML across several lines. One line is what belongs on a
-/// terminal; the rest was never an explanation a person wanted.
+/// A failed request carries the whole response body in its message, and both
+/// S3 and WebDAV answer in XML across several lines. One line is what belongs
+/// on a terminal; the rest was never an explanation a person wanted.
 fn first_line(error: &object_store::Error) -> String {
     let message = error.to_string();
     String::from(message.lines().next().unwrap_or_default())
@@ -1765,7 +1934,12 @@ mod tests {
     use super::*;
     use object_store::PutPayload;
     use serde_json::json;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
 
     /// A command line, as `parse_args` wants it: everything after the program
     /// name, owned. `env::args` hands back `String`s, so the tests do too.
@@ -1881,7 +2055,13 @@ mod tests {
     /// no AWS account -- and what is under test is the same `RemoteStore` that
     /// an `s3://` URI builds, differing only in which object store it wraps.
     fn memory_store(uri: &str, prefix: &str, objects: &[(&str, &str)]) -> RemoteStore {
-        let store = RemoteStore::new(object_store::memory::InMemory::new(), prefix, uri).unwrap();
+        let store = RemoteStore::new(
+            object_store::memory::InMemory::new(),
+            prefix,
+            uri,
+            Backend::S3,
+        )
+        .unwrap();
 
         for (key, body) in objects {
             store
@@ -1902,6 +2082,365 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         print_store(&mut out, store, name, &kind, depth).unwrap();
         String::from_utf8(out).unwrap()
+    }
+
+    /// A minimal HTTP server, on a thread of its own.
+    ///
+    /// It answers the three things zarr-tree ever asks of a server and nothing
+    /// else: `GET` and `HEAD` for metadata, and -- when `webdav` is set --
+    /// WebDAV `PROPFIND` with `Depth: 1` for children. With `webdav` off it
+    /// refuses `PROPFIND` the way an ordinary static file server does, which
+    /// is the whole reason it is worth having one.
+    ///
+    /// One request per connection, no keep-alive, no concurrency. Enough to
+    /// prove the URL mapping and the listing behaviour against the real
+    /// `object_store` HTTP client; not a web server.
+    struct TestServer {
+        /// The URL of the store root, as a person would type it.
+        url: String,
+        /// Every request path the server has seen, in order. What proves a
+        /// chunk was never asked for is its absence from here.
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TestServer {
+        fn start(root: &str, objects: &[(&str, &str)], webdav: bool) -> TestServer {
+            // Port 0 asks the operating system for a free one, so tests running
+            // side by side cannot collide.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+
+            let files: BTreeMap<String, String> = objects
+                .iter()
+                .map(|(key, body)| (child_path(root, key), String::from(*body)))
+                .collect();
+
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let log = Arc::clone(&requests);
+
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let Some((method, target)) = read_request(&mut stream) else {
+                        continue;
+                    };
+                    log.lock().unwrap().push(target.clone());
+
+                    // Keys are stored without the leading slash the URL has.
+                    let key = target.split(['?', '#']).next().unwrap_or("");
+                    let key = key.trim_matches('/');
+
+                    let response = match method.as_str() {
+                        "GET" | "HEAD" => match files.get(key) {
+                            Some(body) => http_response("200 OK", body, method == "HEAD"),
+                            None => http_response("404 Not Found", "", method == "HEAD"),
+                        },
+                        "PROPFIND" if webdav => propfind(&files, key),
+                        // What a static server says. `object_store` hands this
+                        // back as a generic failure, which is what
+                        // `RemoteStore::diagnose` has to make sense of.
+                        _ => http_response("405 Method Not Allowed", "", false),
+                    };
+
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+            });
+
+            TestServer {
+                url: format!("http://127.0.0.1:{port}/{root}"),
+                requests,
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        /// The store this server's root URL opens, through the same
+        /// `open_store` the command line goes through.
+        fn open(&self) -> Box<dyn Store> {
+            open_store(&self.url).unwrap()
+        }
+    }
+
+    /// The method and target of one request, or `None` if the connection died.
+    fn read_request(stream: &mut TcpStream) -> Option<(String, String)> {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).ok()? == 0 {
+                return None;
+            }
+            head.push(byte[0]);
+        }
+
+        // "PROPFIND /data/store.zarr HTTP/1.1" -- the first two words are all
+        // that is needed. `Depth` is not read: `list_with_delimiter` is the
+        // only caller and it always asks for 1.
+        let text = String::from_utf8_lossy(&head).into_owned();
+        let mut words = text.split_whitespace();
+        Some((String::from(words.next()?), String::from(words.next()?)))
+    }
+
+    fn http_response(status: &str, body: &str, head_only: bool) -> String {
+        let head = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        match head_only {
+            true => head,
+            false => format!("{head}{body}"),
+        }
+    }
+
+    /// A WebDAV `Depth: 1` answer: the collection itself, then one entry per
+    /// immediate child.
+    ///
+    /// `object_store` drops the collection itself by path length and turns the
+    /// rest into common prefixes and objects, so what this has to get right is
+    /// the shape, not the filtering.
+    fn propfind(files: &BTreeMap<String, String>, prefix: &str) -> String {
+        let inside = format!("{prefix}/");
+        if !files.keys().any(|key| key.starts_with(&inside)) {
+            // No such collection. A WebDAV server answers 404, and
+            // `object_store` reads that as "no children" rather than an error.
+            return http_response("404 Not Found", "", false);
+        }
+
+        let mut body = String::from(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<multistatus xmlns=\"DAV:\">\n",
+        );
+        body.push_str(&dav_entry(&format!("/{inside}"), None));
+
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for (key, text) in files {
+            let Some(rest) = key.strip_prefix(&inside) else {
+                continue;
+            };
+            match rest.split_once('/') {
+                // A child collection, named once however many keys sit below.
+                Some((directory, _)) => {
+                    if seen.insert(directory) {
+                        body.push_str(&dav_entry(&format!("/{inside}{directory}/"), None));
+                    }
+                }
+                None => body.push_str(&dav_entry(&format!("/{inside}{rest}"), Some(text.len()))),
+            }
+        }
+
+        body.push_str("</multistatus>\n");
+        http_response("207 Multi-Status", &body, false)
+    }
+
+    /// One `<response>` element. `size` is `None` for a collection.
+    ///
+    /// The date format is the one `object_store` insists on -- RFC 1123, which
+    /// it parses as `%a, %d %h %Y %T GMT` -- and a missing `getlastmodified`
+    /// fails the whole listing, so it is not optional here even though nothing
+    /// reads it. chrono checks the weekday against the date, so the two have
+    /// to agree: 1 January 1970 really was a Thursday.
+    fn dav_entry(href: &str, size: Option<usize>) -> String {
+        let (resource_type, length) = match size {
+            Some(size) => (
+                String::new(),
+                format!("<getcontentlength>{size}</getcontentlength>"),
+            ),
+            None => (String::from("<collection/>"), String::new()),
+        };
+
+        format!(
+            "<response><href>{href}</href><propstat><prop>\
+             <getlastmodified>Thu, 01 Jan 1970 00:00:00 GMT</getlastmodified>\
+             {length}<resourcetype>{resource_type}</resourcetype>\
+             </prop><status>HTTP/1.1 200 OK</status></propstat></response>\n"
+        )
+    }
+
+    #[test]
+    fn an_http_uri_is_split_into_a_base_and_a_path() {
+        // The base is the origin and nothing more, because a WebDAV listing
+        // answers with paths from the server root. The path becomes the key
+        // prefix, exactly as an S3 key does.
+        let Ok(Location::Http { base, path }) =
+            parse_location("https://server.example/data/store.zarr")
+        else {
+            panic!("an https:// URI names a server");
+        };
+        assert_eq!(base, "https://server.example/");
+        assert_eq!(path, "data/store.zarr");
+
+        // Cleartext, a port, and a trailing slash.
+        let Ok(Location::Http { base, path }) = parse_location("http://127.0.0.1:8080/store.zarr/")
+        else {
+            panic!("an http:// URI names a server");
+        };
+        assert_eq!(base, "http://127.0.0.1:8080/");
+        assert_eq!(path, "store.zarr");
+
+        // A percent-encoded path is decoded here, because the client encodes
+        // each segment again on its way out. Left encoded it would go out as
+        // `my%2520data`.
+        let Ok(Location::Http { path, .. }) =
+            parse_location("https://server.example/my%20data/s.zarr")
+        else {
+            panic!("an escaped path is still a path");
+        };
+        assert_eq!(path, "my data/s.zarr");
+
+        // A query string rides on the base, so every request carries it --
+        // which is the one shape of access token a static server tends to
+        // want. A fragment never reaches a server and is dropped.
+        let Ok(Location::Http { base, path }) =
+            parse_location("https://server.example/s.zarr?token=abc#top")
+        else {
+            panic!("a query string is still a URI");
+        };
+        assert_eq!(base, "https://server.example/?token=abc");
+        assert_eq!(path, "s.zarr");
+
+        // And the scheme is the only thing that decides. A local path that
+        // merely contains one somewhere after its start is a local path.
+        for local in ["store.zarr", "/data/store.zarr", "./mirrors/https://x"] {
+            assert!(
+                matches!(parse_location(local), Ok(Location::Local)),
+                "{local:?} names a directory on this machine"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_http_uri_is_rejected() {
+        // Nothing to name a server with. Rejected rather than read as a
+        // relative path, because the scheme said what was meant -- the same
+        // rule `s3://` follows.
+        for broken in ["http://", "https://", "http://?token=x", "https://[bad"] {
+            let Err(error) = parse_location(broken) else {
+                panic!("{broken:?} names no server");
+            };
+            assert!(error.contains("invalid url"), "{error}");
+        }
+
+        // Not malformed, though it looks it: URL parsing strips the extra
+        // slashes off an authority, so this names the host `store.zarr` and
+        // not a path on some unnamed server. Asserted so that nobody
+        // "corrects" it into the list above.
+        let Ok(Location::Http { base, path }) = parse_location("https:///store.zarr") else {
+            panic!("the extra slash is stripped, leaving a host");
+        };
+        assert_eq!(base, "https://store.zarr/");
+        assert_eq!(path, "");
+    }
+
+    #[test]
+    fn the_same_store_reads_the_same_over_http_as_on_disk() {
+        // The same assertion the S3 tests make, over a real HTTP client and a
+        // real WebDAV listing. Everything in this tree -- the OME-Zarr 0.5
+        // tag, the axes, the pyramid, the sharded array's two grids -- is read
+        // by functions that never learn where the bytes came from.
+        let dir = fixture("http-neutral");
+        write_fixture(&dir, FIXTURE);
+        let local = LocalStore::new(&dir.to_string_lossy());
+        let local_tree = rendered(&local, "store.zarr", None);
+        fs::remove_dir_all(&dir).unwrap();
+
+        let server = TestServer::start("data/store.zarr", FIXTURE, true);
+        let remote = server.open();
+        let remote_tree = rendered(remote.as_ref(), "store.zarr", None);
+
+        assert_eq!(local_tree, remote_tree);
+        assert!(local_tree.contains("store.zarr [group, OME-Zarr 0.5]"));
+        assert!(local_tree.contains("chunks: [16, 16]"));
+        assert!(local_tree.contains("shards: [32, 32]"));
+
+        // The URL mapping, checked from the server's side: every request
+        // landed under the store root, with no doubled or missing separator.
+        for request in server.requests() {
+            assert!(
+                request.starts_with("/data/store.zarr"),
+                "{request:?} is not under the store root"
+            );
+            assert!(!request.contains("//"), "{request:?} has a doubled slash");
+        }
+    }
+
+    #[test]
+    fn an_http_array_is_a_leaf_and_its_chunks_are_never_requested() {
+        let server = TestServer::start("data/store.zarr", FIXTURE, true);
+        let store = server.open();
+        let tree = rendered(store.as_ref(), server.url.as_str(), None);
+
+        assert!(tree.contains("0 [array]"), "the array itself is shown");
+        assert!(!tree.contains("── c"), "the chunk directory is not a child");
+
+        // Nothing under the array was asked for -- neither its chunk objects
+        // nor a listing of the prefix holding them.
+        for request in server.requests() {
+            assert!(
+                !request.contains("/0/c"),
+                "{request:?} reaches into chunk storage"
+            );
+        }
+
+        // And not because there was nothing to find: asked directly, the
+        // server hands back the chunk prefix the walk declined to ask for.
+        assert_eq!(store.children("0").unwrap(), vec![String::from("c")]);
+    }
+
+    #[test]
+    fn depth_limits_an_http_walk_the_way_it_limits_a_local_one() {
+        let server = TestServer::start("srv/store.zarr", NESTED, true);
+        let store = server.open();
+
+        // Depth 0 is the root alone, and costs no listing at all -- the same
+        // saving it makes on S3.
+        assert_eq!(
+            rendered(store.as_ref(), "store.zarr", Some(0)),
+            "store.zarr [group]\n"
+        );
+        assert!(
+            !server.requests().iter().any(|request| request.is_empty()),
+            "no listing should have been made"
+        );
+
+        let one = rendered(store.as_ref(), "store.zarr", Some(1));
+        assert!(one.contains("── A [group]"));
+        assert!(!one.contains("── 1 [group]"), "{one}");
+
+        let two = rendered(store.as_ref(), "store.zarr", Some(2));
+        assert!(two.contains("── 1 [group]"));
+        assert!(!two.contains("── 0 [array]"), "{two}");
+
+        let all = rendered(store.as_ref(), "store.zarr", None);
+        assert!(all.contains("── 0 [array]"), "{all}");
+    }
+
+    #[test]
+    fn a_server_that_cannot_list_says_so_rather_than_saying_the_store_is_missing() {
+        // An ordinary static file server: `GET` works, `PROPFIND` does not.
+        let server = TestServer::start("data/store.zarr", FIXTURE, false);
+        let store = server.open();
+
+        // The metadata reads succeed, so the root is identified and the root
+        // check passes without a listing -- exactly as it would on S3.
+        let kind = classify(store.as_ref(), "");
+        assert!(matches!(kind, NodeKind::Group(_)), "the root is readable");
+        assert!(store.check_root(true).is_ok());
+
+        // Only then does the listing fail, and what it says is that the server
+        // cannot list. Saying the store was not found would be plainly wrong:
+        // the group tag above was read from that very URL.
+        let error = store
+            .children("")
+            .expect_err("this server does not implement PROPFIND");
+        let message = error.to_string();
+        assert!(message.contains("cannot list"), "{message}");
+        assert!(message.contains("WebDAV"), "{message}");
+        assert!(
+            !message.contains("not found") && !message.contains("does not exist"),
+            "a readable root must not be reported as missing: {message}"
+        );
     }
 
     #[test]
