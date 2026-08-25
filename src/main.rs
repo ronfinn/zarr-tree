@@ -2,10 +2,14 @@ use std::env;
 use std::fs;
 use std::io;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process;
 
+use object_store::aws::AmazonS3Builder;
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use serde_json::{Value, json};
+use tokio::runtime::Runtime;
 
 /// What kind of Zarr node a directory is, as far as its metadata files reveal.
 enum NodeKind {
@@ -233,10 +237,20 @@ impl OmeInfo {
 /// string with a blank line.
 const HELP: &str = "\
 zarr-tree
-Explore the structure and metadata of a local Zarr store.
+Explore the structure and metadata of a Zarr store.
 
 USAGE:
-    zarr-tree [OPTIONS] <DIRECTORY>
+    zarr-tree [OPTIONS] <STORE>
+
+STORE is a directory on this machine, or an S3 URI:
+
+    zarr-tree /data/store.zarr
+    zarr-tree s3://bucket/path/store.zarr
+
+S3 settings are read from the usual AWS_* environment variables. When none of
+them supplies a credential, requests are sent unsigned, which is what a public
+bucket wants; set AWS_SKIP_SIGNATURE=false to force the credential chain, and
+AWS_REGION when the bucket is not in us-east-1.
 
 OPTIONS:
         --depth <N>  Descend at most N levels below the root.
@@ -250,11 +264,12 @@ OPTIONS:
 /// The one-line reminder printed on stderr when the command line does not make
 /// sense. Kept in step with the USAGE section above by hand: there are two of
 /// them because one is an answer and the other is a complaint.
-const USAGE: &str = "usage: zarr-tree [OPTIONS] <DIRECTORY>";
+const USAGE: &str = "usage: zarr-tree [OPTIONS] <STORE>";
 
 /// What the command line asked for.
 struct Options {
-    /// The directory to walk, exactly as it was typed.
+    /// The store to walk, exactly as it was typed: a directory on this
+    /// machine, or an `s3://` URI.
     path: String,
     /// How many levels below the root to descend, or `None` for all of them.
     /// `Some(0)` shows the root and nothing under it.
@@ -389,36 +404,35 @@ fn run() -> io::Result<()> {
         Request::Walk(options) => options,
     };
 
-    let root = Path::new(&options.path);
-    if !root.exists() {
-        eprintln!("error: path does not exist: {}", root.display());
-        process::exit(1);
-    }
-    if !root.is_dir() {
-        eprintln!("error: path is not a directory: {}", root.display());
-        process::exit(1);
-    }
+    // Which kind of store this is is settled once, here, by the scheme on the
+    // path. Everything below reaches it through `Store` and never asks again.
+    let store = open_store(&options.path)?;
 
     // The root is named by the path as it was typed, in both outputs. Every
-    // node below it is named by its directory.
+    // node below it is named by its directory, or by its S3 prefix.
     let root_name = options.path.trim_end_matches('/');
 
+    // Classified before the root is checked, because the check wants the
+    // answer: a root whose metadata named it a Zarr node is plainly there, and
+    // one that named nothing has to be looked for. See `Store::check_root`.
+    let root_kind = classify(store.as_ref(), "");
+    store.check_root(!matches!(root_kind, NodeKind::Unknown))?;
+
     if options.json {
-        let tree = json_tree(root_name, root, options.depth)?;
+        let tree = json_tree(store.as_ref(), "", root_name, root_kind, options.depth)?;
         // Indented rather than compact: this is still a command a person runs
         // and reads, and `jq` does not mind either way.
         writeln!(out, "{}", serde_json::to_string_pretty(&tree)?)?;
         return out.flush();
     }
 
-    let root_kind = classify(root);
-    writeln!(out, "{root_name} {}", root_kind.label())?;
-
-    // An array is a leaf here too: its metadata takes the place of the walk.
-    match &root_kind {
-        NodeKind::Array(meta) => print_array_meta(&mut out, meta, "")?,
-        _ => print_tree(&mut out, root, "", &group_rows(&root_kind), options.depth)?,
-    }
+    print_store(
+        &mut out,
+        store.as_ref(),
+        root_name,
+        &root_kind,
+        options.depth,
+    )?;
 
     // Stdout flushes itself when the process ends, but it swallows any error
     // in doing so. Flushing here is what puts a late `BrokenPipe` in front of
@@ -429,9 +443,9 @@ fn run() -> io::Result<()> {
 /// Read the command line, or say what is wrong with it.
 ///
 /// `args` is everything after the program name. Hand-written rather than
-/// reached for a crate: three options and one directory is a short enough
-/// grammar that a loop over the arguments says all there is to say, and the
-/// package still has one dependency.
+/// reached for a crate: three options and one store is a short enough grammar
+/// that a loop over the arguments says all there is to say. Which kind of
+/// store the argument names is not decided here -- see `parse_location`.
 ///
 /// The loop holds its iterator rather than using a `for`, because `--depth`
 /// has to reach forward and take the value that follows it.
@@ -463,20 +477,20 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
             // Repeating it is not an error: it asks for the same thing twice.
             "--json" => json = true,
             // A leading dash we do not know is a mistyped option rather than a
-            // directory. The cost of reading it that way is that a directory
-            // whose name begins with `-` can no longer be inspected -- the
-            // same trade `-h` and `-V` already made.
+            // path. The cost of reading it that way is that a directory whose
+            // name begins with `-` can no longer be inspected -- the same
+            // trade `-h` and `-V` already made.
             other if other.starts_with('-') => return Err(format!("unknown option: {other}")),
             other => {
                 if path.is_some() {
-                    return Err(String::from("expected exactly one directory"));
+                    return Err(String::from("expected exactly one store"));
                 }
                 path = Some(other);
             }
         }
     }
 
-    let path = path.ok_or_else(|| String::from("expected a directory"))?;
+    let path = path.ok_or_else(|| String::from("expected a store"))?;
     Ok(Request::Walk(Options {
         path: String::from(path),
         depth,
@@ -484,9 +498,434 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
     }))
 }
 
-/// Print the directories inside `dir`, one line each, indented by `prefix`.
+/// Where a walk reads its metadata from.
 ///
-/// `rows` is `dir`'s own metadata, one finished line each, in the order they
+/// Two things implement it: a directory on this machine, and a key prefix in
+/// an object store. Everything above it -- the walk, both renderers, and every
+/// function that interprets Zarr, OME-Zarr or SpatialData metadata -- is
+/// written once and never learns which one it is looking at.
+///
+/// Three methods, because a walk asks only three questions: what does this
+/// metadata file say, what lies immediately below this node, and is the root
+/// there at all.
+///
+/// Paths are `/`-separated and relative to the store root, with the empty
+/// string for the root itself. Each implementation joins them onto its own
+/// base, which is what keeps that base -- a directory here, a bucket and a
+/// prefix there -- out of everything above.
+trait Store {
+    /// The text of the metadata file at `path`, or `None` when it is missing
+    /// or unreadable.
+    ///
+    /// Absence and failure are deliberately not told apart. Every caller
+    /// treats an unreadable metadata file the way it treats a missing one, and
+    /// answering "no" is the ordinary course of classifying a node: three of
+    /// these questions are asked of every directory, and at most one of them
+    /// finds a file.
+    fn read(&self, path: &str) -> Option<String>;
+
+    /// The names of the immediate children of `path`, sorted.
+    ///
+    /// Subdirectories here, common prefixes there. A file is a child in
+    /// neither: a metadata file is what `read` is for, and a chunk is not part
+    /// of the structure at all.
+    fn children(&self, path: &str) -> io::Result<Vec<String>>;
+
+    /// Fail if the store root is not there, before anything is printed.
+    ///
+    /// `identified` says whether the root's own metadata has already named it
+    /// a Zarr node. A local store ignores it: `exists()` answers on its own,
+    /// for nothing.
+    ///
+    /// A remote store has no such question to ask, and must fall back on a
+    /// listing -- of which there is one it must never make. What lies beneath
+    /// an array is chunk objects, and a real store has millions of them.
+    /// Metadata that identified the node is proof enough that the root is
+    /// there, so the listing is reached only when nothing did, which is
+    /// exactly when the prefix cannot be an array.
+    fn check_root(&self, identified: bool) -> io::Result<()>;
+}
+
+/// The path of `name` inside `parent`, in the form `Store` takes.
+///
+/// A function rather than a `format!` at each call site because the root is
+/// the empty string, and joining onto it must not produce a leading slash.
+fn child_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        String::from(name)
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+/// Where the positional argument points.
+///
+/// The scheme decides, and only `s3://` names a remote store. Everything else
+/// is a path on this machine and is passed through untouched -- including a
+/// relative path that happens to contain `s3://` somewhere after its start.
+enum Location {
+    Local,
+    /// A bucket, and the key prefix the store root sits at. The prefix is
+    /// empty when the URI named a bucket and nothing more.
+    S3 {
+        bucket: String,
+        key: String,
+    },
+}
+
+/// Read an `s3://bucket/prefix` URI, or say what is wrong with it.
+fn parse_location(target: &str) -> Result<Location, String> {
+    let Some(rest) = target.strip_prefix("s3://") else {
+        return Ok(Location::Local);
+    };
+
+    // A trailing slash is how a person writes a prefix, and an S3 key has no
+    // use for one: `s3://bucket/store.zarr/` and `s3://bucket/store.zarr` name
+    // the same place. The root line trims the same slash off the local
+    // spelling for the same reason.
+    let rest = rest.trim_end_matches('/');
+    let (bucket, key) = rest.split_once('/').unwrap_or((rest, ""));
+
+    if bucket.is_empty() {
+        return Err(format!("expected s3://bucket/prefix, not {target:?}"));
+    }
+
+    Ok(Location::S3 {
+        bucket: String::from(bucket),
+        key: String::from(key),
+    })
+}
+
+/// Open the store the command line named.
+///
+/// Nothing here reaches the network or the filesystem: this only decides what
+/// to build. Whether the root is really there is `Store::check_root`'s
+/// question, asked once the walk knows what the root claims to be.
+fn open_store(target: &str) -> io::Result<Box<dyn Store>> {
+    match parse_location(target).map_err(io::Error::other)? {
+        Location::Local => Ok(Box::new(LocalStore::new(target))),
+        Location::S3 { bucket, key } => Ok(Box::new(RemoteStore::s3(target, &bucket, &key)?)),
+    }
+}
+
+/// A Zarr store in a directory on this machine.
+struct LocalStore {
+    root: PathBuf,
+}
+
+impl LocalStore {
+    fn new(root: &str) -> Self {
+        LocalStore {
+            root: PathBuf::from(root),
+        }
+    }
+
+    /// Where on disk a store path lands.
+    fn resolve(&self, path: &str) -> PathBuf {
+        if path.is_empty() {
+            self.root.clone()
+        } else {
+            // `join` takes the `/`-separated form as it stands: `Path` splits
+            // on the separator itself, so no component-by-component walk of
+            // our own is needed.
+            self.root.join(path)
+        }
+    }
+}
+
+impl Store for LocalStore {
+    fn read(&self, path: &str) -> Option<String> {
+        // `.ok()` drops the error and leaves an Option: the caller cares
+        // *that* this failed, not why.
+        fs::read_to_string(self.resolve(path)).ok()
+    }
+
+    fn children(&self, path: &str) -> io::Result<Vec<String>> {
+        let mut names: Vec<String> = Vec::new();
+        for entry in fs::read_dir(self.resolve(path))? {
+            let entry = entry?;
+            // file_type() does not follow symlinks, so a link pointing back at
+            // an ancestor cannot send us into infinite recursion.
+            if entry.file_type()?.is_dir() {
+                // A name that is not valid UTF-8 keeps its readable parts,
+                // with the rest replaced, which is what `to_string_lossy` is
+                // for.
+                names.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        // `read_dir` returns entries in arbitrary order, and the tree has to
+        // know which child is last before it can draw a connector.
+        names.sort();
+        Ok(names)
+    }
+
+    fn check_root(&self, _identified: bool) -> io::Result<()> {
+        // The two questions the filesystem answers for nothing, and the reason
+        // this method takes an argument it ignores: only a remote store has to
+        // pay for the answer.
+        if !self.root.exists() {
+            return Err(io::Error::other(format!(
+                "path does not exist: {}",
+                self.root.display()
+            )));
+        }
+        if !self.root.is_dir() {
+            return Err(io::Error::other(format!(
+                "path is not a directory: {}",
+                self.root.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// A Zarr store held under a key prefix in an object store.
+///
+/// `s3` builds the one this program uses. The tests build the same type over
+/// `object_store`'s in-memory store, which is what lets the remote walk be
+/// tested with no network, no mock server and no AWS account.
+struct RemoteStore {
+    /// The runtime the requests are driven on. `object_store` is async
+    /// throughout and zarr-tree is not, so every call below is run to
+    /// completion here.
+    ///
+    /// A current-thread runtime, because one request at a time is exactly the
+    /// shape the walk already had. Built once and kept: a runtime per request
+    /// would mean a connection pool per request too.
+    runtime: Runtime,
+    store: Box<dyn ObjectStore>,
+    /// The key prefix the store root sits at, empty for a whole bucket.
+    prefix: ObjectPath,
+    /// The URI as it was typed. Only the error messages read it.
+    uri: String,
+}
+
+impl RemoteStore {
+    /// Wrap an object store, with `prefix` as the store root.
+    fn new(store: impl ObjectStore + 'static, prefix: &str, uri: &str) -> io::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        Ok(RemoteStore {
+            runtime,
+            store: Box::new(store),
+            prefix: ObjectPath::from(prefix),
+            uri: String::from(uri),
+        })
+    }
+
+    /// An S3 bucket, configured from the environment.
+    ///
+    /// `AmazonS3Builder::from_env` reads the `AWS_*` variables -- region,
+    /// endpoint, access key, session token, and the web-identity and container
+    /// credential settings -- and nothing else is configured here. There is no
+    /// credential store of ours, no prompt and no profile manager: what the
+    /// environment says is what is used, and what it does not say is left to
+    /// the library's own chain.
+    ///
+    /// One thing that chain does not include: `object_store` does not read
+    /// `~/.aws/credentials`, so a named profile there has no effect on its
+    /// own. `aws configure export-credentials --format env` is the bridge.
+    fn s3(uri: &str, bucket: &str, key: &str) -> io::Result<Self> {
+        let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+
+        if anonymous_by_default() {
+            builder = builder.with_skip_signature(true);
+        }
+
+        let store = builder.build().map_err(|error| s3_error(uri, &error))?;
+        RemoteStore::new(store, key, uri)
+    }
+
+    /// The object key a store path lands on.
+    fn key(&self, path: &str) -> ObjectPath {
+        // `ObjectPath::from` splits on `/` and drops the empty parts, so the
+        // root's empty path and a bucket with no prefix both come out right
+        // without a case of their own.
+        ObjectPath::from(format!("{}/{path}", self.prefix))
+    }
+
+    /// Why the store could not be reached, in one line.
+    ///
+    /// A failed *listing* is the one thing `object_store` hands back
+    /// unclassified: whatever went wrong, it arrives as a generic error with
+    /// S3's XML explanation attached, and the status that would have sorted it
+    /// is not reachable from outside the library. A failed *read* is sorted,
+    /// so one read of the same prefix is made purely to ask why -- an extra
+    /// request on the failing path, and only there.
+    ///
+    /// A prefix is not an object, so a bucket that can be read at all answers
+    /// "not found" here too. That is the right answer anyway: the listing
+    /// failed, and on a readable bucket only the name can have been wrong.
+    fn diagnose(&self) -> io::Error {
+        match self.runtime.block_on(self.store.head(&self.prefix)) {
+            Ok(_) | Err(object_store::Error::NotFound { .. }) => {
+                io::Error::other(format!("no such bucket or prefix: {}", self.uri))
+            }
+            Err(error) => s3_error(&self.uri, &error),
+        }
+    }
+
+    /// The immediate children and the objects of one prefix, in one request.
+    fn list(&self, prefix: &ObjectPath) -> io::Result<object_store::ListResult> {
+        // One `ListObjectsV2` with `delimiter=/`. The keys directly under the
+        // prefix come back as objects, and everything deeper is folded into
+        // one common prefix per child -- so a child costs a line of a response
+        // rather than a request of its own.
+        self.runtime
+            .block_on(self.store.list_with_delimiter(Some(prefix)))
+            .map_err(|error| s3_error(&self.uri, &error))
+    }
+}
+
+impl Store for RemoteStore {
+    fn read(&self, path: &str) -> Option<String> {
+        let key = self.key(path);
+        let bytes = self
+            .runtime
+            .block_on(async { self.store.get(&key).await.ok()?.bytes().await.ok() })?;
+        String::from_utf8(bytes.to_vec()).ok()
+    }
+
+    fn children(&self, path: &str) -> io::Result<Vec<String>> {
+        let listing = self.list(&self.key(path))?;
+
+        // Only the common prefixes. The objects in the same response are this
+        // node's own metadata files and, beneath an unrecognised node, its
+        // chunks -- neither of which is a child.
+        //
+        // This is the only place a listing is made, and the walk stops at an
+        // array before reaching it. That is what keeps a store's chunk objects
+        // out of the walk entirely: they are never listed, so they are never
+        // named, however many millions of them there are.
+        let mut names: Vec<String> = listing
+            .common_prefixes
+            .iter()
+            .filter_map(|prefix| prefix.filename())
+            .map(String::from)
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
+    fn check_root(&self, identified: bool) -> io::Result<()> {
+        // Metadata that named the root a group or an array has already proved
+        // the bucket is reachable and the prefix is real, at no cost: the
+        // reads that answered are the ones `classify` had to make anyway.
+        if identified {
+            return Ok(());
+        }
+
+        // Nothing identified it, so ask. This is safe here for the reason it
+        // is safe nowhere else: a prefix with no `.zarray` and no array
+        // `zarr.json` is not an array, so it is not the prefix full of chunks
+        // that `Store::check_root` warns about.
+        let listing = self.list(&self.prefix).map_err(|_| self.diagnose())?;
+
+        if listing.objects.is_empty() && listing.common_prefixes.is_empty() {
+            return Err(io::Error::other(format!(
+                "no such bucket or prefix: {}",
+                self.uri
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Whether requests should go out unsigned unless the environment says
+/// otherwise.
+///
+/// `object_store` resolves credentials from the `AWS_*` variables, then a
+/// web-identity token, then a container credential endpoint, and finally the
+/// EC2 instance metadata service. Off an EC2 instance that last step cannot
+/// succeed, and every request would spend a second failing to reach
+/// 169.254.169.254 before returning a signature error -- which is what reading
+/// a public bucket, the ordinary case for this tool, would get.
+///
+/// So when nothing in the environment names a credential, requests are sent
+/// unsigned. `AWS_SKIP_SIGNATURE` is left to say otherwise in either
+/// direction, and an EC2 instance role is what wants it set to `false`.
+fn anonymous_by_default() -> bool {
+    if env::var_os("AWS_SKIP_SIGNATURE").is_some() {
+        return false;
+    }
+
+    ![
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    ]
+    .iter()
+    .any(|name| env::var_os(name).is_some())
+}
+
+/// The one line printed for a failed S3 request.
+///
+/// Four cases, because a person can act on each of the first three: the name
+/// is wrong, the credentials are not allowed, the credentials are not valid,
+/// or something else went wrong and the library's own account of it is the
+/// best there is.
+///
+/// Nothing here can print a secret. `object_store` puts no key, token or
+/// signature in an error, and the fourth case is cut to its first line anyway
+/// -- which is also what keeps a failure from spilling S3's whole XML
+/// explanation across the terminal.
+fn s3_error(uri: &str, error: &object_store::Error) -> io::Error {
+    let message = match error {
+        // A bucket that does not exist answers 404 as well, so this is both
+        // "no such bucket" and "no such key" -- from one request there is no
+        // telling which.
+        object_store::Error::NotFound { .. } => format!("no such bucket or prefix: {uri}"),
+        object_store::Error::PermissionDenied { .. } => format!("permission denied: {uri}"),
+        object_store::Error::Unauthenticated { .. } => format!("authentication failed: {uri}"),
+        other => format!("s3 request failed: {}", first_line(other)),
+    };
+    io::Error::other(message)
+}
+
+/// The first line of an error's own words, and no more.
+///
+/// A failed request carries the whole response body in its message, and S3
+/// answers in XML across several lines. One line is what belongs on a
+/// terminal; the rest was never an explanation a person wanted.
+fn first_line(error: &object_store::Error) -> String {
+    let message = error.to_string();
+    String::from(message.lines().next().unwrap_or_default())
+}
+
+/// Draw the whole tree for one store, root line and all.
+///
+/// Split out of `run` so that the tests can render a store into a buffer of
+/// their own: the walk writes through `&mut dyn Write` and neither knows nor
+/// cares that this is usually standard output.
+fn print_store(
+    out: &mut dyn Write,
+    store: &dyn Store,
+    name: &str,
+    kind: &NodeKind,
+    depth: Option<usize>,
+) -> io::Result<()> {
+    writeln!(out, "{name} {}", kind.label())?;
+
+    // An array is a leaf here too: its metadata takes the place of the walk.
+    match kind {
+        NodeKind::Array(meta) => print_array_meta(out, meta, ""),
+        _ => print_tree(out, store, "", "", &group_rows(kind), depth),
+    }
+}
+
+/// Print the children of the node at `path`, one line each, indented by
+/// `prefix`.
+///
+/// `store` is where the metadata comes from, and the only thing here that
+/// knows whether these nodes are directories or S3 prefixes. `path` names the
+/// node inside it -- see `Store`.
+///
+/// `rows` is the node's own metadata, one finished line each, in the order they
 /// should appear. They are printed here rather than by the caller because this
 /// is the one place that already knows whether any children follow them, which
 /// is what decides the last connector. An empty slice means there is nothing to
@@ -496,34 +935,35 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
 /// directory reads; writes now join them, so a closed pipe stops the walk the
 /// same way an unreadable directory does.
 ///
-/// `depth` is how many more levels below `dir` may be listed, or `None` for
+/// `depth` is how many more levels below this node may be listed, or `None` for
 /// all of them. `Some(0)` means this node is as deep as the output goes: its
 /// own metadata rows still print, because those describe the node itself
 /// rather than anything below it.
 fn print_tree(
     out: &mut dyn Write,
-    dir: &Path,
+    store: &dyn Store,
+    path: &str,
     prefix: &str,
     rows: &[String],
     depth: Option<usize>,
 ) -> io::Result<()> {
-    let subdirs = child_dirs(dir, depth)?;
+    let children = child_dirs(store, path, depth)?;
 
     // This directory's own metadata, above its children. Metadata rows keep
     // the shorter two-dash stem that tells them apart from node rows.
     for (i, row) in rows.iter().enumerate() {
         // `└─` closes a branch, so it belongs to the last row only when there
         // are no children below it to keep the branch open.
-        let is_last = i == rows.len() - 1 && subdirs.is_empty();
+        let is_last = i == rows.len() - 1 && children.is_empty();
         let connector = if is_last { "└─ " } else { "├─ " };
         writeln!(out, "{prefix}{connector}{row}")?;
     }
 
-    for (i, path) in subdirs.iter().enumerate() {
-        let is_last = i == subdirs.len() - 1;
+    for (i, name) in children.iter().enumerate() {
+        let is_last = i == children.len() - 1;
         let connector = if is_last { "└── " } else { "├── " };
-        let name = node_name(path);
-        let kind = classify(path);
+        let child = child_path(path, name);
+        let kind = classify(store, &child);
         writeln!(out, "{prefix}{connector}{name} {}", kind.label())?;
 
         // Children of the last entry need no vertical bar above them.
@@ -545,7 +985,8 @@ fn print_tree(
             // unlimited walk stays unlimited without a second branch.
             _ => print_tree(
                 out,
-                path,
+                store,
+                &child,
                 &child_prefix,
                 &group_rows(&kind),
                 depth.map(|depth| depth - 1),
@@ -556,79 +997,63 @@ fn print_tree(
     Ok(())
 }
 
-/// The subdirectories of `dir`, sorted, and honouring the depth limit.
+/// The children of the node at `path`, sorted, and honouring the depth limit.
 ///
 /// Collected rather than streamed because the tree needs to know which child is
-/// last before it can draw a connector, and `read_dir` returns entries in
-/// arbitrary order.
+/// last before it can draw a connector, and neither `read_dir` nor an S3
+/// listing promises an order.
 ///
-/// `Some(0)` means this node is as deep as the output goes, and the directory
-/// is then not read at all. That is not only cheaper on a store full of chunk
-/// files: an empty list is also exactly what a node with no children has, so
-/// neither renderer needs a rule of its own for the limit.
+/// `Some(0)` means this node is as deep as the output goes, and the store is
+/// then not asked at all. That is not only cheaper on a store full of chunk
+/// files -- remotely it is one HTTP request saved per node -- but an empty list
+/// is also exactly what a node with no children has, so neither renderer needs
+/// a rule of its own for the limit.
 ///
 /// Both renderers call this, which is what keeps them agreeing about which
 /// children exist and in what order.
-fn child_dirs(dir: &Path, depth: Option<usize>) -> io::Result<Vec<PathBuf>> {
+fn child_dirs(store: &dyn Store, path: &str, depth: Option<usize>) -> io::Result<Vec<String>> {
     if depth == Some(0) {
         return Ok(Vec::new());
     }
 
-    let mut subdirs: Vec<PathBuf> = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        // file_type() does not follow symlinks, so a link pointing back at an
-        // ancestor cannot send us into infinite recursion.
-        if entry.file_type()?.is_dir() {
-            subdirs.push(entry.path());
-        }
-    }
-    subdirs.sort();
-
-    Ok(subdirs)
+    store.children(path)
 }
 
-/// The name a node is listed under: its directory name.
-///
-/// A path with no final component -- which the walk never produces, since
-/// every entry comes from `read_dir` -- yields an empty name rather than
-/// failing. A name that is not valid UTF-8 keeps its readable parts, with the
-/// rest replaced, which is what `to_string_lossy` is for.
-fn node_name(path: &Path) -> String {
-    path.file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// Decide what kind of Zarr node `dir` is by looking at the metadata files
+/// Decide what kind of Zarr node sits at `path` by reading the metadata files
 /// directly inside it.
 ///
-/// Classification never fails: a directory we cannot read, or whose metadata we
-/// do not understand, is simply `Unknown`. A broken `zarr.json` in one corner of
+/// Classification never fails: a node we cannot read, or whose metadata we do
+/// not understand, is simply `Unknown`. A broken `zarr.json` in one corner of
 /// the tree should not abort the whole walk.
-fn classify(dir: &Path) -> NodeKind {
-    // Zarr V2 keeps the two node kinds in separate files, so the filename alone
-    // answers the question -- no need to open anything.
-    if dir.join(".zgroup").is_file() {
-        // Each helper opens `.zattrs` for itself, so a V2 group costs one
-        // extra read of a small file. That buys each fact being read where it
-        // is explained; the V3 path below parses its one file once and hands
-        // the same value to both.
+///
+/// Three reads at worst, and they are in the order they are for a reason.
+/// Every one of them is an HTTP GET on a remote store, which is what decided
+/// the shape of everything below: a file is read once and its text kept, and
+/// nothing is opened twice.
+fn classify(store: &dyn Store, path: &str) -> NodeKind {
+    // Zarr V2 keeps the two node kinds in separate files, so which file is
+    // there answers the question. Locally that used to be a stat and is now a
+    // read of a very small file; remotely there is no cheaper way to ask.
+    if store.read(&child_path(path, ".zgroup")).is_some() {
+        // V2 keeps user attributes in a file of their own. It is read once
+        // here and handed to both readers below, which read different keys out
+        // of it and know nothing about each other -- but which would otherwise
+        // cost a second request for a file already in hand.
+        let attrs = read_json(store, &child_path(path, ".zattrs"));
         return NodeKind::Group(GroupMeta {
-            ome: ome_info_v2(dir),
-            spatialdata: spatialdata_info_v2(dir),
+            ome: attrs.as_ref().and_then(ome_info_v2),
+            spatialdata: attrs.as_ref().and_then(spatialdata_info_v2),
         });
     }
-    let zarray = dir.join(".zarray");
-    if zarray.is_file() {
+
+    if let Some(zarray) = store.read(&child_path(path, ".zarray")) {
         return NodeKind::Array(array_meta_v2(&zarray));
     }
 
     // Zarr V3 uses one filename for both kinds and moves the distinction inside
-    // the file, so here we do have to read it. Checked second, so a store that
-    // carries both V2 and V3 metadata is reported as V2.
-    if let Some(kind) = classify_v3(&dir.join("zarr.json")) {
+    // the file, so here we do have to look inside it. Checked second, so a
+    // store that carries both V2 and V3 metadata is reported as V2.
+    if let Some(kind) = classify_v3(store, &child_path(path, "zarr.json")) {
         return kind;
     }
 
@@ -637,8 +1062,8 @@ fn classify(dir: &Path) -> NodeKind {
 
 /// Read `node_type` out of a Zarr V3 `zarr.json`, or `None` if the file is
 /// missing, unreadable, not valid JSON, or has no recognisable `node_type`.
-fn classify_v3(path: &Path) -> Option<NodeKind> {
-    let value = read_json(path)?;
+fn classify_v3(store: &dyn Store, path: &str) -> Option<NodeKind> {
+    let value = read_json(store, path)?;
 
     match value.get("node_type")?.as_str()? {
         "group" => Some(NodeKind::Group(GroupMeta {
@@ -650,14 +1075,13 @@ fn classify_v3(path: &Path) -> Option<NodeKind> {
     }
 }
 
-/// Look for OME-Zarr image metadata beside a Zarr V2 `.zgroup`.
+/// Look for OME-Zarr image metadata in an already-parsed Zarr V2 `.zattrs`.
 ///
-/// V2 keeps user attributes in a `.zattrs` file separate from `.zgroup`, so
-/// this is the one extra read the tag costs us. A `.zattrs` that is missing or
-/// unparseable simply means no tag.
-fn ome_info_v2(dir: &Path) -> Option<OmeInfo> {
-    let attrs = read_json(&dir.join(".zattrs"))?;
-
+/// V2 keeps user attributes in a file separate from `.zgroup`, and that file
+/// *is* the attributes object -- so `attrs` is its whole contents. A `.zattrs`
+/// that was missing or unparseable never reaches here: `classify` has nothing
+/// to hand over, and the group simply gets no tag.
+fn ome_info_v2(attrs: &Value) -> Option<OmeInfo> {
     // V2 predates the `ome` namespace: the keys sit at the top level of
     // `.zattrs`, and the version belongs to an individual multiscale rather
     // than to the group. Real 0.4 stores often leave it out entirely.
@@ -667,7 +1091,7 @@ fn ome_info_v2(dir: &Path) -> Option<OmeInfo> {
         .and_then(|entries| entries.first())
         .and_then(|first| first.get("version"));
 
-    ome_info(&attrs, version)
+    ome_info(attrs, version)
 }
 
 /// Look for OME-Zarr image metadata in an already-parsed Zarr V3 `zarr.json`.
@@ -763,23 +1187,20 @@ fn ome_info(ome: &Value, version: Option<&Value>) -> Option<OmeInfo> {
     None
 }
 
-/// Look for SpatialData metadata beside a Zarr V2 `.zgroup`.
+/// Look for SpatialData metadata in an already-parsed Zarr V2 `.zattrs`.
 ///
-/// V2 keeps user attributes in a `.zattrs` file, and that file *is* the
+/// V2 keeps user attributes in a file of their own, and that file *is* the
 /// attributes object -- so the markers sit at its top level, rather than under
-/// an `attributes` field the way V3 nests it. A `.zattrs` that is missing or
-/// unparseable simply means no tag.
+/// an `attributes` field the way V3 nests it.
 ///
-/// This opens `.zattrs` a second time, after `ome_info_v2` has already read it.
-/// The file is small, V2 is the older of the two SpatialData layouts, and
-/// reading each fact where that fact is explained costs less confusion than it
-/// costs microseconds.
-fn spatialdata_info_v2(dir: &Path) -> Option<SpatialData> {
-    let attrs = read_json(&dir.join(".zattrs"))?;
+/// `attrs` is the same value `ome_info_v2` was given: `classify` reads the
+/// file once and hands it to both. They read different keys and know nothing
+/// about each other, which is why they are still two functions.
+fn spatialdata_info_v2(attrs: &Value) -> Option<SpatialData> {
     // V2 predates the `ome` namespace, so the OME-Zarr keys sit at the top
     // level of `.zattrs` alongside SpatialData's own -- the two objects this
     // function has to tell apart are, here, one and the same.
-    spatialdata_info(&attrs, Some(&attrs))
+    spatialdata_info(attrs, Some(attrs))
 }
 
 /// Look for SpatialData metadata in an already-parsed Zarr V3 `zarr.json`.
@@ -988,22 +1409,24 @@ fn group_rows(kind: &NodeKind) -> Vec<String> {
     rows
 }
 
-/// Read a file and parse it as JSON, or `None` if either step fails.
-fn read_json(path: &Path) -> Option<Value> {
-    // `.ok()` drops the error and leaves an Option: we care *that* this failed,
-    // not why. `?` then returns None early, the same way it returns Err early
-    // on a Result.
-    let text = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+/// Read a metadata file and parse it as JSON, or `None` if either step fails.
+///
+/// Missing, unreadable and unparseable all come back the same way, because
+/// every caller does the same thing with them. `?` returns None early on the
+/// read, and `.ok()` drops the parse error: we care *that* this failed, not
+/// why.
+fn read_json(store: &dyn Store, path: &str) -> Option<Value> {
+    serde_json::from_str(&store.read(path)?).ok()
 }
 
-/// Collect the display metadata from a Zarr V2 `.zarray`.
+/// Collect the display metadata from the text of a Zarr V2 `.zarray`.
 ///
-/// The filename already told us this is an array, so a file we cannot read or
-/// parse only costs us the metadata: every field comes back missing and the
-/// node is still shown as an array.
-fn array_meta_v2(path: &Path) -> ArrayMeta {
-    let Some(value) = read_json(path) else {
+/// Takes the text rather than a parsed value, and that is the whole point: the
+/// filename has already told us this is an array, so text we cannot parse
+/// costs us only the metadata. Every field comes back missing and the node is
+/// still shown as an array.
+fn array_meta_v2(text: &str) -> ArrayMeta {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
         return ArrayMeta {
             shape: None,
             chunks: None,
@@ -1215,9 +1638,13 @@ fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::
 /// nodes they apply to, and a field inside one is `null` when the file did not
 /// give us a readable value. That is the same rule the tree follows when it
 /// prints `?`.
-fn json_tree(name: &str, dir: &Path, depth: Option<usize>) -> io::Result<Value> {
-    let kind = classify(dir);
-
+fn json_tree(
+    store: &dyn Store,
+    path: &str,
+    name: &str,
+    kind: NodeKind,
+    depth: Option<usize>,
+) -> io::Result<Value> {
     let mut node = json!({
         "name": name,
         "kind": kind.kind(),
@@ -1244,10 +1671,17 @@ fn json_tree(name: &str, dir: &Path, depth: Option<usize>) -> io::Result<Value> 
     // absent, so a reader can walk every node the same way.
     let mut children = Vec::new();
     if !matches!(kind, NodeKind::Array(_)) {
-        for path in child_dirs(dir, depth)? {
+        for name in child_dirs(store, path, depth)? {
+            let child = child_path(path, &name);
+            // Classified here rather than inside the call, so that the root --
+            // which `run` had to classify before it could check the store --
+            // is not classified a second time.
+            let child_kind = classify(store, &child);
             children.push(json_tree(
-                &node_name(&path),
-                &path,
+                store,
+                &child,
+                &name,
+                child_kind,
                 depth.map(|depth| depth - 1),
             )?);
         }
@@ -1329,7 +1763,9 @@ mod tests {
     // root's private items. This glob import just brings their names into
     // scope so we can call them unqualified.
     use super::*;
+    use object_store::PutPayload;
     use serde_json::json;
+    use std::path::Path;
 
     /// A command line, as `parse_args` wants it: everything after the program
     /// name, owned. `env::args` hands back `String`s, so the tests do too.
@@ -1349,6 +1785,322 @@ mod tests {
         names.as_ref().map(|names| names.join(", "))
     }
 
+    /// An empty fixture directory inside the system temp directory, named for
+    /// the test that asked for it. The process id keeps two simultaneous test
+    /// runs from colliding, and the name keeps two tests in one run from
+    /// deleting each other's files.
+    fn fixture(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("zarr-tree-test-{name}-{}", process::id()));
+        // Left over from an earlier run that panicked before its cleanup.
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Classify a directory of real files the way the walk does: through a
+    /// `LocalStore`, whose root is the directory itself.
+    ///
+    /// The V2 readers take a parsed `.zattrs`, which `classify` reads for
+    /// them, so a test about V2's *file layout* has to come in this way round.
+    /// It gets the whole path exercised for its trouble.
+    fn classify_dir(dir: &Path) -> NodeKind {
+        classify(&LocalStore::new(&dir.to_string_lossy()), "")
+    }
+
+    /// The same, for the tests that go on to ask what the group's attributes
+    /// said about it.
+    fn group_meta(dir: &Path) -> GroupMeta {
+        match classify_dir(dir) {
+            NodeKind::Group(meta) => meta,
+            _ => panic!("a `.zgroup` makes this a group"),
+        }
+    }
+
+    /// One small Zarr V3 store, as the metadata objects that make it up.
+    ///
+    /// Written into a directory by `write_fixture` and into an in-memory
+    /// object store by `memory_store`, so that the same store can be walked
+    /// both ways and the two outputs compared.
+    ///
+    /// The last two entries are chunk objects. They are the point of the
+    /// fixture as much as the metadata is: nothing in either output may ever
+    /// name them.
+    const FIXTURE: &[(&str, &str)] = &[
+        (
+            "zarr.json",
+            r#"{"zarr_format": 3, "node_type": "group", "attributes": {"ome": {
+                "version": "0.5",
+                "multiscales": [{
+                    "axes": [{"name": "y"}, {"name": "x"}],
+                    "datasets": [{"path": "0"}]
+                }]
+            }}}"#,
+        ),
+        (
+            "0/zarr.json",
+            r#"{"zarr_format": 3, "node_type": "array",
+                "shape": [64, 64], "data_type": "uint16",
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [32, 32]}},
+                "codecs": [{"name": "sharding_indexed",
+                            "configuration": {"chunk_shape": [16, 16]}}]}"#,
+        ),
+        ("0/c/0/0", "chunk, not metadata"),
+        ("0/c/0/1", "chunk, not metadata"),
+    ];
+
+    /// A store four levels deep, for the tests about `--depth`.
+    const NESTED: &[(&str, &str)] = &[
+        ("zarr.json", r#"{"zarr_format": 3, "node_type": "group"}"#),
+        ("A/zarr.json", r#"{"zarr_format": 3, "node_type": "group"}"#),
+        (
+            "A/1/zarr.json",
+            r#"{"zarr_format": 3, "node_type": "group"}"#,
+        ),
+        (
+            "A/1/0/zarr.json",
+            r#"{"zarr_format": 3, "node_type": "array", "shape": [4], "data_type": "uint8",
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}}}"#,
+        ),
+    ];
+
+    /// Write a fixture into a directory, creating the directories it implies.
+    fn write_fixture(dir: &Path, objects: &[(&str, &str)]) {
+        for (key, body) in objects {
+            let path = dir.join(key);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        }
+    }
+
+    /// A `RemoteStore` over `object_store`'s in-memory store, holding a
+    /// fixture written under `prefix`.
+    ///
+    /// `InMemory` is a real `ObjectStore`: it answers `get` and
+    /// `list_with_delimiter` as S3 does, common prefixes and all. That is what
+    /// lets the remote walk be tested here with no network, no mock server and
+    /// no AWS account -- and what is under test is the same `RemoteStore` that
+    /// an `s3://` URI builds, differing only in which object store it wraps.
+    fn memory_store(uri: &str, prefix: &str, objects: &[(&str, &str)]) -> RemoteStore {
+        let store = RemoteStore::new(object_store::memory::InMemory::new(), prefix, uri).unwrap();
+
+        for (key, body) in objects {
+            store
+                .runtime
+                .block_on(store.store.put(
+                    &ObjectPath::from(child_path(prefix, key)),
+                    PutPayload::from(String::from(*body)),
+                ))
+                .unwrap();
+        }
+
+        store
+    }
+
+    /// The tree a store draws, as the text a person would see.
+    fn rendered(store: &dyn Store, name: &str, depth: Option<usize>) -> String {
+        let kind = classify(store, "");
+        let mut out: Vec<u8> = Vec::new();
+        print_store(&mut out, store, name, &kind, depth).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn a_path_is_local_unless_it_names_a_bucket() {
+        // Every spelling a local path has ever been given here, and one that
+        // carries the scheme somewhere other than the front -- a directory may
+        // legitimately be called that, and nothing but a leading `s3://` makes
+        // an argument remote.
+        for local in [
+            "store.zarr",
+            "/data/store.zarr",
+            "./store.zarr",
+            "../data/store.zarr",
+            "backups/s3://not-a-uri",
+        ] {
+            assert!(
+                matches!(parse_location(local), Ok(Location::Local)),
+                "{local:?} names a directory on this machine"
+            );
+        }
+
+        let Ok(Location::S3 { bucket, key }) = parse_location("s3://bucket/path/store.zarr") else {
+            panic!("an s3:// URI names a bucket");
+        };
+        assert_eq!(bucket, "bucket");
+        assert_eq!(key, "path/store.zarr");
+
+        // A bucket and nothing more: the whole bucket is the store, and the
+        // prefix is empty rather than missing.
+        let Ok(Location::S3 { bucket, key }) = parse_location("s3://bucket") else {
+            panic!("a bucket on its own is a store");
+        };
+        assert_eq!(bucket, "bucket");
+        assert_eq!(key, "");
+
+        // A trailing slash is how a person writes a prefix, and names the same
+        // place without one.
+        let Ok(Location::S3 { key, .. }) = parse_location("s3://bucket/store.zarr/") else {
+            panic!("a trailing slash is still a URI");
+        };
+        assert_eq!(key, "store.zarr");
+
+        // Nothing to name a bucket with. Rejected rather than read as a
+        // relative path, because the scheme said what was meant.
+        for broken in ["s3://", "s3:///store.zarr"] {
+            assert!(
+                parse_location(broken).is_err(),
+                "{broken:?} names no bucket"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_store_reads_the_same_whether_it_is_local_or_remote() {
+        // The whole point of the `Store` trait, in one assertion. Every fact
+        // in this tree -- that the root is an OME-Zarr 0.5 image, its axes,
+        // its pyramid, that `0` is a sharded array and what its two grids are
+        // -- is read by functions that never learn where the bytes came from.
+        let dir = fixture("neutral");
+        write_fixture(&dir, FIXTURE);
+        let local = LocalStore::new(&dir.to_string_lossy());
+        let local_tree = rendered(&local, "store.zarr", None);
+        fs::remove_dir_all(&dir).unwrap();
+
+        let remote = memory_store("s3://bucket/store.zarr", "store.zarr", FIXTURE);
+        let remote_tree = rendered(&remote, "store.zarr", None);
+
+        assert_eq!(local_tree, remote_tree);
+
+        // And it is the tree we meant, not two identically empty ones.
+        assert!(local_tree.contains("store.zarr [group, OME-Zarr 0.5]"));
+        assert!(local_tree.contains("axes: y, x"));
+        assert!(local_tree.contains("0 [array]"));
+        assert!(local_tree.contains("chunks: [16, 16]"));
+        assert!(local_tree.contains("shards: [32, 32]"));
+    }
+
+    #[test]
+    fn a_remote_array_is_a_leaf_and_its_chunks_are_never_listed() {
+        // This is the rule that makes remote traversal usable at all. A real
+        // OME-Zarr array on S3 has millions of chunk objects under it, and
+        // listing even one prefix of them would cost thousands of requests.
+        let store = memory_store("s3://bucket/store.zarr", "store.zarr", FIXTURE);
+        let tree = rendered(&store, "s3://bucket/store.zarr", None);
+
+        assert!(tree.contains("0 [array]"), "the array itself is shown");
+        assert!(
+            !tree.contains("── c"),
+            "the V3 chunk directory is not a child:\n{tree}"
+        );
+        assert!(
+            !tree.contains("[unknown]"),
+            "nothing beneath the array is reached at all:\n{tree}"
+        );
+
+        // And not because there was nothing to find. Asked directly, the store
+        // hands back the chunk prefix that the walk declined to ask for --
+        // which is what distinguishes pruning from an empty bucket.
+        assert_eq!(store.children("0").unwrap(), vec![String::from("c")]);
+    }
+
+    #[test]
+    fn depth_limits_a_remote_walk_the_way_it_limits_a_local_one() {
+        let store = memory_store("s3://bucket/store.zarr", "store.zarr", NESTED);
+
+        // The root on its own. Nothing below it is listed, which remotely means
+        // no listing request is made at all.
+        let root_only = rendered(&store, "store.zarr", Some(0));
+        assert_eq!(root_only, "store.zarr [group]\n");
+
+        // One level, then two. `A/1/0` is the array at the bottom, and it
+        // appears only once the limit reaches it.
+        let one = rendered(&store, "store.zarr", Some(1));
+        assert!(one.contains("── A [group]"));
+        assert!(!one.contains("── 1 [group]"), "{one}");
+
+        let two = rendered(&store, "store.zarr", Some(2));
+        assert!(two.contains("── 1 [group]"));
+        assert!(!two.contains("── 0 [array]"), "{two}");
+
+        // And unlimited reaches the array at the bottom.
+        let all = rendered(&store, "store.zarr", None);
+        assert!(all.contains("── 0 [array]"), "{all}");
+    }
+
+    #[test]
+    fn a_remote_store_reports_the_same_json_as_a_local_one() {
+        // `--json` is a second renderer over the same walk, so it has the same
+        // claim to be storage-neutral -- and the same chunk objects to leave
+        // out.
+        let dir = fixture("neutral-json");
+        write_fixture(&dir, FIXTURE);
+        let local = LocalStore::new(&dir.to_string_lossy());
+        let local_json =
+            json_tree(&local, "", "store.zarr", classify(&local, ""), Some(2)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+
+        let remote = memory_store("s3://bucket/store.zarr", "store.zarr", FIXTURE);
+        let remote_json =
+            json_tree(&remote, "", "store.zarr", classify(&remote, ""), Some(2)).unwrap();
+
+        assert_eq!(local_json, remote_json);
+
+        // The array is a leaf here too: `children` is present and empty, and
+        // no chunk key appears anywhere in the document.
+        assert_eq!(remote_json["children"][0]["kind"], json!("array"));
+        assert_eq!(remote_json["children"][0]["children"], json!([]));
+    }
+
+    #[test]
+    fn a_remote_root_that_is_not_there_is_an_error() {
+        // A prefix with no metadata and no children is a mistyped URI, and
+        // saying so beats printing an empty tree. The local walk has said as
+        // much since the beginning, from `exists()`; remotely it takes a
+        // listing, and only when nothing identified the root.
+        let store = memory_store("s3://bucket/store.zarr", "store.zarr", FIXTURE);
+        assert!(store.check_root(false).is_ok(), "that prefix is there");
+
+        // The same bucket, seen from a prefix nothing was written under: a
+        // mistyped URI rather than a missing bucket, and from one listing
+        // there is no telling the two apart.
+        let mistyped = RemoteStore {
+            prefix: ObjectPath::from("nope.zarr"),
+            uri: String::from("s3://bucket/nope.zarr"),
+            ..store
+        };
+        let error = mistyped
+            .check_root(false)
+            .expect_err("nothing was written under that prefix");
+        assert!(
+            error.to_string().contains("no such bucket or prefix"),
+            "{error}"
+        );
+
+        // And a root the metadata already identified is not listed for at all.
+        // Nothing here can tell that from the outside, which is the point: the
+        // listing that would have failed is never made.
+        assert!(mistyped.check_root(true).is_ok());
+    }
+
+    #[test]
+    fn anonymous_access_is_the_default_only_when_nothing_names_a_credential() {
+        // Reading this environment rather than a fixture, so the assertion has
+        // to be phrased against whatever the test runner happens to have set.
+        // The rule itself is simple enough to state either way round.
+        let named = [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        ]
+        .iter()
+        .any(|name| env::var_os(name).is_some());
+        let overridden = env::var_os("AWS_SKIP_SIGNATURE").is_some();
+
+        assert_eq!(anonymous_by_default(), !named && !overridden);
+    }
     #[test]
     fn parse_args_reads_a_directory_and_an_optional_depth() {
         let Ok(Request::Walk(options)) = parse_args(&args(&["store.zarr"])) else {
@@ -1397,8 +2149,8 @@ mod tests {
             (vec!["--depth", "-1", "store.zarr"], "whole number"),
             (vec!["--depth", "two", "store.zarr"], "whole number"),
             (vec!["--nope", "store.zarr"], "unknown option"),
-            (vec!["one.zarr", "two.zarr"], "exactly one directory"),
-            (vec![], "expected a directory"),
+            (vec!["one.zarr", "two.zarr"], "exactly one store"),
+            (vec![], "expected a store"),
         ] {
             let error = parse_args(&args(&line))
                 .err()
@@ -1412,19 +2164,18 @@ mod tests {
 
     #[test]
     fn v2_metadata_is_read_from_a_zarray_file() {
-        // A directory of our own inside the system temp directory. The process
-        // id keeps two simultaneous test runs from colliding.
-        let dir = env::temp_dir().join(format!("zarr-tree-test-v2-{}", process::id()));
-        fs::create_dir_all(&dir).unwrap();
-
-        let zarray = dir.join(".zarray");
+        let dir = fixture("v2");
         fs::write(
-            &zarray,
+            dir.join(".zarray"),
             r#"{"shape": [4096, 4096], "chunks": [512, 512], "dtype": "<u2"}"#,
         )
         .unwrap();
 
-        let meta = array_meta_v2(&zarray);
+        // Through the store, so that this covers the whole V2 array path: the
+        // filename that makes it an array, and the reading of the file.
+        let NodeKind::Array(meta) = classify_dir(&dir) else {
+            panic!("a `.zarray` makes this an array");
+        };
 
         // Clean up before asserting: a failing assert_eq! panics, and anything
         // after the panic would never run.
@@ -1548,15 +2299,12 @@ mod tests {
 
     #[test]
     fn malformed_v3_metadata_classifies_as_unknown() {
-        // A name of its own, so two tests running in parallel cannot delete
-        // each other's fixtures.
-        let dir = env::temp_dir().join(format!("zarr-tree-test-v3-malformed-{}", process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = fixture("v3-malformed");
 
         // Truncated mid-object: serde_json will refuse to parse this.
         fs::write(dir.join("zarr.json"), r#"{"zarr_format": 3, "node_type":"#).unwrap();
 
-        let kind = classify(&dir);
+        let kind = classify_dir(&dir);
 
         fs::remove_dir_all(&dir).unwrap();
 
@@ -1568,22 +2316,12 @@ mod tests {
 
     #[test]
     fn v2_dtype_is_passed_through_uninterpreted() {
-        let dir = env::temp_dir().join(format!("zarr-tree-test-v2-dtype-{}", process::id()));
-        fs::create_dir_all(&dir).unwrap();
-
-        let zarray = dir.join(".zarray");
         // `<M8[ns]` is NumPy's datetime64, valid V2 but outside what a Zarr
         // library would necessarily load. We only display dtypes, so it has
         // to survive to the screen unchanged.
-        fs::write(
-            &zarray,
+        let meta = array_meta_v2(
             r#"{"zarr_format": 2, "shape": [10], "chunks": [10], "dtype": "<M8[ns]"}"#,
-        )
-        .unwrap();
-
-        let meta = array_meta_v2(&zarray);
-
-        fs::remove_dir_all(&dir).unwrap();
+        );
 
         assert_eq!(shown(&meta.shape), Some(String::from("[10]")));
         assert_eq!(shown(&meta.chunks), Some(String::from("[10]")));
@@ -1627,19 +2365,19 @@ mod tests {
 
     #[test]
     fn ome_v2_multiscales_without_version_is_still_detected() {
-        let dir = env::temp_dir().join(format!("zarr-tree-test-ome-v2-{}", process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = fixture("ome-v2");
 
         // A V2 image group, written the way real 0.4 stores often are: the keys
         // at the top level of `.zattrs`, and no `version` anywhere. The group is
         // still an OME-Zarr image, so it earns a tag -- just a bare one.
+        fs::write(dir.join(".zgroup"), r#"{"zarr_format": 2}"#).unwrap();
         fs::write(
             dir.join(".zattrs"),
             r#"{"multiscales": [{"datasets": [{"path": "0"}]}]}"#,
         )
         .unwrap();
 
-        let info = ome_info_v2(&dir);
+        let info = group_meta(&dir).ome;
 
         fs::remove_dir_all(&dir).unwrap();
 
@@ -1759,19 +2497,19 @@ mod tests {
 
     #[test]
     fn a_v2_plate_takes_its_version_from_the_plate_object() {
-        let dir = env::temp_dir().join(format!("zarr-tree-test-plate-v2-{}", process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = fixture("plate-v2");
 
         // V2 has no `ome` namespace to record a version in, so the version sits
         // inside the `plate` object -- the same split `multiscales` has, in a
         // different place.
+        fs::write(dir.join(".zgroup"), r#"{"zarr_format": 2}"#).unwrap();
         fs::write(
             dir.join(".zattrs"),
             r#"{"plate": {"version": "0.4", "rows": [{"name": "A"}], "columns": [{"name": "1"}]}}"#,
         )
         .unwrap();
 
-        let info = ome_info_v2(&dir);
+        let info = group_meta(&dir).ome;
 
         fs::remove_dir_all(&dir).unwrap();
 
@@ -2086,8 +2824,7 @@ mod tests {
 
     #[test]
     fn a_raster_element_is_read_from_a_v2_zattrs_file() {
-        let dir = env::temp_dir().join(format!("zarr-tree-test-sd-labels-v2-{}", process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = fixture("sd-labels-v2");
 
         // A Zarr V2 segmentation. V2 predates the `ome` namespace, so
         // `image-label` and `multiscales` sit at the top level of `.zattrs`
@@ -2104,7 +2841,7 @@ mod tests {
         )
         .unwrap();
 
-        let info = spatialdata_info_v2(&dir);
+        let info = group_meta(&dir).spatialdata;
 
         fs::remove_dir_all(&dir).unwrap();
 
@@ -2154,8 +2891,7 @@ mod tests {
 
     #[test]
     fn spatialdata_root_is_read_from_a_v2_zattrs_file() {
-        let dir = env::temp_dir().join(format!("zarr-tree-test-sd-v2-{}", process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = fixture("sd-v2");
 
         // Container format 0.1 is a Zarr V2 store. `.zattrs` *is* the
         // attributes object, so the marker sits at its top level rather than
@@ -2168,7 +2904,7 @@ mod tests {
         )
         .unwrap();
 
-        let info = spatialdata_info_v2(&dir);
+        let info = group_meta(&dir).spatialdata;
 
         fs::remove_dir_all(&dir).unwrap();
 
@@ -2257,8 +2993,7 @@ mod tests {
 
     #[test]
     fn a_shapes_element_from_the_array_era_is_still_detected() {
-        let dir = env::temp_dir().join(format!("zarr-tree-test-sd-shapes-v1-{}", process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = fixture("sd-shapes-v1");
 
         // The oldest shapes encoding, from a Zarr V2 store: the geometry lived
         // in sibling Zarr arrays rather than in a Parquet file, `geos` recorded
@@ -2282,7 +3017,7 @@ mod tests {
         )
         .unwrap();
 
-        let info = spatialdata_info_v2(&dir);
+        let info = group_meta(&dir).spatialdata;
 
         fs::remove_dir_all(&dir).unwrap();
 

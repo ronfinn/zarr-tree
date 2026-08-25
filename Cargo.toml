@@ -3,9 +3,17 @@ name = "zarr-tree"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
-description = "A small CLI for exploring the structure and metadata of local Zarr stores."
+description = "A small CLI for exploring the structure and metadata of Zarr stores, locally or on S3."
 license = "MIT"
 repository = "https://github.com/ronfinn/zarr-tree"
 
 [dependencies]
+# The `aws` feature is the only cloud backend enabled; `default-features` is
+# off so that object_store's own local-filesystem backend is left out -- local
+# stores are read with `std::fs`, as they always have been.
+object_store = { version = "0.14.1", default-features = false, features = ["aws"] }
 serde_json = "1.0.151"
+# object_store is async throughout, so a runtime is needed to drive it. A
+# current-thread one is enough: `net` and `time` are what its HTTP client needs
+# from the reactor, and nothing here wants a thread pool.
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "time"] }

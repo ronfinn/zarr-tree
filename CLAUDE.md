@@ -4,9 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`zarr-tree` is a Rust CLI for inspecting local Zarr stores. It walks a directory,
-reads Zarr metadata files, and prints the hierarchy as a tree. It reads metadata
-only — never chunk data.
+`zarr-tree` is a Rust CLI for inspecting Zarr stores, either in a local
+directory or under an S3 key prefix. It walks the store, reads Zarr metadata
+files, and prints the hierarchy as a tree. It reads metadata only — never chunk
+data.
 
 Layout is deliberately flat: `src/main.rs` holds the whole program plus its unit
 tests, and `tests/cli.rs` holds integration tests that run the compiled binary
@@ -32,6 +33,12 @@ against throwaway fixture stores.
   column and well counts.
 - SpatialData store-root recognition, plus image, labels, points, shapes and
   table elements.
+- Read-only S3 access: `zarr-tree s3://bucket/path/store.zarr` produces the
+  same tree as a local path. Traversal, interpretation and both renderers are
+  storage-neutral; only the `Store` trait and its two implementations
+  (`LocalStore`, `RemoteStore`) know where the bytes come from.
+- Arrays are leaves remotely as well, so an array's chunk objects are never
+  listed. This is what makes remote traversal affordable and must stay true.
 - `--depth N` to limit traversal.
 - `--json` for structured output.
 - Unix `BrokenPipe` handled quietly (exit 0, nothing on stderr).
@@ -39,8 +46,10 @@ against throwaway fixture stores.
 ## Development rules
 
 - Keep milestones small — one idea per commit.
-- Prefer the standard library plus `serde_json`. That is the whole dependency
-  list and it should stay that way.
+- Prefer the standard library plus `serde_json`, `object_store` (the `aws`
+  feature only) and `tokio` (a current-thread runtime, for driving
+  `object_store`). That is the whole dependency list and it should stay that
+  way.
 - No `zarrs` until an actual array-reading, chunk-decoding or remote-store need
   justifies it.
 - This is metadata **inspection, not validation**. Nothing is checked against a
@@ -77,7 +86,8 @@ for exactly one, `cargo test -- --nocapture` to see printed output.
 
 Do not implement these without an explicit request:
 
-- S3 / HTTP / any remote or object store.
+- HTTP, GCS, Azure or any object store beyond S3.
+- Writing to a store of any kind.
 - Chunk or pixel reads of any kind.
 - Parquet decoding.
 - AnnData interpretation.

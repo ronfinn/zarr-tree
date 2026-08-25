@@ -2,7 +2,8 @@
 
 [![CI](https://github.com/ronfinn/zarr-tree/actions/workflows/ci.yml/badge.svg)](https://github.com/ronfinn/zarr-tree/actions/workflows/ci.yml)
 
-A small Rust CLI for exploring the structure and metadata of local Zarr stores.
+A small Rust CLI for exploring the structure and metadata of Zarr stores, on
+this machine or in an S3 bucket.
 
 ```
 $ zarr-tree example.zarr
@@ -25,7 +26,7 @@ example.zarr [group]
 
 ## Features
 
-- Prints a directory tree of a local Zarr store.
+- Prints a tree of a Zarr store, given a directory or an `s3://` URI.
 - Labels each directory as `[group]`, `[array]` or `[unknown]`.
 - Shows `shape`, `chunks` and `dtype` underneath every array.
 - Tells a Zarr V3 sharded array's inner chunks from its shards, and adds a
@@ -44,6 +45,9 @@ example.zarr [group]
 - Recognises SpatialData elements — images, labels, points, shapes and tables —
   e.g. `[group, SpatialData points]`, and tells a segmentation from an image by
   its OME-Zarr metadata rather than by its directory name.
+- Reads S3 with the same walk, the same output and the same options, stopping
+  at arrays there too — so an array's chunk objects are never listed, however
+  many millions of them there are.
 - Limits how far it descends with `--depth N`.
 - Prints the same walk as JSON with `--json`, for `jq` and scripts.
 - Sits quietly at the producing end of a pipe: `| head` ends the run with no
@@ -439,20 +443,20 @@ with rustc 1.98.0.
 ## Usage
 
 ```sh
-zarr-tree [OPTIONS] <directory>
+zarr-tree [OPTIONS] <store>
 ```
 
-Exactly one directory, plus any of the options below in any order. Anything
-else names what was wrong and exits with status 1:
+Exactly one store, plus any of the options below in any order. Anything else
+names what was wrong and exits with status 1:
 
 ```
 $ zarr-tree
-error: expected a directory
-usage: zarr-tree [OPTIONS] <DIRECTORY>
+error: expected a store
+usage: zarr-tree [OPTIONS] <STORE>
 
 $ zarr-tree --depth two store.zarr
 error: --depth needs a whole number, not "two"
-usage: zarr-tree [OPTIONS] <DIRECTORY>
+usage: zarr-tree [OPTIONS] <STORE>
 ```
 
 ```
@@ -463,8 +467,79 @@ usage: zarr-tree [OPTIONS] <DIRECTORY>
 ```
 
 An argument beginning with `-` that is not one of these is read as a mistyped
-option rather than as a directory, so a directory whose name starts with `-`
-cannot be inspected.
+option rather than as a path, so a directory whose name starts with `-` cannot
+be inspected.
+
+### S3
+
+A store argument beginning with `s3://` is read from S3 instead of from disk.
+Nothing else changes: the same walk, the same tree, the same `--depth` and
+`--json`.
+
+```
+$ zarr-tree --depth 1 s3://janelia-cosem-datasets/jrc_cos7-11/jrc_cos7-11.zarr
+s3://janelia-cosem-datasets/jrc_cos7-11/jrc_cos7-11.zarr [group]
+├── mapping [group]
+├── recon-1 [group]
+└── recon-2 [group]
+```
+
+The scheme is the only thing that decides. Every other argument is a path on
+this machine, exactly as before — including a relative path that happens to
+contain `s3://` somewhere after its start.
+
+**Credentials.** Settings come from the usual `AWS_*` environment variables and
+nothing else: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
+`AWS_REGION`, `AWS_ENDPOINT_URL`, and the web-identity and container credential
+variables. There is no login, no profile manager and no credential file of
+zarr-tree's own.
+
+When none of those names a credential, requests go out **unsigned**, which is
+what a public bucket wants and what the example above relies on. Set
+`AWS_SKIP_SIGNATURE=false` to force the credential chain — on an EC2 instance
+with an instance role, that is what you want.
+
+`AWS_REGION` matters: without it the bucket is assumed to be in `us-east-1`, and
+S3 answers a bucket in another region with a redirect rather than data.
+
+Note that the underlying library does not read `~/.aws/credentials`, so a named
+profile has no effect on its own. `aws configure export-credentials --format
+env` bridges the gap.
+
+**Requests.** An array is a leaf on S3 exactly as it is on disk, and that is
+what makes remote traversal affordable: a listing is made only for a group, so
+an array's chunk objects are never enumerated. Walking a six-level pyramid
+whose first two levels alone hold some 77,000 chunk objects costs 2 listings
+and 16 metadata reads:
+
+```
+$ zarr-tree s3://janelia-cosem-datasets/jrc_cos7-11/jrc_cos7-11.zarr/recon-1/em
+s3://.../recon-1/em [group]
+└── fibsem-uint16 [group, OME-Zarr 0.4]
+    ├─ axes: z, y, x
+    ├─ pyramid levels: 6
+    ├─ datasets: s0, s1, s2, s3, s4, s5
+    ├── s0 [array]
+    │   ├─ shape:  [12664, 1200, 8750]
+    │   ├─ chunks: [256, 256, 256]
+    │   └─ dtype:  <u2
+    ...
+```
+
+Per node that is one `ListObjectsV2` with `delimiter=/` for a group, and one to
+three `GetObject` calls to classify it — `.zgroup`, then `.zarray`, then
+`zarr.json`, stopping at the first that answers.
+
+**Errors** name the category and nothing more:
+
+```
+$ zarr-tree s3://janelia-cosem-datasets/nope.zarr
+error: no such bucket or prefix: s3://janelia-cosem-datasets/nope.zarr
+
+$ zarr-tree s3://
+error: expected s3://bucket/prefix, not "s3://"
+usage: zarr-tree [OPTIONS] <STORE>
+```
 
 ### Depth
 
@@ -616,7 +691,25 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
 
 ## Limitations
 
-- Local filesystem paths only. No remote or object-store access.
+- Local directories and S3 only. There is no HTTP, GCS or Azure backend, no
+  ZIP store, and no writing of any kind.
+- S3 credentials come from `AWS_*` environment variables, a web-identity token,
+  a container credential endpoint or EC2 instance metadata. `~/.aws/credentials`
+  is not read, and there is no `--profile`, `--region` or `--endpoint` flag:
+  the environment is the whole interface.
+- A bucket in a region other than `us-east-1` needs `AWS_REGION` set. Nothing
+  discovers the region for you, and S3 answers a request to the wrong one with
+  a redirect that is reported as a failed request.
+- A remote store is classified with up to three `GetObject` calls per node —
+  `.zgroup`, `.zarray`, `zarr.json`, in that order — so a Zarr V3 store pays two
+  misses per node. Nothing is cached between runs and nothing is fetched
+  concurrently: requests go out one at a time.
+- A remote read that fails mid-walk is indistinguishable from a missing file, so
+  a node whose metadata could not be fetched is reported `[unknown]` rather than
+  as an error. Only the root is checked properly, before anything is printed.
+- Pointing at a prefix that is not a Zarr node lists it to find out whether it
+  exists at all. On a prefix holding a very large number of loose objects that
+  listing is paginated to the end.
 - Only `shape`, `chunks`/`chunk_shape`, `dtype`/`data_type` and the shard
   shape are read. Compressors, fill values, dimension names and user
   attributes are not shown, and `codecs` is read for the sharding codec
@@ -676,8 +769,8 @@ Small, in roughly this order:
 1. Show a node's user attributes when asked.
 2. Report V3 dtypes given in object form, instead of showing them as missing.
 
-Remote stores, and anything beyond lightweight OME-Zarr and SpatialData
-recognition, are out of scope for now.
+HTTP, GCS and Azure backends, and anything beyond lightweight OME-Zarr and
+SpatialData recognition, are out of scope for now.
 
 ## Why this project exists
 
