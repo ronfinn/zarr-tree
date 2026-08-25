@@ -28,12 +28,17 @@ example.zarr [group]
 - Prints a directory tree of a local Zarr store.
 - Labels each directory as `[group]`, `[array]` or `[unknown]`.
 - Shows `shape`, `chunks` and `dtype` underneath every array.
+- Tells a Zarr V3 sharded array's inner chunks from its shards, and adds a
+  `shards:` row when the array is sharded.
 - Stops descending at arrays, so chunk storage (a V3 `c/` directory, V2 chunk
   keys) does not clutter the output.
 - Recognises OME-Zarr image groups and tags them, e.g. `[group, OME-Zarr 0.4]`.
 - Shows an OME-Zarr image's axis names on one row, e.g. `axes: c, y, x`.
 - Summarises an OME-Zarr multiscale pyramid: how many resolution levels the
   metadata declares, and the paths it declares them at.
+- Recognises OME-Zarr HCS plates and wells and tags them, e.g.
+  `[group, OME-Zarr 0.5 plate]`, and shows a plate's declared row, column and
+  well counts.
 - Recognises the root of a SpatialData store and tags it, e.g.
   `[group, SpatialData 0.2]`.
 - Recognises SpatialData elements — images, labels, points, shapes and tables —
@@ -53,7 +58,7 @@ Both Zarr V2 and V3 metadata layouts are recognised:
 | Version | Group marker | Array marker | Fields read |
 | --- | --- | --- | --- |
 | V2 | `.zgroup` | `.zarray` | `shape`, `chunks`, `dtype` |
-| V3 | `zarr.json` with `"node_type": "group"` | `zarr.json` with `"node_type": "array"` | `shape`, `chunk_grid.configuration.chunk_shape`, `data_type` |
+| V3 | `zarr.json` with `"node_type": "group"` | `zarr.json` with `"node_type": "array"` | `shape`, `chunk_grid.configuration.chunk_shape`, `codecs`, `data_type` |
 
 V2 is checked first, so a directory carrying both V2 and V3 metadata is reported
 as V2.
@@ -61,6 +66,36 @@ as V2.
 V2 `dtype` values are displayed exactly as stored, in NumPy notation — `<u2`,
 `|u1`, `<M8[ns]`. They are not translated into V3 names such as `uint16`, and no
 attempt is made to validate them.
+
+### Sharding
+
+A Zarr V3 array may store many chunks together in one file — a *shard* — using
+the `sharding_indexed` codec. When it does, `chunk_grid` no longer describes the
+chunks: it describes the shards, and the chunk shape lives in the codec's own
+`configuration.chunk_shape`. Both are shown, under the names that match what
+they are:
+
+```
+$ zarr-tree sharded.zarr
+sharded.zarr [group]
+└── img [array]
+    ├─ shape:  [4096, 4096]
+    ├─ chunks: [512, 512]
+    ├─ shards: [2048, 2048]
+    └─ dtype:  uint16
+```
+
+The `shards:` row appears only for a sharded array. An unsharded array has no
+shards to report, so nothing is printed and `--json` omits the key entirely —
+unlike `chunks`, which is always applicable and shows `?` (or `null`) when it
+cannot be read.
+
+A `sharding_indexed` codec whose inner chunk shape cannot be read leaves
+`chunks` as `?` rather than falling back to the grid shape, which would print a
+shard under the name `chunks`.
+
+Zarr V2 has no sharding: there is one grid, `chunks` is it, and no `shards` row
+is ever drawn.
 
 ## OME-Zarr
 
@@ -169,6 +204,44 @@ follows the rows and the last one closes the branch with `└─`.
 Nothing checks that a declared path exists on disk, and no scale factors, pixel
 sizes or physical extents are calculated — the `coordinateTransformations` those
 would come from are not read at all.
+
+### Plates and wells
+
+High-content screening stores a plate of wells rather than a single image. The
+two groups name themselves the way an image does — with a key in their
+attributes, `plate` or `well` — and are tagged with the kind after the version:
+
+```
+$ zarr-tree plate.zarr
+plate.zarr [group, OME-Zarr 0.5 plate]
+├─ rows: 2
+├─ columns: 3
+├─ wells: 6
+└── A [group]
+    └── 1 [group, OME-Zarr 0.5 well]
+        └── 0 [group, OME-Zarr 0.5]
+            ├─ axes: c, y, x
+            ├─ pyramid levels: 1
+            └─ datasets: 0
+```
+
+A plate's three rows are the lengths of the lists its metadata declares. Like
+the pyramid level count, they come from the metadata and **never** from counting
+directories: a plate that declares 96 wells says 96 whether or not 96 were
+written. Each count is independent, so a plate that declares only some of the
+three lists shows only those rows.
+
+A well adds no rows of its own. What it holds is its images, and the tree is
+already printing them.
+
+The kind is decided by which key the attributes carry, never by a name. A
+plate's rows and columns really are called `A`, `B`, `1`, `2`, and any store is
+free to use those names for anything at all — so the row group `A` above is an
+ordinary `[group]`, because that is all its metadata says it is.
+
+Nothing inside `plate` or `well` beyond the three counts is read: well paths,
+acquisitions, field-of-view indices and image paths are all left alone, and no
+declared path is checked against the disk.
 
 This is **recognition, not validation**. Nothing here checks a store against the
 OME-NGFF specification: axes, dataset paths, coordinate transformations, `omero`
@@ -452,8 +525,8 @@ applies to it:
 | `name` | yes | The directory name. On the root, the path as it was typed — the same thing the tree's first line shows. |
 | `kind` | yes | `group`, `array` or `unknown` |
 | `children` | yes | The child nodes, in the same order the tree lists them. Empty for an array, and empty at the depth limit. |
-| `array` | arrays only | `shape`, `chunks`, `dtype` |
-| `ome` | OME-Zarr images | `tag`, `version`, `axes`, `pyramid_levels`, `datasets` |
+| `array` | arrays only | `shape`, `chunks`, `dtype`, and `shards` on a sharded V3 array |
+| `ome` | OME-Zarr groups | `tag`, `kind` (`image`, `plate`, `well`), `version`, `axes`, `pyramid_levels`, `datasets`, and `rows`, `columns`, `wells` on a plate |
 | `spatialdata` | SpatialData nodes | `kind` (`root`, `image`, `labels`, `points`, `shapes`, `table`) and `version`, which only a store root records |
 
 A section is absent when that kind of metadata does not apply; a field inside a
@@ -534,8 +607,8 @@ cargo clippy --all-targets -- -D warnings  # lints, as CI runs them
 cargo fmt --check            # formatting, as CI runs it
 ```
 
-The suite is in two parts: 37 unit tests in `src/main.rs`, which cover metadata
-parsing directly, and 11 integration tests in `tests/cli.rs`, which run the
+The suite is in two parts: 44 unit tests in `src/main.rs`, which cover metadata
+parsing directly, and 13 integration tests in `tests/cli.rs`, which run the
 compiled binary against throwaway fixture stores and assert on what it prints.
 
 CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
@@ -544,19 +617,25 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
 ## Limitations
 
 - Local filesystem paths only. No remote or object-store access.
-- Only `shape`, `chunks`/`chunk_shape` and `dtype`/`data_type` are read.
-  Codecs, compressors, fill values, dimension names and user attributes are
-  not shown.
+- Only `shape`, `chunks`/`chunk_shape`, `dtype`/`data_type` and the shard
+  shape are read. Compressors, fill values, dimension names and user
+  attributes are not shown, and `codecs` is read for the sharding codec
+  alone.
 - No output options beyond `--depth` and `--json`: no filtering, no colour.
 - V2 dtypes are passed through as stored and V3 dtypes given in object form
   (the extension syntax) are not interpreted.
-- Sharding is not understood; a sharded array shows its declared chunk shape
-  only.
-- OME-Zarr support goes no further than spotting image groups and showing their
-  version, axis names, declared pyramid level count and dataset paths. Axis
+- A sharded V3 array reports its chunks and shards, but nothing else about the
+  sharding: the index location, the inner codecs and the shard layout on disk
+  are not read.
+- OME-Zarr support goes no further than spotting image, plate and well groups
+  and showing their version, and for an image its axis names, declared pyramid
+  level count and dataset paths. Axis
   `type` and `unit` are not shown, nothing is validated (axis names, ordering or
   count; whether a declared dataset path exists), and coordinate
-  transformations, `omero` and plate/well metadata are not read. `image-label`
+  transformations and `omero` are not read. HCS support goes no further than
+  tagging a plate and a well and showing a plate's three declared counts —
+  well paths, acquisitions and field-of-view indices are not read, and no
+  declared count is checked against the wells actually present. `image-label`
   is read only for its presence, to tell a segmentation from an image. No
   scale factors, pixel sizes or physical extents are calculated.
 - SpatialData support goes no further than recognising a store root and its

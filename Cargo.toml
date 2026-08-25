@@ -1,6 +1,6 @@
 [package]
 name = "zarr-tree"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A small CLI for exploring the structure and metadata of local Zarr stores."

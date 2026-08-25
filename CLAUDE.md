@@ -14,18 +14,22 @@ against throwaway fixture stores.
 
 ## Current release
 
-- Latest release: **v0.1.0** (tag `v0.1.0`).
-- Current manifest version: `0.1.0`.
+- Latest release: **v0.2.0** (tag `v0.2.0`).
+- Current manifest version: `0.2.0`.
 
 ## Current capabilities
 
 - Zarr V2 (`.zgroup` / `.zarray`) and V3 (`zarr.json`) metadata layouts.
 - Nodes labelled `[group]`, `[array]` or `[unknown]`; arrays are leaves.
 - `shape`, `chunks` and `dtype` shown under every array.
+- Zarr V3 sharded arrays report `chunks` (inner chunk shape) and `shards`
+  (chunk-grid shape) separately.
 - OME-Zarr image detection, with the version as stored.
 - Axis names from the first `multiscales` entry (both the 0.3 list-of-names and
   the 0.4/0.5 list-of-objects forms).
 - Multiscale pyramid metadata: declared level count and dataset paths.
+- OME-Zarr HCS plate and well recognition, with a plate's declared row,
+  column and well counts.
 - SpatialData store-root recognition, plus image, labels, points, shapes and
   table elements.
 - `--depth N` to limit traversal.
