@@ -46,6 +46,10 @@ example.zarr [group]
 - Recognises SpatialData elements — images, labels, points, shapes and tables —
   e.g. `[group, SpatialData points]`, and tells a segmentation from an image by
   its OME-Zarr metadata rather than by its directory name.
+- Summarises the Parquet payload of a SpatialData points or shapes element: how
+  many rows it holds, how many columns wide it is, how many Parquet files it is
+  written across, and what its columns are called and typed. Read from the file
+  footer alone — **Parquet records are not read.**
 - Reads S3 with the same walk, the same output and the same options, stopping
   at arrays there too — so an array's chunk objects are never listed, however
   many millions of them there are.
@@ -401,15 +405,66 @@ and its coordinate transformations are all left alone.
 
 ### Payload files
 
-`points.parquet` shows up as `[unknown]`, and `shapes.parquet` does not show up
-at all. Both are correct. Points are written as a *partitioned* Parquet
-dataset, which on disk is a directory of `part.N.parquet` files, so the walk
-finds it and reports honestly that it holds no Zarr metadata. Shapes are
-written as a single Parquet *file*, and only directories are listed.
+A points or shapes element keeps its data outside the Zarr hierarchy, in
+Parquet beside the element's own metadata. The two are not written the same
+way. Points are a *partitioned* Parquet dataset, so `points.parquet` is a
+directory of `part.0.parquet`, `part.1.parquet` and so on — one file where the
+frame had one partition, eight for the Xenium transcripts. Shapes are a
+GeoDataFrame written in one go, so `shapes.parquet` is a single file.
 
-Neither is suppressed. That would mean matching on the name `points.parquet`,
-and names decide nothing here — and in an older store the children of a shapes
-element are genuine Zarr arrays worth showing.
+zarr-tree reads the footer of each of those files and prints four rows:
+
+```
+$ zarr-tree xenium.zarr
+xenium.zarr [group, SpatialData 0.2]
+├── points [group]
+│   └── transcripts [group, SpatialData points]
+│       ├─ rows: 638,083
+│       ├─ columns: 9
+│       ├─ parquet files: 1
+│       └─ schema: x:float, y:float, z:float, feature_name:string, cell_id:int32, ...
+└── shapes [group]
+    ├── cell_boundaries [group, SpatialData shapes]
+    │   ├─ rows: 167,780
+    │   ├─ columns: 2
+    │   ├─ parquet files: 1
+    │   └─ schema: geometry:byte_array, cell_id:int32
+    └── cell_circles [group, SpatialData shapes]
+        ├─ rows: 167,780
+        ├─ columns: 3
+        ├─ parquet files: 1
+        └─ schema: geometry:byte_array, radius:double, cell_id:int32
+```
+
+**Parquet records are not read.** A Parquet file keeps its metadata in a footer
+at the very end, so only the end of the file is fetched — 64 KiB at most, twice
+at worst, whether the file is three kilobytes or two gigabytes. No row group is
+opened, no page is decoded, no coordinate or geometry is touched, and the
+`--json` output carries the same four facts and nothing more. A 77 MB
+transcripts payload on an HTTP server costs one `HEAD` and one 64 KiB range
+`GET`: 0.09% of the file.
+
+`rows` is the total across every file of the payload, summed from the footers.
+`columns` and `schema` are the top-level columns of the first file — the parts
+of one payload are one table written in pieces and share a schema. Column types
+are Parquet's own: the logical type where a column declares one (`string`,
+`uint8`), and the physical type otherwise (`double`, `byte_array`). Past a
+dozen columns the tree's `schema` row counts the rest rather than naming them;
+`--json` always carries the whole schema.
+
+A points element's `points.parquet` directory is not drawn as a child node. It
+is the element's data, not a node beneath it, and the rows above already say
+what is in it. That is not a rule about the name: it applies only to a group
+whose own metadata said it is a points element, so an ordinary Zarr group with
+a directory called `points.parquet` is walked into as usual.
+
+The summary is best-effort. A payload that is missing, is not Parquet, has an
+encrypted footer, or — on a plain static HTTP server — is a directory that
+cannot be listed, costs the four rows and nothing else: the element is still
+recognised and tagged from its Zarr metadata exactly as before. A shapes
+payload is one file at a name we know, so it is read even from a server with no
+listing at all; a points payload has to be listed first, and its filenames are
+never guessed at.
 
 The directory names `images`, `labels`, `points`, `shapes` and `tables` are
 never used to detect anything. In a real store those groups carry no attributes
@@ -863,9 +918,11 @@ cargo clippy --all-targets -- -D warnings  # lints, as CI runs them
 cargo fmt --check            # formatting, as CI runs it
 ```
 
-The suite is in two parts: 44 unit tests in `src/main.rs`, which cover metadata
-parsing directly, and 13 integration tests in `tests/cli.rs`, which run the
+The suite is in two parts: 78 unit tests in `src/main.rs`, which cover metadata
+parsing directly, and 14 integration tests in `tests/cli.rs`, which run the
 compiled binary against throwaway fixture stores and assert on what it prints.
+The Parquet fixtures are written by the same crate that reads them back, so
+those tests run against real Parquet bytes with a real footer.
 
 CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
 `cargo test` on every push and pull request.
@@ -929,11 +986,24 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
   is read only for its presence, to tell a segmentation from an image. No
   scale factors, pixel sizes or physical extents are calculated.
 - SpatialData support goes no further than recognising a store root and its
-  image, labels, points, shapes and table elements. Nothing inside an element
-  is read: `points.parquet`, `shapes.parquet` and a table's `X`, `obs`, `var`
-  and `layers` are left alone. Element axes, feature keys, instance keys,
-  geometry types, the region a table annotates and coordinate transformations
-  are not shown, and no element is joined to any other.
+  image, labels, points, shapes and table elements, and summarising the Parquet
+  payload of a points or shapes element from its footer. Element axes, feature
+  keys, instance keys, geometry types, the region a table annotates and
+  coordinate transformations are not shown, and no element is joined to any
+  other. A table's `X`, `obs`, `var` and `layers` are walked as the Zarr arrays
+  they are and not interpreted as AnnData.
+- No Parquet record is ever read. Only the footer is fetched, so row counts and
+  the schema are what the file *declares*: nothing is counted, nothing is
+  checked, and a footer that disagrees with the pages below it is reported as
+  it stands. Row-group layout, encodings, compression, statistics, key/value
+  metadata and the GeoParquet `geo` block are not read, so a shapes column
+  shows as `byte_array` rather than as the geometry type it encodes. Nested
+  columns are counted once and not expanded.
+- A Parquet payload is looked for only where a SpatialData element's metadata
+  named one, and only at the two paths SpatialData's writer uses —
+  `points.parquet/` and `shapes.parquet`. An arbitrary `.parquet` file
+  elsewhere in a store is not read, and a points payload on a server with no
+  listing is skipped rather than having its part filenames guessed at.
 - A segmentation that omits the optional `image-label` key is reported as an
   image. Nothing inside `image-label` — colours, properties, the source image —
   is read, and no label value is ever looked at.

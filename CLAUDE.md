@@ -33,6 +33,15 @@ against throwaway fixture stores.
   column and well counts.
 - SpatialData store-root recognition, plus image, labels, points, shapes and
   table elements.
+- SpatialData Parquet payload summaries: row count, column count, file count
+  and schema for a points or shapes element, read from the file footer only.
+  A points payload is the directory `points.parquet/` of `part.N.parquet`
+  parts (a listing, so it needs a backend that can list); a shapes payload is
+  the single file `shapes.parquet` (no listing, so a plain static HTTP server
+  can serve it). Neither path is declared in the element's metadata; both are
+  SpatialData writer conventions, reached only from a group its own metadata
+  already named a points or shapes element. No record, page or row group is
+  ever read.
 - Read-only S3 access: `zarr-tree s3://bucket/path/store.zarr` produces the
   same tree as a local path. Traversal, interpretation and both renderers are
   storage-neutral; only the `Store` trait and its two implementations
@@ -55,6 +64,14 @@ against throwaway fixture stores.
   same JSON it always got. It is opportunistic (no store that worked without it
   may come to depend on it) and all-or-nothing (once the document is read the
   physical store is dropped, so a tree is never half snapshot and half live).
+- `Store` answers five questions, not three: `read`, `children` and
+  `check_root` are the Zarr walk; `files` and `read_suffix` exist for binary
+  payloads alone. `read_suffix` can only ask for the end of an object, which
+  is what makes "never download a whole Parquet file" structural rather than
+  remembered.
+- `ConsolidatedStore` keeps the physical store, but only `files` and
+  `read_suffix` reach it. `read`, `children` and `check_root` stay
+  overlay-only, so the Zarr snapshot is never half document and half live.
 - `--depth N` to limit traversal.
 - `--json` for structured output.
 - Unix `BrokenPipe` handled quietly (exit 0, nothing on stderr).
@@ -63,7 +80,8 @@ against throwaway fixture stores.
 
 - Keep milestones small — one idea per commit.
 - Prefer the standard library plus `serde_json`, `object_store` (the `aws` and
-  `http` features only), `tokio` (a current-thread runtime, for driving
+  `http` features only), `parquet` (no default features -- no arrow, no
+  codecs, no async), `tokio` (a current-thread runtime, for driving
   `object_store`) and `url` (splitting an http(s) URI). That is the whole
   dependency list and it should stay that way.
 - No `zarrs` until an actual array-reading, chunk-decoding or remote-store need
@@ -110,7 +128,11 @@ Do not implement these without an explicit request:
   snapshot is reported as it stands.
 - Writing to a store of any kind.
 - Chunk or pixel reads of any kind.
-- Parquet decoding.
+- Parquet record, page or row-group decoding; row-group, encoding, compression
+  or statistics reporting; the GeoParquet `geo` block; Arrow, DataFusion or
+  Polars.
+- Turning an arbitrary `.parquet` file elsewhere in a store into a tree node,
+  or guessing the filenames of a points payload a backend cannot list.
 - AnnData interpretation.
 - async / Tokio.
 

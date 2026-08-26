@@ -3,14 +3,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io;
-use std::io::Write;
+use std::io::{Read, Seek, Write};
 use std::path::PathBuf;
 use std::process;
 
 use object_store::aws::AmazonS3Builder;
 use object_store::http::HttpBuilder;
 use object_store::path::Path as ObjectPath;
-use object_store::{ClientConfigKey, ObjectStore, ObjectStoreExt};
+use object_store::{ClientConfigKey, GetOptions, GetRange, ObjectStore, ObjectStoreExt};
+use parquet::basic::LogicalType;
+use parquet::file::metadata::{FooterTail, ParquetMetaData, ParquetMetaDataReader};
+use parquet::schema::types::Type as SchemaType;
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use url::Url;
@@ -25,10 +28,13 @@ enum NodeKind {
 
 /// What a group's attributes say about it, beyond its being a group.
 ///
-/// The two fields are independent facts, read by two conventions that know
-/// nothing about each other. A group may carry either, both, or -- as almost
-/// every group does -- neither. A SpatialData raster element carries both, and
-/// each field is still read on its own terms.
+/// The first two fields are independent facts, read by two conventions that
+/// know nothing about each other. A group may carry either, both, or -- as
+/// almost every group does -- neither. A SpatialData raster element carries
+/// both, and each field is still read on its own terms.
+///
+/// The third is not independent of them, and is the one field here that does
+/// not come out of a metadata file at all -- see `parquet`.
 struct GroupMeta {
     /// Set when the group carries OME-Zarr image metadata. See `ome_info`.
     ome: Option<OmeInfo>,
@@ -37,6 +43,55 @@ struct GroupMeta {
     /// `images`/`labels`/`points`/`shapes`/`tables` containers inside a store,
     /// which carry no attributes. See `spatialdata_info`.
     spatialdata: Option<SpatialData>,
+    /// What the Parquet payload of a SpatialData points or shapes element
+    /// says about itself.
+    ///
+    /// Read only when `spatialdata` has already said this group is one of
+    /// those two, which is what keeps an arbitrary `.parquet` file elsewhere
+    /// in a store from being interpreted: a payload is looked for because the
+    /// element's own metadata named it, never because a filename looked
+    /// promising. `None` everywhere else, and also wherever the payload could
+    /// not be read -- see `parquet_summary`.
+    parquet: Option<ParquetSummary>,
+}
+
+/// What a SpatialData element's Parquet payload says about itself, read from
+/// the file footer and nowhere else.
+///
+/// SpatialData keeps the coordinates of a points element and the geometries of
+/// a shapes element outside the Zarr hierarchy, in Parquet files beside the
+/// element's own metadata. Neither is Zarr, and neither is described by any
+/// Zarr metadata: the element declares no path to its payload, so the layout
+/// is a convention of SpatialData's writer -- see `payload_files`.
+///
+/// Every field here comes out of the footer at the end of each file, which is
+/// a few kilobytes however large the file is. Nothing below the footer is
+/// read: no row group is opened, no page is decoded and no value is looked at.
+/// A transcripts payload of well over a gigabyte costs the same handful of
+/// kilobytes as a landmark file of three.
+struct ParquetSummary {
+    /// Rows across every file of the payload, summed. Parquet counts rows in
+    /// the footer, so this is read rather than counted.
+    rows: i64,
+    /// How many files the payload is written across. One for a shapes
+    /// element; one per partition for a points element.
+    files: usize,
+    /// The top-level columns of the first file, in the order the schema
+    /// declares them.
+    ///
+    /// The first file rather than all of them, because the parts of one
+    /// payload are one table written in pieces and share a schema. Nested
+    /// columns are not expanded: a group column is one column here, as it is
+    /// to a reader of the table.
+    columns: Vec<ParquetColumn>,
+}
+
+/// One column of a Parquet schema: its name, and the type it was written as.
+struct ParquetColumn {
+    name: String,
+    /// Parquet's own name for the type, never a translation into a NumPy or
+    /// Arrow spelling -- see `column_type`.
+    kind: String,
 }
 
 /// What a group says about itself in [SpatialData]'s own vocabulary.
@@ -527,9 +582,9 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
 /// Zarr, OME-Zarr or SpatialData metadata -- is written once and never learns
 /// which one it is looking at.
 ///
-/// Three methods, because a walk asks only three questions: what does this
-/// metadata file say, what lies immediately below this node, and is the root
-/// there at all.
+/// Three of the methods are what a walk asks: what does this metadata file
+/// say, what lies immediately below this node, and is the root there at all.
+/// The other two are not about Zarr at all -- see `files` and `read_suffix`.
 ///
 /// Paths are `/`-separated and relative to the store root, with the empty
 /// string for the root itself. Each implementation joins them onto its own
@@ -566,6 +621,34 @@ trait Store {
     /// there, so the listing is reached only when nothing did, which is
     /// exactly when the prefix cannot be an array.
     fn check_root(&self, identified: bool) -> io::Result<()>;
+
+    /// The names of the files directly inside `path`, sorted.
+    ///
+    /// The other half of what `children` deliberately throws away, and the
+    /// only caller is the one thing in this program that is looking for
+    /// something other than a Zarr node: the Parquet parts of a SpatialData
+    /// points element, which are files in a directory the element's metadata
+    /// names but does not list -- see `payload_files`.
+    ///
+    /// Kept separate from `children` rather than folded into it because the
+    /// distinction is the whole point. `children` must never name a chunk
+    /// object, and it never does, because it never looks at files at all.
+    ///
+    /// An `Err` where a listing cannot be made, which on an ordinary static
+    /// HTTP server is always -- see `RemoteStore::diagnose`. The caller takes
+    /// that as "no summary" rather than as a failure of the walk.
+    fn files(&self, path: &str) -> io::Result<Vec<String>>;
+
+    /// The last `len` bytes of the object at `path`, or all of it when it is
+    /// shorter than that. `None` when it is missing or unreadable.
+    ///
+    /// The one method here that reads something other than metadata, and the
+    /// shape of it is the safeguard. Parquet keeps its metadata in a footer at
+    /// the very end of the file, so the end is all anybody needs -- and a
+    /// method that can only ask for the end cannot be talked into fetching a
+    /// four-gigabyte transcripts payload, whoever calls it and however wrong
+    /// they are about the size of what they are reading.
+    fn read_suffix(&self, path: &str, len: u64) -> Option<Vec<u8>>;
 }
 
 /// The path of `name` inside `parent`, in the form `Store` takes.
@@ -691,12 +774,13 @@ fn open_store(target: &str) -> io::Result<Box<dyn Store>> {
 ///
 /// The one place the swap is made, so that everything above it -- the walk,
 /// both renderers, every reader of Zarr, OME-Zarr and SpatialData metadata --
-/// goes on asking the same three questions of the same trait and never learns
+/// goes on asking the same questions of the same trait and never learns
 /// which kind of store answered.
 fn consolidate(store: Box<dyn Store>) -> Box<dyn Store> {
-    match ConsolidatedStore::open(store.as_ref()) {
-        Some(consolidated) => Box::new(consolidated),
-        None => store,
+    match ConsolidatedStore::open(store) {
+        Ok(consolidated) => Box::new(consolidated),
+        // The store back, unchanged. See `ConsolidatedStore::open`.
+        Err(store) => store,
     }
 }
 
@@ -714,13 +798,19 @@ fn consolidate(store: Box<dyn Store>) -> Box<dyn Store> {
 /// are in the document. The same holds for a local directory and for S3, where
 /// it saves a request per node rather than making the walk possible.
 ///
-/// This holds no store. Once the document has been read the index *is* the
-/// store, and the physical one is dropped -- which is the precedence rule made
-/// structural rather than remembered. Consolidated metadata is a snapshot,
-/// taken at one moment and possibly stale since; a tree that mixed it with
-/// live reads would show two moments at once and say which was which nowhere.
-/// The only read that does come off the store is the one that found the
-/// document, and that happens before this exists.
+/// For Zarr metadata this holds no store: once the document has been read the
+/// index *is* the store, and `read`, `children` and `check_root` answer from
+/// it and from nothing else. Consolidated metadata is a snapshot, taken at one
+/// moment and possibly stale since; a tree that mixed it with live reads would
+/// show two moments at once and say which was which nowhere. No fallback, in
+/// either direction: a metadata file the document does not name is missing.
+///
+/// The physical store is kept all the same, for the one thing the document
+/// cannot answer. A SpatialData element's Parquet payload is not Zarr, is not
+/// listed in any consolidated document, and has to be read where it lies --
+/// see `files` and `read_suffix` below. That is the whole of what the store
+/// behind this is used for, and the split is what keeps the snapshot whole
+/// while the payload stays readable.
 struct ConsolidatedStore {
     /// Metadata path to document text, in exactly the form `Store::read`
     /// takes: `.zgroup`, `images/0/.zarray`, `a/b/zarr.json`.
@@ -733,23 +823,40 @@ struct ConsolidatedStore {
     /// Node path to its immediate children, sorted. Derived from the metadata
     /// paths and from nothing else -- see `child_index`.
     children: BTreeMap<String, Vec<String>>,
+    /// The store the document was read off, kept for binary payloads alone.
+    ///
+    /// Nothing about the Zarr hierarchy is ever asked of it again. See the
+    /// type's own note for why that line is drawn where it is.
+    physical: Box<dyn Store>,
 }
 
 impl ConsolidatedStore {
-    /// `store`'s consolidated metadata, if it has any this program reads.
+    /// A store built over `store`'s consolidated metadata, if it has any this
+    /// program reads -- and `store` itself back if it has not.
     ///
     /// The two conventions are tried in the order the two Zarr versions are
-    /// tried everywhere else here. `None` means there was nothing to find, or
-    /// nothing that could be made sense of, and the walk then reads the store
-    /// directly exactly as it did before any of this existed. Consolidation is
-    /// opportunistic: no store that worked without it may come to depend on
-    /// it.
-    fn open(store: &dyn Store) -> Option<ConsolidatedStore> {
-        let documents = consolidated_v2(store).or_else(|| consolidated_v3(store))?;
-        let children = child_index(&documents);
-        Some(ConsolidatedStore {
+    /// tried everywhere else here. An `Err` means there was nothing to find,
+    /// or nothing that could be made sense of, and the walk then reads the
+    /// store directly exactly as it did before any of this existed.
+    /// Consolidation is opportunistic: no store that worked without it may
+    /// come to depend on it.
+    ///
+    /// `Result<_, Box<dyn Store>>` rather than an `Option`, because this takes
+    /// ownership of the store and the caller still needs it when the answer is
+    /// no. Handing it back inside the `Err` is how Rust says "I did not use
+    /// this after all"; an `Option` would have dropped it and left the caller
+    /// with nothing to fall back to.
+    fn open(store: Box<dyn Store>) -> Result<ConsolidatedStore, Box<dyn Store>> {
+        let Some(documents) =
+            consolidated_v2(store.as_ref()).or_else(|| consolidated_v3(store.as_ref()))
+        else {
+            return Err(store);
+        };
+
+        Ok(ConsolidatedStore {
+            children: child_index(&documents),
             documents,
-            children,
+            physical: store,
         })
     }
 }
@@ -774,6 +881,19 @@ impl Store for ConsolidatedStore {
         // the whole check, and it is the one a server without a listing could
         // not otherwise have passed.
         Ok(())
+    }
+
+    fn files(&self, path: &str) -> io::Result<Vec<String>> {
+        // Not Zarr, so not in the document, so asked of the store. On the very
+        // server consolidation exists to rescue this still cannot be answered,
+        // and the caller treats that as "no summary" -- see `payload_files`.
+        self.physical.files(path)
+    }
+
+    fn read_suffix(&self, path: &str, len: u64) -> Option<Vec<u8>> {
+        // Likewise: a Parquet footer is bytes in a file, and no consolidated
+        // document has ever carried one.
+        self.physical.read_suffix(path, len)
     }
 }
 
@@ -1013,6 +1133,34 @@ impl Store for LocalStore {
             )));
         }
         Ok(())
+    }
+
+    fn files(&self, path: &str) -> io::Result<Vec<String>> {
+        let mut names: Vec<String> = Vec::new();
+        for entry in fs::read_dir(self.resolve(path))? {
+            let entry = entry?;
+            // The mirror image of `children`, which keeps the directories.
+            if !entry.file_type()?.is_dir() {
+                names.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    fn read_suffix(&self, path: &str, len: u64) -> Option<Vec<u8>> {
+        let mut file = fs::File::open(self.resolve(path)).ok()?;
+        let size = file.metadata().ok()?.len();
+
+        // Clamped rather than seeking backwards from the end, because seeking
+        // past the start of a file is an error and a short file is the
+        // ordinary case: a landmark payload is three kilobytes.
+        let start = size.saturating_sub(len);
+        file.seek(io::SeekFrom::Start(start)).ok()?;
+
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
+        Some(bytes)
     }
 }
 
@@ -1275,6 +1423,58 @@ impl Store for RemoteStore {
         }
         Ok(())
     }
+
+    fn files(&self, path: &str) -> io::Result<Vec<String>> {
+        let listing = self.list(&self.key(path))?;
+
+        // The objects this time, where `children` takes the common prefixes.
+        // Same request, other half of the answer.
+        let mut names: Vec<String> = listing
+            .objects
+            .iter()
+            .filter_map(|object| object.location.filename())
+            .map(String::from)
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
+    fn read_suffix(&self, path: &str, len: u64) -> Option<Vec<u8>> {
+        let key = self.key(path);
+
+        // The size first, because the range asked for has to be one the object
+        // really has. `object_store` checks the answer against the request and
+        // refuses a reply that does not match, so a range running past the end
+        // of the object is an error rather than a short read -- and a suffix
+        // range, which would have avoided this request, is a thing not every
+        // static server answers.
+        let size = self
+            .runtime
+            .block_on(self.store.head(&key))
+            .ok()
+            .map(|meta| meta.size)?;
+
+        let start = size.saturating_sub(len);
+        let options = GetOptions {
+            range: Some(GetRange::Bounded(start..size)),
+            ..GetOptions::default()
+        };
+
+        let bytes = self.runtime.block_on(async {
+            self.store
+                .get_opts(&key, options)
+                .await
+                .ok()?
+                .bytes()
+                .await
+                .ok()
+        })?;
+
+        // Noted for one error message, and nothing else. See `reachable`.
+        self.reachable.set(true);
+
+        Some(bytes.to_vec())
+    }
 }
 
 /// Whether requests should go out unsigned unless the environment says
@@ -1355,7 +1555,7 @@ fn print_store(
     // An array is a leaf here too: its metadata takes the place of the walk.
     match kind {
         NodeKind::Array(meta) => print_array_meta(out, meta, ""),
-        _ => print_tree(out, store, "", "", &group_rows(kind), depth),
+        _ => print_tree(out, store, "", "", kind, depth),
     }
 }
 
@@ -1366,11 +1566,10 @@ fn print_store(
 /// knows whether these nodes are directories or S3 prefixes. `path` names the
 /// node inside it -- see `Store`.
 ///
-/// `rows` is the node's own metadata, one finished line each, in the order they
-/// should appear. They are printed here rather than by the caller because this
-/// is the one place that already knows whether any children follow them, which
-/// is what decides the last connector. An empty slice means there is nothing to
-/// print above the children.
+/// `kind` is what the node was classified as. Its metadata rows are drawn here
+/// rather than by the caller because this is the one place that already knows
+/// whether any children follow them, which is what decides the last connector.
+/// It also decides which children there are -- see `child_dirs`.
 ///
 /// `out` is where the lines go. It was already returning `io::Result` for the
 /// directory reads; writes now join them, so a closed pipe stops the walk the
@@ -1385,10 +1584,11 @@ fn print_tree(
     store: &dyn Store,
     path: &str,
     prefix: &str,
-    rows: &[String],
+    kind: &NodeKind,
     depth: Option<usize>,
 ) -> io::Result<()> {
-    let children = child_dirs(store, path, depth)?;
+    let rows = group_rows(kind);
+    let children = child_dirs(store, path, kind, depth)?;
 
     // This directory's own metadata, above its children. Metadata rows keep
     // the shorter two-dash stem that tells them apart from node rows.
@@ -1429,7 +1629,7 @@ fn print_tree(
                 store,
                 &child,
                 &child_prefix,
-                &group_rows(&kind),
+                &kind,
                 depth.map(|depth| depth - 1),
             )?,
         }
@@ -1452,12 +1652,34 @@ fn print_tree(
 ///
 /// Both renderers call this, which is what keeps them agreeing about which
 /// children exist and in what order.
-fn child_dirs(store: &dyn Store, path: &str, depth: Option<usize>) -> io::Result<Vec<String>> {
+///
+/// `kind` is here for one case. A SpatialData points element keeps its payload
+/// in a directory beside its metadata, and that directory is not a Zarr node:
+/// listed as a child it would show as `[unknown]`, directly above the rows
+/// that already say what is in it. So it is dropped -- but only from a node
+/// whose own metadata said it is a points element, never from a directory that
+/// merely happens to be called that.
+fn child_dirs(
+    store: &dyn Store,
+    path: &str,
+    kind: &NodeKind,
+    depth: Option<usize>,
+) -> io::Result<Vec<String>> {
     if depth == Some(0) {
         return Ok(Vec::new());
     }
 
-    store.children(path)
+    let mut names = store.children(path)?;
+
+    if let NodeKind::Group(GroupMeta {
+        spatialdata: Some(SpatialData::Points),
+        ..
+    }) = kind
+    {
+        names.retain(|name| name != "points.parquet");
+    }
+
+    Ok(names)
 }
 
 /// Decide what kind of Zarr node sits at `path` by reading the metadata files
@@ -1481,9 +1703,14 @@ fn classify(store: &dyn Store, path: &str) -> NodeKind {
         // of it and know nothing about each other -- but which would otherwise
         // cost a second request for a file already in hand.
         let attrs = read_json(store, &child_path(path, ".zattrs"));
+        let spatialdata = attrs.as_ref().and_then(spatialdata_info_v2);
         return NodeKind::Group(GroupMeta {
             ome: attrs.as_ref().and_then(ome_info_v2),
-            spatialdata: attrs.as_ref().and_then(spatialdata_info_v2),
+            // Read after the attributes and only because of them: what the
+            // metadata said this element is decides whether there is a payload
+            // to look for at all.
+            parquet: parquet_summary(store, path, spatialdata.as_ref()),
+            spatialdata,
         });
     }
 
@@ -1494,23 +1721,32 @@ fn classify(store: &dyn Store, path: &str) -> NodeKind {
     // Zarr V3 uses one filename for both kinds and moves the distinction inside
     // the file, so here we do have to look inside it. Checked second, so a
     // store that carries both V2 and V3 metadata is reported as V2.
-    if let Some(kind) = classify_v3(store, &child_path(path, "zarr.json")) {
+    if let Some(kind) = classify_v3(store, path) {
         return kind;
     }
 
     NodeKind::Unknown
 }
 
-/// Read `node_type` out of a Zarr V3 `zarr.json`, or `None` if the file is
-/// missing, unreadable, not valid JSON, or has no recognisable `node_type`.
+/// Read `node_type` out of the Zarr V3 `zarr.json` of the node at `path`, or
+/// `None` if the file is missing, unreadable, not valid JSON, or has no
+/// recognisable `node_type`.
+///
+/// Takes the node rather than the file, unlike the V2 reads above, because a
+/// SpatialData element's Parquet payload sits beside the node's metadata file
+/// rather than inside it, and finding it means knowing where the node is.
 fn classify_v3(store: &dyn Store, path: &str) -> Option<NodeKind> {
-    let value = read_json(store, path)?;
+    let value = read_json(store, &child_path(path, "zarr.json"))?;
 
     match value.get("node_type")?.as_str()? {
-        "group" => Some(NodeKind::Group(GroupMeta {
-            ome: ome_info_v3(&value),
-            spatialdata: spatialdata_info_v3(&value),
-        })),
+        "group" => {
+            let spatialdata = spatialdata_info_v3(&value);
+            Some(NodeKind::Group(GroupMeta {
+                ome: ome_info_v3(&value),
+                parquet: parquet_summary(store, path, spatialdata.as_ref()),
+                spatialdata,
+            }))
+        }
         "array" => Some(NodeKind::Array(array_meta_v3(&value))),
         _ => None,
     }
@@ -1802,19 +2038,256 @@ fn spatialdata_raster_element(attrs: &Value, ome: Option<&Value>) -> Option<Spat
     }
 }
 
+/// How much of the end of a Parquet file to ask for first.
+///
+/// The footer is a length and a magic word in the last eight bytes, and the
+/// metadata itself sits immediately above them. Reading one generous piece of
+/// the end finds both in a single request nearly always; the fallback for a
+/// schema too large for it is one more read of exactly the right size, and no
+/// more than that -- see `parquet_metadata`.
+///
+/// Sixty-four kilobytes covers every payload SpatialData writes by a wide
+/// margin: the eight-part, gigabyte-and-a-half Xenium transcripts payload has
+/// footers of about three.
+const PARQUET_TAIL: u64 = 64 * 1024;
+
+/// The Parquet payload of a SpatialData points or shapes element, or `None`
+/// when there is nothing to report.
+///
+/// `element` is what the group's own metadata said it is, and it is the whole
+/// of the licence to go looking. Every other kind of node -- an ordinary Zarr
+/// group, a SpatialData image, a store root -- returns here at once, which is
+/// what keeps this from wandering into files it was never told about. A
+/// `.parquet` file sitting somewhere else in a store is not a payload and is
+/// not read: this program never infers meaning from a name.
+///
+/// `None` covers every way a payload can fail to be summarised, and they are
+/// all ordinary. The parts cannot be listed, because the server has no listing
+/// to give. A file is missing, or is not Parquet, or has an encrypted footer.
+/// Any of those and the element still prints exactly as it did before this
+/// existed -- a graceful degradation, not an error, because the Zarr metadata
+/// that made this an element was read successfully and is what the tree is
+/// really showing.
+fn parquet_summary(
+    store: &dyn Store,
+    path: &str,
+    element: Option<&SpatialData>,
+) -> Option<ParquetSummary> {
+    let files = payload_files(store, path, element?)?;
+
+    let mut rows = 0i64;
+    let mut columns = Vec::new();
+
+    for (index, file) in files.iter().enumerate() {
+        let metadata = parquet_metadata(store, file)?;
+        let file_metadata = metadata.file_metadata();
+
+        rows += file_metadata.num_rows();
+        // The schema comes off the first part. The parts of one payload are
+        // one table written in pieces, so the later ones have nothing to add.
+        if index == 0 {
+            columns = schema_columns(file_metadata.schema());
+        }
+    }
+
+    Some(ParquetSummary {
+        rows,
+        files: files.len(),
+        columns,
+    })
+}
+
+/// Where a SpatialData element keeps its Parquet payload, in the order the
+/// files should be read.
+///
+/// The two element kinds do not agree about this, and the difference is not
+/// cosmetic. A shapes element is a GeoDataFrame written by geopandas in one
+/// go, so `shapes.parquet` is a file. A points element is a dask DataFrame
+/// written a partition at a time, so `points.parquet` is a *directory* of
+/// `part.0.parquet`, `part.1.parquet` and so on -- one file where the frame
+/// had one partition, eight where the Xenium transcripts have eight.
+///
+/// Neither path is declared anywhere in the element's metadata; both are
+/// conventions of SpatialData's writer, and are hard-coded here for that
+/// reason. That is not an inference from a directory name: the element said
+/// what it is, and this is where that kind of element keeps its payload.
+///
+/// A points payload therefore needs a file listing, and a shapes payload does
+/// not. On a plain static HTTP server, which can answer a `GET` but no kind of
+/// listing at all, that is the difference between a shapes element that
+/// summarises and a points element that quietly does not.
+fn payload_files(store: &dyn Store, path: &str, element: &SpatialData) -> Option<Vec<String>> {
+    match element {
+        SpatialData::Shapes => Some(vec![child_path(path, "shapes.parquet")]),
+        SpatialData::Points => {
+            let directory = child_path(path, "points.parquet");
+            let mut names = store.files(&directory).ok()?;
+
+            // dask writes only the parts unless it is asked for a metadata
+            // file as well, but it can be asked, and `_metadata` is not a part
+            // and has no rows to count.
+            names.retain(|name| name.ends_with(".parquet"));
+            if names.is_empty() {
+                return None;
+            }
+
+            // Already sorted by `files`, which is lexicographic and so orders
+            // ten parts `part.0, part.1, part.10, part.2`. Nothing here cares:
+            // the rows are summed and the schema is one schema.
+            Some(
+                names
+                    .iter()
+                    .map(|name| child_path(&directory, name))
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Read one Parquet file's footer metadata, and nothing else.
+///
+/// Parquet puts its metadata at the *end* of the file: a thrift-encoded block,
+/// then that block's length, then `PAR1`. So the end is read first -- one
+/// piece large enough to hold both the eight-byte tail and, nearly always, the
+/// block above it. A schema too large for that costs one more read, of exactly
+/// the length the tail just named.
+///
+/// Two reads at worst, of a few kilobytes each, whether the file is three
+/// kilobytes or two gigabytes. No row group, no page, no column chunk and no
+/// value is touched: `decode_metadata` is handed the footer bytes and stops
+/// there.
+fn parquet_metadata(store: &dyn Store, path: &str) -> Option<ParquetMetaData> {
+    let tail = store.read_suffix(path, PARQUET_TAIL)?;
+    let footer: &[u8] = tail.get(tail.len().checked_sub(8)?..)?;
+
+    // Rejects a file that does not end in `PAR1`, and says so for one that
+    // ends in `PARE` -- an encrypted footer, which `decode_metadata` would
+    // refuse anyway and which this program has no key for.
+    let length = FooterTail::try_from(footer).ok()?.metadata_length();
+
+    // The block sits immediately above the eight bytes just read.
+    let wanted = length.checked_add(8)?;
+    let bytes = if tail.len() >= wanted {
+        tail[tail.len() - wanted..tail.len() - 8].to_vec()
+    } else {
+        let tail = store.read_suffix(path, wanted as u64)?;
+        tail.get(tail.len().checked_sub(wanted)?..tail.len() - 8)?
+            .to_vec()
+    };
+
+    ParquetMetaDataReader::decode_metadata(&bytes).ok()
+}
+
+/// The top-level columns of a Parquet schema, in declaration order.
+///
+/// The root of a Parquet schema is a group whose fields are the columns a
+/// reader of the table sees. Its *leaves* are something else: a nested column
+/// counts once here and several times there, and it is the reader's count that
+/// belongs beside a row count.
+fn schema_columns(schema: &SchemaType) -> Vec<ParquetColumn> {
+    schema
+        .get_fields()
+        .iter()
+        .map(|field| ParquetColumn {
+            name: String::from(field.name()),
+            kind: column_type(field),
+        })
+        .collect()
+}
+
+/// What a column was written as, in Parquet's own vocabulary.
+///
+/// Parquet describes a column twice: a physical type, which is how the bytes
+/// are laid down, and an optional logical type, which is what they mean. The
+/// logical one is the answer where there is one -- a `feature_name` is a
+/// `string`, not a `byte_array` -- and the physical one otherwise.
+///
+/// Reported, not translated. These are the spellings the file itself uses, and
+/// no attempt is made to render them as the NumPy or Arrow names some other
+/// tool would show, for the same reason a Zarr `dtype` is printed as stored.
+fn column_type(field: &SchemaType) -> String {
+    let logical = match field.get_basic_info().logical_type_ref() {
+        Some(LogicalType::String) => Some(String::from("string")),
+        Some(LogicalType::Enum) => Some(String::from("enum")),
+        Some(LogicalType::Uuid) => Some(String::from("uuid")),
+        Some(LogicalType::Json) => Some(String::from("json")),
+        Some(LogicalType::Bson) => Some(String::from("bson")),
+        Some(LogicalType::Date) => Some(String::from("date")),
+        Some(LogicalType::Time(_)) => Some(String::from("time")),
+        Some(LogicalType::Timestamp(_)) => Some(String::from("timestamp")),
+        Some(LogicalType::Float16) => Some(String::from("float16")),
+        Some(LogicalType::Map) => Some(String::from("map")),
+        Some(LogicalType::List) => Some(String::from("list")),
+        Some(LogicalType::Integer(int)) => Some(format!(
+            "{}int{}",
+            if int.is_signed { "" } else { "u" },
+            int.bit_width
+        )),
+        Some(LogicalType::Decimal(decimal)) => {
+            Some(format!("decimal({}, {})", decimal.precision, decimal.scale))
+        }
+        // Every other logical type, including whatever a future version of the
+        // format adds, falls through to the physical one. That is always true
+        // and never misleading, which is the right way to be wrong here.
+        _ => None,
+    };
+
+    logical.unwrap_or_else(|| match field.is_primitive() {
+        // `BYTE_ARRAY`, `DOUBLE`, `INT64`. Lowercased only because that is how
+        // every other value this program prints looks.
+        true => field.get_physical_type().to_string().to_lowercase(),
+        // A nested column with no logical type of its own. There is no
+        // physical type to give: the bytes are in the leaves below.
+        false => String::from("group"),
+    })
+}
+
+/// A count with its thousands separated, so that a row count can be read.
+///
+/// The one number this program prints that has no bound on it. A store's
+/// shapes and its pyramid levels are counted in tens; a transcripts payload is
+/// counted in millions, and `4825319` is not a number anybody reads.
+fn grouped(count: i64) -> String {
+    let digits = count.abs().to_string();
+    let mut text = String::new();
+
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            text.push(',');
+        }
+        text.push(digit);
+    }
+
+    match count < 0 {
+        true => format!("-{text}"),
+        false => text,
+    }
+}
+
 /// The metadata rows to print underneath a node's own line, in display order.
 ///
-/// Everything but an OME-Zarr image group has nothing to say here and gets an
-/// empty list. Returning one list rather than one argument per row keeps
-/// `print_tree` from growing a parameter every time a row is added: all it
-/// needs to know is how many rows there are and what each one says.
+/// A group with neither OME-Zarr metadata nor a Parquet payload has nothing to
+/// say here and gets an empty list. Returning one list rather than one
+/// argument per row keeps `print_tree` from growing a parameter every time a
+/// row is added: all it needs to know is how many rows there are and what each
+/// one says.
 fn group_rows(kind: &NodeKind) -> Vec<String> {
     // `let ... else` matches one pattern and takes an early exit when it does
     // not fit, which reads better here than a `match` whose other arm is just
     // an empty list.
-    // The `..` says the rest of GroupMeta is not needed here: no SpatialData
-    // marker adds a row below its own line in this version.
-    let NodeKind::Group(GroupMeta { ome: Some(ome), .. }) = kind else {
+    let NodeKind::Group(meta) = kind else {
+        return Vec::new();
+    };
+
+    let mut rows = ome_rows(meta.ome.as_ref());
+    rows.extend(parquet_rows(meta.parquet.as_ref()));
+    rows
+}
+
+/// The rows an OME-Zarr group adds beneath its own line.
+fn ome_rows(ome: Option<&OmeInfo>) -> Vec<String> {
+    let Some(ome) = ome else {
         return Vec::new();
     };
 
@@ -1847,6 +2320,48 @@ fn group_rows(kind: &NodeKind) -> Vec<String> {
             rows.push(format!("wells: {count}"));
         }
     }
+    rows
+}
+
+/// The rows a SpatialData points or shapes element adds beneath its own line,
+/// once its Parquet payload has been read.
+///
+/// Four facts, all four of them read from footers: how many rows the payload
+/// holds, how many columns wide it is, how many files it is written across,
+/// and what those columns are called and typed.
+///
+/// The schema row is capped. A points payload has a handful of columns and
+/// prints whole; a table written with three hundred would run off the side of
+/// any terminal, so past a dozen the rest are counted rather than named. The
+/// `--json` output carries every column either way, which is where a reader
+/// who wants them all should look.
+fn parquet_rows(parquet: Option<&ParquetSummary>) -> Vec<String> {
+    let Some(parquet) = parquet else {
+        return Vec::new();
+    };
+
+    let mut rows = vec![
+        format!("rows: {}", grouped(parquet.rows)),
+        format!("columns: {}", parquet.columns.len()),
+        format!("parquet files: {}", parquet.files),
+    ];
+
+    const SHOWN: usize = 12;
+    if !parquet.columns.is_empty() {
+        let mut schema: Vec<String> = parquet
+            .columns
+            .iter()
+            .take(SHOWN)
+            .map(|column| format!("{}:{}", column.name, column.kind))
+            .collect();
+
+        if let Some(rest) = parquet.columns.len().checked_sub(SHOWN).filter(|n| *n > 0) {
+            schema.push(format!("... ({rest} more)"));
+        }
+
+        rows.push(format!("schema: {}", schema.join(", ")));
+    }
+
     rows
 }
 
@@ -2103,6 +2618,9 @@ fn json_tree(
                     "version": spatialdata.version(),
                 });
             }
+            if let Some(parquet) = &meta.parquet {
+                node["parquet"] = json_parquet(parquet);
+            }
         }
         NodeKind::Unknown => {}
     }
@@ -2112,7 +2630,7 @@ fn json_tree(
     // absent, so a reader can walk every node the same way.
     let mut children = Vec::new();
     if !matches!(kind, NodeKind::Array(_)) {
-        for name in child_dirs(store, path, depth)? {
+        for name in child_dirs(store, path, &kind, depth)? {
             let child = child_path(path, &name);
             // Classified here rather than inside the call, so that the root --
             // which `run` had to classify before it could check the store --
@@ -2155,6 +2673,31 @@ fn json_array_meta(meta: &ArrayMeta) -> Value {
     }
 
     value
+}
+
+/// A SpatialData element's Parquet payload, as the footers gave it.
+///
+/// A section of its own beside `spatialdata` rather than a field inside it,
+/// because it is a different kind of fact: `spatialdata` is what a Zarr
+/// metadata file said, and this is what a Parquet file said. A node has this
+/// key only when there was a payload and it could be read, which is the same
+/// rule `ome` and `array` follow.
+///
+/// `columns` is the count and `schema` the columns themselves, so a reader
+/// wanting only the width need not measure the list. The schema is whole here
+/// however long it is: the tree caps it because a terminal is only so wide,
+/// and nothing about JSON is.
+fn json_parquet(parquet: &ParquetSummary) -> Value {
+    json!({
+        "rows": parquet.rows,
+        "columns": parquet.columns.len(),
+        "files": parquet.files,
+        "schema": parquet
+            .columns
+            .iter()
+            .map(|column| json!({ "name": column.name, "type": column.kind }))
+            .collect::<Vec<Value>>(),
+    })
 }
 
 /// An OME-Zarr image group's metadata.
@@ -2205,10 +2748,14 @@ mod tests {
     // scope so we can call them unqualified.
     use super::*;
     use object_store::PutPayload;
+    use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, Int32Type, Int64Type};
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::parser::parse_message_type;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
-    use std::io::Read;
     use std::net::{TcpListener, TcpStream};
+    use std::ops::Range;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -2811,42 +3358,65 @@ mod tests {
 
     /// A minimal HTTP server, on a thread of its own.
     ///
-    /// It answers the three things zarr-tree ever asks of a server and nothing
-    /// else: `GET` and `HEAD` for metadata, and -- when `webdav` is set --
-    /// WebDAV `PROPFIND` with `Depth: 1` for children. With `webdav` off it
-    /// refuses `PROPFIND` the way an ordinary static file server does, which
-    /// is the whole reason it is worth having one.
+    /// It answers the four things zarr-tree ever asks of a server and nothing
+    /// else: `GET` and `HEAD`, `GET` with a `Range` for a Parquet footer, and
+    /// -- when `webdav` is set -- WebDAV `PROPFIND` with `Depth: 1` for
+    /// children. With `webdav` off it refuses `PROPFIND` the way an ordinary
+    /// static file server does, which is the whole reason it is worth having
+    /// one.
     ///
     /// One request per connection, no keep-alive, no concurrency. Enough to
-    /// prove the URL mapping and the listing behaviour against the real
-    /// `object_store` HTTP client; not a web server.
+    /// prove the URL mapping, the listing behaviour and the range reads
+    /// against the real `object_store` HTTP client; not a web server.
     struct TestServer {
         /// The URL of the store root, as a person would type it.
         url: String,
         /// Every request path the server has seen, in order. What proves a
         /// chunk was never asked for is its absence from here.
         requests: Arc<Mutex<Vec<String>>>,
+        /// How many bytes of body the server has actually sent, per path.
+        /// What proves a Parquet file was never downloaded whole is this
+        /// number set beside the file's own length.
+        served: Arc<Mutex<BTreeMap<String, usize>>>,
     }
 
     impl TestServer {
         fn start(root: &str, objects: &[(&str, &str)], webdav: bool) -> TestServer {
+            TestServer::serving(root, objects, &[], webdav)
+        }
+
+        /// The same, with binary objects alongside the textual metadata. Only
+        /// the Parquet tests need those, and only they pay for the parameter.
+        fn serving(
+            root: &str,
+            objects: &[(&str, &str)],
+            binary: &[(&str, Vec<u8>)],
+            webdav: bool,
+        ) -> TestServer {
             // Port 0 asks the operating system for a free one, so tests running
             // side by side cannot collide.
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
 
-            let files: BTreeMap<String, String> = objects
+            let mut files: BTreeMap<String, Vec<u8>> = objects
                 .iter()
-                .map(|(key, body)| (child_path(root, key), String::from(*body)))
+                .map(|(key, body)| (child_path(root, key), body.as_bytes().to_vec()))
                 .collect();
+            files.extend(
+                binary
+                    .iter()
+                    .map(|(key, body)| (child_path(root, key), body.clone())),
+            );
 
             let requests = Arc::new(Mutex::new(Vec::new()));
+            let served: Arc<Mutex<BTreeMap<String, usize>>> = Arc::new(Mutex::new(BTreeMap::new()));
             let log = Arc::clone(&requests);
+            let sent = Arc::clone(&served);
 
             thread::spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { continue };
-                    let Some((method, target)) = read_request(&mut stream) else {
+                    let Some((method, target, range)) = read_request(&mut stream) else {
                         continue;
                     };
                     log.lock().unwrap().push(target.clone());
@@ -2857,17 +3427,30 @@ mod tests {
 
                     let response = match method.as_str() {
                         "GET" | "HEAD" => match files.get(key) {
-                            Some(body) => http_response("200 OK", body, method == "HEAD"),
-                            None => http_response("404 Not Found", "", method == "HEAD"),
+                            Some(body) => {
+                                let head_only = method == "HEAD";
+                                if !head_only {
+                                    let length = match &range {
+                                        Some(range) => range.end - range.start,
+                                        None => body.len(),
+                                    };
+                                    *sent.lock().unwrap().entry(String::from(key)).or_default() +=
+                                        length;
+                                }
+                                body_response(body, range.clone(), head_only)
+                            }
+                            None => {
+                                http_response("404 Not Found", "", method == "HEAD").into_bytes()
+                            }
                         },
-                        "PROPFIND" if webdav => propfind(&files, key),
+                        "PROPFIND" if webdav => propfind(&files, key).into_bytes(),
                         // What a static server says. `object_store` hands this
                         // back as a generic failure, which is what
                         // `RemoteStore::diagnose` has to make sense of.
-                        _ => http_response("405 Method Not Allowed", "", false),
+                        _ => http_response("405 Method Not Allowed", "", false).into_bytes(),
                     };
 
-                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.write_all(&response);
                     let _ = stream.flush();
                 }
             });
@@ -2875,11 +3458,22 @@ mod tests {
             TestServer {
                 url: format!("http://127.0.0.1:{port}/{root}"),
                 requests,
+                served,
             }
         }
 
         fn requests(&self) -> Vec<String> {
             self.requests.lock().unwrap().clone()
+        }
+
+        /// How many bytes of `path`'s body the server has sent altogether.
+        fn served(&self, path: &str) -> usize {
+            self.served
+                .lock()
+                .unwrap()
+                .get(path)
+                .copied()
+                .unwrap_or_default()
         }
 
         /// The store this server's root URL opens, through the same
@@ -2889,23 +3483,40 @@ mod tests {
         }
     }
 
-    /// The method and target of one request, or `None` if the connection died.
-    fn read_request(stream: &mut TcpStream) -> Option<(String, String)> {
+    /// The method, target and requested byte range of one request, or `None`
+    /// if the connection died.
+    fn read_request(stream: &mut TcpStream) -> Option<(String, String, Option<Range<usize>>)> {
         let mut head = Vec::new();
         let mut byte = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") {
-            if stream.read(&mut byte).ok()? == 0 {
+            if std::io::Read::read(stream, &mut byte).ok()? == 0 {
                 return None;
             }
             head.push(byte[0]);
         }
 
         // "PROPFIND /data/store.zarr HTTP/1.1" -- the first two words are all
-        // that is needed. `Depth` is not read: `list_with_delimiter` is the
-        // only caller and it always asks for 1.
+        // that is needed there. `Depth` is not read: `list_with_delimiter` is
+        // the only caller and it always asks for 1.
         let text = String::from_utf8_lossy(&head).into_owned();
         let mut words = text.split_whitespace();
-        Some((String::from(words.next()?), String::from(words.next()?)))
+        let method = String::from(words.next()?);
+        let target = String::from(words.next()?);
+
+        Some((method, target, requested_range(&text)))
+    }
+
+    /// The byte range a request asked for, if it asked for one.
+    ///
+    /// Only the `bytes=first-last` form, because that is the only form
+    /// `RemoteStore::read_suffix` ever sends: it asks for the size first and
+    /// then names both ends.
+    fn requested_range(head: &str) -> Option<Range<usize>> {
+        let line = head
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("range:"))?;
+        let (first, last) = line.split_once('=')?.1.trim().split_once('-')?;
+        Some(first.parse().ok()?..last.parse::<usize>().ok()? + 1)
     }
 
     fn http_response(status: &str, body: &str, head_only: bool) -> String {
@@ -2920,13 +3531,52 @@ mod tests {
         }
     }
 
+    /// A body, whole or in part.
+    ///
+    /// A range turns this into the `206 Partial Content` with a
+    /// `Content-Range` that `object_store` insists on: it refuses a plain
+    /// `200` in answer to a range request, and checks the range it is given
+    /// against the one it asked for.
+    fn body_response(body: &[u8], range: Option<Range<usize>>, head_only: bool) -> Vec<u8> {
+        let (status, extra, slice) = match &range {
+            Some(range) => {
+                let end = range.end.min(body.len());
+                let start = range.start.min(end);
+                (
+                    "206 Partial Content",
+                    format!(
+                        "Content-Range: bytes {start}-{}/{}\r\n",
+                        end.saturating_sub(1),
+                        body.len()
+                    ),
+                    &body[start..end],
+                )
+            }
+            None => ("200 OK", String::new(), body),
+        };
+
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\n\
+             Accept-Ranges: bytes\r\n\
+             Last-Modified: Thu, 01 Jan 1970 00:00:00 GMT\r\n\
+             {extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            slice.len()
+        )
+        .into_bytes();
+
+        if !head_only {
+            response.extend_from_slice(slice);
+        }
+        response
+    }
+
     /// A WebDAV `Depth: 1` answer: the collection itself, then one entry per
     /// immediate child.
     ///
     /// `object_store` drops the collection itself by path length and turns the
     /// rest into common prefixes and objects, so what this has to get right is
     /// the shape, not the filtering.
-    fn propfind(files: &BTreeMap<String, String>, prefix: &str) -> String {
+    fn propfind(files: &BTreeMap<String, Vec<u8>>, prefix: &str) -> String {
         let inside = format!("{prefix}/");
         if !files.keys().any(|key| key.starts_with(&inside)) {
             // No such collection. A WebDAV server answers 404, and
@@ -2940,7 +3590,7 @@ mod tests {
         body.push_str(&dav_entry(&format!("/{inside}"), None));
 
         let mut seen: BTreeSet<&str> = BTreeSet::new();
-        for (key, text) in files {
+        for (key, content) in files {
             let Some(rest) = key.strip_prefix(&inside) else {
                 continue;
             };
@@ -2951,7 +3601,7 @@ mod tests {
                         body.push_str(&dav_entry(&format!("/{inside}{directory}/"), None));
                     }
                 }
-                None => body.push_str(&dav_entry(&format!("/{inside}{rest}"), Some(text.len()))),
+                None => body.push_str(&dav_entry(&format!("/{inside}{rest}"), Some(content.len()))),
             }
         }
 
@@ -3704,6 +4354,7 @@ mod tests {
             group_rows(&NodeKind::Group(GroupMeta {
                 ome: Some(info),
                 spatialdata: None,
+                parquet: None,
             })),
             vec!["rows: 2", "columns: 3", "wells: 3"]
         );
@@ -3726,6 +4377,7 @@ mod tests {
             group_rows(&NodeKind::Group(GroupMeta {
                 ome: Some(info),
                 spatialdata: None,
+                parquet: None,
             }))
             .is_empty()
         );
@@ -3754,6 +4406,7 @@ mod tests {
             group_rows(&NodeKind::Group(GroupMeta {
                 ome: Some(info),
                 spatialdata: None,
+                parquet: None,
             }))
             .is_empty()
         );
@@ -3784,6 +4437,7 @@ mod tests {
             group_rows(&NodeKind::Group(GroupMeta {
                 ome: Some(info),
                 spatialdata: None,
+                parquet: None,
             })),
             vec!["rows: 1", "columns: 1"]
         );
@@ -4695,5 +5349,605 @@ mod tests {
         let tree = rendered(store.as_ref(), "store.zarr", None);
         assert!(tree.contains("── A [unknown]"), "{tree}");
         assert!(tree.contains("── B [array]"), "{tree}");
+    }
+
+    /// One column of a Parquet fixture: what the schema says it is, and what
+    /// gets written into it.
+    ///
+    /// The fixtures are written by the same crate that reads them back, which
+    /// is the point: these tests run against real Parquet bytes with a real
+    /// footer, not against a stub standing in for one.
+    enum Column {
+        Double(&'static str),
+        Int32(&'static str),
+        Int64(&'static str),
+        /// A `BYTE_ARRAY` annotated `STRING`, which is what a logical type
+        /// looks like in a file and what `column_type` has to prefer.
+        Text(&'static str),
+        /// A `BYTE_ARRAY` with no annotation -- a geopandas geometry column.
+        Binary(&'static str),
+    }
+
+    impl Column {
+        fn declaration(&self) -> String {
+            match self {
+                Column::Double(name) => format!("required double {name};"),
+                Column::Int32(name) => format!("required int32 {name};"),
+                Column::Int64(name) => format!("required int64 {name};"),
+                Column::Text(name) => format!("required byte_array {name} (STRING);"),
+                Column::Binary(name) => format!("required byte_array {name};"),
+            }
+        }
+    }
+
+    /// One column's worth of values, one per row.
+    fn values<T>(rows: usize, of: impl Fn(usize) -> T) -> Vec<T> {
+        (0..rows).map(of).collect()
+    }
+
+    /// A real Parquet file of `rows` rows, as bytes.
+    fn parquet_file(columns: &[Column], rows: usize) -> Vec<u8> {
+        let message = format!(
+            "message fixture {{ {} }}",
+            columns
+                .iter()
+                .map(Column::declaration)
+                .collect::<Vec<String>>()
+                .join(" ")
+        );
+
+        let schema = std::sync::Arc::new(parse_message_type(&message).unwrap());
+        let properties = std::sync::Arc::new(WriterProperties::builder().build());
+
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut writer = SerializedFileWriter::new(&mut bytes, schema, properties).unwrap();
+        let mut group = writer.next_row_group().unwrap();
+
+        // `next_column` walks the schema in declaration order, so the counter
+        // and the column list stay in step.
+        let mut index = 0;
+        while let Some(mut column) = group.next_column().unwrap() {
+            // Every value distinct, so that a big fixture really is big:
+            // Parquet would encode a column of one repeated value down to
+            // almost nothing, and a test about how little of a large file gets
+            // read needs a large file.
+            match columns[index] {
+                Column::Double(_) => column
+                    .typed::<DoubleType>()
+                    .write_batch(&values(rows, |row| row as f64 * 1.5), None, None)
+                    .map(|_| ()),
+                Column::Int32(_) => column
+                    .typed::<Int32Type>()
+                    .write_batch(&values(rows, |row| row as i32), None, None)
+                    .map(|_| ()),
+                Column::Int64(_) => column
+                    .typed::<Int64Type>()
+                    .write_batch(&values(rows, |row| row as i64), None, None)
+                    .map(|_| ()),
+                Column::Text(_) | Column::Binary(_) => column
+                    .typed::<ByteArrayType>()
+                    .write_batch(
+                        &values(rows, |row| ByteArray::from(format!("value-{row}").as_str())),
+                        None,
+                        None,
+                    )
+                    .map(|_| ()),
+            }
+            .unwrap();
+
+            column.close().unwrap();
+            index += 1;
+        }
+
+        group.close().unwrap();
+        writer.close().unwrap();
+        bytes
+    }
+
+    /// The Zarr V3 metadata of a SpatialData element of one kind.
+    fn element_metadata(encoding: &str) -> String {
+        json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": { "encoding-type": encoding },
+        })
+        .to_string()
+    }
+
+    /// A `LocalStore` that remembers what it was asked for.
+    ///
+    /// Wrapped rather than replaced, so what is under test is the real store
+    /// reading real files -- this only counts. Every method forwards; two of
+    /// them keep a note first.
+    struct CountingStore {
+        inner: LocalStore,
+        /// Bytes handed back by `read_suffix`, summed.
+        suffix_bytes: Cell<u64>,
+        /// Every path `read` was asked for. A Parquet file appearing here
+        /// would mean somebody had pulled the whole thing into memory as text.
+        reads: Mutex<Vec<String>>,
+    }
+
+    impl CountingStore {
+        fn new(root: &Path) -> CountingStore {
+            CountingStore {
+                inner: LocalStore::new(&root.to_string_lossy()),
+                suffix_bytes: Cell::new(0),
+                reads: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Store for CountingStore {
+        fn read(&self, path: &str) -> Option<String> {
+            self.reads.lock().unwrap().push(String::from(path));
+            self.inner.read(path)
+        }
+
+        fn children(&self, path: &str) -> io::Result<Vec<String>> {
+            self.inner.children(path)
+        }
+
+        fn check_root(&self, identified: bool) -> io::Result<()> {
+            self.inner.check_root(identified)
+        }
+
+        fn files(&self, path: &str) -> io::Result<Vec<String>> {
+            self.inner.files(path)
+        }
+
+        fn read_suffix(&self, path: &str, len: u64) -> Option<Vec<u8>> {
+            let bytes = self.inner.read_suffix(path, len)?;
+            self.suffix_bytes
+                .set(self.suffix_bytes.get() + bytes.len() as u64);
+            Some(bytes)
+        }
+    }
+
+    /// Write one file of bytes into a fixture directory, making the
+    /// directories above it.
+    fn write_bytes(dir: &Path, path: &str, bytes: &[u8]) {
+        let path = dir.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn a_parquet_footer_yields_the_rows_columns_and_schema_the_file_declares() {
+        let dir = fixture("parquet-footer");
+        let columns = [
+            Column::Double("x"),
+            Column::Double("y"),
+            Column::Text("feature_name"),
+            Column::Int64("cell_id"),
+        ];
+        write_bytes(&dir, "shapes.parquet", &parquet_file(&columns, 1234));
+
+        let store = LocalStore::new(&dir.to_string_lossy());
+        let metadata = parquet_metadata(&store, "shapes.parquet").unwrap();
+
+        assert_eq!(metadata.file_metadata().num_rows(), 1234);
+
+        let read = schema_columns(metadata.file_metadata().schema());
+        let shown: Vec<String> = read
+            .iter()
+            .map(|column| format!("{}:{}", column.name, column.kind))
+            .collect();
+
+        // A `STRING` annotation is reported as `string`, and a `BYTE_ARRAY`
+        // without one as `byte_array`: the file's own vocabulary either way.
+        assert_eq!(
+            shown,
+            vec![
+                "x:double",
+                "y:double",
+                "feature_name:string",
+                "cell_id:int64"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_points_payload_is_a_directory_of_parts_whose_rows_are_summed() {
+        let dir = fixture("parquet-points");
+        let columns = [
+            Column::Double("x"),
+            Column::Double("y"),
+            Column::Text("gene"),
+        ];
+
+        write_fixture(
+            &dir,
+            &[
+                (
+                    "zarr.json",
+                    &json!({ "zarr_format": 3, "node_type": "group", "attributes": {} })
+                        .to_string(),
+                ),
+                ("transcripts/zarr.json", &element_metadata("ngff:points")),
+            ],
+        );
+
+        // dask writes one file per partition, named `part.N.parquet`. Three
+        // partitions of different lengths, so a sum is the only way to arrive
+        // at the total.
+        for (part, rows) in [(0, 100), (1, 250), (2, 7)] {
+            write_bytes(
+                &dir,
+                &format!("transcripts/points.parquet/part.{part}.parquet"),
+                &parquet_file(&columns, rows),
+            );
+        }
+
+        let store = LocalStore::new(&dir.to_string_lossy());
+        let tree = rendered(&store, "store.zarr", None);
+
+        assert!(
+            tree.contains("transcripts [group, SpatialData points]"),
+            "{tree}"
+        );
+        assert!(tree.contains("rows: 357"), "{tree}");
+        assert!(tree.contains("columns: 3"), "{tree}");
+        assert!(tree.contains("parquet files: 3"), "{tree}");
+        assert!(
+            tree.contains("schema: x:double, y:double, gene:string"),
+            "{tree}"
+        );
+    }
+
+    #[test]
+    fn a_shapes_payload_is_one_file_beside_the_element() {
+        let dir = fixture("parquet-shapes");
+
+        write_fixture(
+            &dir,
+            &[
+                (
+                    "zarr.json",
+                    &json!({ "zarr_format": 3, "node_type": "group", "attributes": {} })
+                        .to_string(),
+                ),
+                (
+                    "cell_boundaries/zarr.json",
+                    &element_metadata("ngff:shapes"),
+                ),
+            ],
+        );
+
+        // geopandas writes a GeoDataFrame in one go, so this is a file rather
+        // than a directory -- the difference the two element kinds turn on.
+        write_bytes(
+            &dir,
+            "cell_boundaries/shapes.parquet",
+            &parquet_file(
+                &[Column::Binary("geometry"), Column::Int32("cell_id")],
+                167780,
+            ),
+        );
+
+        let store = LocalStore::new(&dir.to_string_lossy());
+        let tree = rendered(&store, "store.zarr", None);
+
+        assert!(
+            tree.contains("cell_boundaries [group, SpatialData shapes]"),
+            "{tree}"
+        );
+        assert!(tree.contains("rows: 167,780"), "{tree}");
+        assert!(tree.contains("parquet files: 1"), "{tree}");
+        assert!(
+            tree.contains("schema: geometry:byte_array, cell_id:int32"),
+            "{tree}"
+        );
+    }
+
+    #[test]
+    fn only_the_footer_of_a_parquet_file_is_ever_read() {
+        let dir = fixture("parquet-footer-only");
+
+        write_fixture(
+            &dir,
+            &[
+                (
+                    "zarr.json",
+                    &json!({ "zarr_format": 3, "node_type": "group", "attributes": {} })
+                        .to_string(),
+                ),
+                ("cells/zarr.json", &element_metadata("ngff:shapes")),
+            ],
+        );
+
+        // Big enough that reading it whole would show up plainly in the count
+        // below, and small enough to write in a test.
+        let payload = parquet_file(
+            &[Column::Binary("geometry"), Column::Double("radius")],
+            200_000,
+        );
+        let size = payload.len() as u64;
+        assert!(size > 4 * PARQUET_TAIL, "the fixture has to dwarf a footer");
+        write_bytes(&dir, "cells/shapes.parquet", &payload);
+
+        let store = CountingStore::new(&dir);
+        let tree = rendered(&store, "store.zarr", None);
+        assert!(tree.contains("rows: 200,000"), "{tree}");
+
+        // One read of the end of the file, and nothing else. Not a fraction of
+        // the file: a fixed ceiling, whatever the file's size.
+        assert!(
+            store.suffix_bytes.get() <= PARQUET_TAIL,
+            "read {} bytes of a {size}-byte file",
+            store.suffix_bytes.get()
+        );
+
+        // And nothing pulled it in as metadata by the back door.
+        let reads = store.reads.lock().unwrap();
+        assert!(
+            !reads.iter().any(|path| path.ends_with(".parquet")),
+            "{reads:?}"
+        );
+    }
+
+    #[test]
+    fn a_remote_parquet_footer_is_fetched_as_a_byte_range() {
+        let payload = parquet_file(
+            &[Column::Binary("geometry"), Column::Int32("cell_id")],
+            120_000,
+        );
+        let size = payload.len();
+
+        let root = json!({ "zarr_format": 3, "node_type": "group", "attributes": {} }).to_string();
+        let element = element_metadata("ngff:shapes");
+
+        let server = TestServer::serving(
+            "data/store.zarr",
+            &[
+                ("zarr.json", root.as_str()),
+                ("cells/zarr.json", element.as_str()),
+            ],
+            &[("cells/shapes.parquet", payload)],
+            true,
+        );
+
+        let store = server.open();
+        let tree = rendered(store.as_ref(), "store.zarr", None);
+        assert!(tree.contains("rows: 120,000"), "{tree}");
+
+        // The whole point: the server sent a footer, not a file.
+        let sent = server.served("data/store.zarr/cells/shapes.parquet");
+        assert!(sent > 0, "nothing was fetched at all");
+        assert!(
+            sent as u64 <= PARQUET_TAIL,
+            "the server sent {sent} bytes of a {size}-byte file"
+        );
+    }
+
+    #[test]
+    fn an_element_whose_payload_cannot_be_read_prints_as_it_always_did() {
+        let dir = fixture("parquet-missing");
+
+        // Both elements declared, neither with a payload beside it: a store
+        // written by a tool that keeps its frames elsewhere, or one copied
+        // without them.
+        write_fixture(
+            &dir,
+            &[
+                (
+                    "zarr.json",
+                    &json!({ "zarr_format": 3, "node_type": "group", "attributes": {} })
+                        .to_string(),
+                ),
+                ("transcripts/zarr.json", &element_metadata("ngff:points")),
+                ("cells/zarr.json", &element_metadata("ngff:shapes")),
+            ],
+        );
+
+        let store = LocalStore::new(&dir.to_string_lossy());
+        let tree = rendered(&store, "store.zarr", None);
+
+        // Still elements, tagged from their metadata exactly as before. The
+        // payload is what is missing, not the recognition.
+        assert!(tree.contains("cells [group, SpatialData shapes]"), "{tree}");
+        assert!(
+            tree.contains("transcripts [group, SpatialData points]"),
+            "{tree}"
+        );
+        assert!(!tree.contains("rows:"), "{tree}");
+        assert!(!tree.contains("parquet files:"), "{tree}");
+    }
+
+    #[test]
+    fn a_static_server_reads_a_shapes_payload_but_cannot_find_a_points_one() {
+        // No WebDAV, so no listing of any kind -- the server consolidation
+        // exists to rescue. A shapes payload is one file at a name we know, so
+        // it is read; a points payload is a directory that would have to be
+        // listed, so it is not, and its filenames are not guessed at.
+        let payload = parquet_file(&[Column::Binary("geometry")], 42);
+
+        let consolidated = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {},
+            "consolidated_metadata": {
+                "kind": "inline",
+                "must_understand": false,
+                "metadata": {
+                    "cells": {
+                        "zarr_format": 3,
+                        "node_type": "group",
+                        "attributes": { "encoding-type": "ngff:shapes" },
+                    },
+                    "transcripts": {
+                        "zarr_format": 3,
+                        "node_type": "group",
+                        "attributes": { "encoding-type": "ngff:points" },
+                    },
+                },
+            },
+        })
+        .to_string();
+
+        let server = TestServer::serving(
+            "data/store.zarr",
+            &[("zarr.json", consolidated.as_str())],
+            &[
+                ("cells/shapes.parquet", payload),
+                (
+                    "transcripts/points.parquet/part.0.parquet",
+                    parquet_file(&[Column::Double("x")], 9),
+                ),
+            ],
+            false,
+        );
+
+        let store = consolidate(server.open());
+        let tree = rendered(store.as_ref(), "store.zarr", None);
+
+        // The consolidated walk is untouched: both elements are there, read
+        // out of the document rather than off the server.
+        assert!(tree.contains("cells [group, SpatialData shapes]"), "{tree}");
+        assert!(
+            tree.contains("transcripts [group, SpatialData points]"),
+            "{tree}"
+        );
+
+        // The shapes payload came off the physical store behind the snapshot.
+        assert!(tree.contains("rows: 42"), "{tree}");
+        // The points one could not, and says nothing rather than guessing.
+        assert!(!tree.contains("rows: 9"), "{tree}");
+    }
+
+    #[test]
+    fn a_consolidated_walk_still_reads_payloads_off_the_store_behind_it() {
+        let dir = fixture("parquet-consolidated");
+
+        // A `.zmetadata` that names both nodes, so every Zarr read comes out
+        // of the snapshot. The Parquet file is not in it and cannot be: no
+        // consolidated document has ever carried one.
+        let document = json!({
+            "zarr_consolidated_format": 1,
+            "metadata": {
+                ".zgroup": { "zarr_format": 2 },
+                "cells/.zgroup": { "zarr_format": 2 },
+                "cells/.zattrs": { "encoding-type": "ngff:shapes" },
+            },
+        })
+        .to_string();
+
+        write_fixture(&dir, &[(".zmetadata", &document)]);
+        write_bytes(
+            &dir,
+            "cells/shapes.parquet",
+            &parquet_file(&[Column::Binary("geometry"), Column::Double("radius")], 88),
+        );
+
+        let store = consolidate(Box::new(LocalStore::new(&dir.to_string_lossy())));
+        let tree = rendered(store.as_ref(), "store.zarr", None);
+
+        // The hierarchy came out of the document -- there is no `cells/.zgroup`
+        // on disk at all -- and the payload came off the disk behind it.
+        assert!(tree.contains("cells [group, SpatialData shapes]"), "{tree}");
+        assert!(tree.contains("rows: 88"), "{tree}");
+        assert!(
+            tree.contains("schema: geometry:byte_array, radius:double"),
+            "{tree}"
+        );
+    }
+
+    #[test]
+    fn the_json_carries_the_whole_schema_where_the_tree_abbreviates_it() {
+        let dir = fixture("parquet-json");
+
+        write_fixture(
+            &dir,
+            &[
+                (
+                    "zarr.json",
+                    &json!({ "zarr_format": 3, "node_type": "group", "attributes": {} })
+                        .to_string(),
+                ),
+                ("cells/zarr.json", &element_metadata("ngff:shapes")),
+            ],
+        );
+        write_bytes(
+            &dir,
+            "cells/shapes.parquet",
+            &parquet_file(&[Column::Binary("geometry"), Column::Int32("cell_id")], 5),
+        );
+
+        let store = LocalStore::new(&dir.to_string_lossy());
+        let root = classify(&store, "");
+        let value = json_tree(&store, "", "store.zarr", root, None).unwrap();
+
+        let element = &value["children"][0];
+        assert_eq!(element["spatialdata"]["kind"], "shapes");
+        assert_eq!(element["parquet"]["rows"], 5);
+        assert_eq!(element["parquet"]["columns"], 2);
+        assert_eq!(element["parquet"]["files"], 1);
+        assert_eq!(
+            element["parquet"]["schema"],
+            json!([
+                { "name": "geometry", "type": "byte_array" },
+                { "name": "cell_id", "type": "int32" },
+            ])
+        );
+    }
+
+    #[test]
+    fn a_long_schema_is_cut_short_in_the_tree_and_counted() {
+        let columns: Vec<ParquetColumn> = (0..20)
+            .map(|index| ParquetColumn {
+                name: format!("c{index}"),
+                kind: String::from("double"),
+            })
+            .collect();
+
+        let rows = parquet_rows(Some(&ParquetSummary {
+            rows: 4_825_319,
+            files: 12,
+            columns,
+        }));
+
+        assert_eq!(rows[0], "rows: 4,825,319");
+        assert_eq!(rows[1], "columns: 20");
+        assert_eq!(rows[2], "parquet files: 12");
+        // Twelve named, the other eight counted.
+        assert!(rows[3].starts_with("schema: c0:double, "), "{}", rows[3]);
+        assert!(rows[3].ends_with("c11:double, ... (8 more)"), "{}", rows[3]);
+    }
+
+    #[test]
+    fn a_parquet_file_elsewhere_in_a_store_is_not_a_payload() {
+        let dir = fixture("parquet-not-an-element");
+
+        // An ordinary group whose directory happens to be called `points`,
+        // with a file that happens to be called `points.parquet`. Neither name
+        // means anything: no metadata called this an element.
+        write_fixture(
+            &dir,
+            &[
+                (
+                    "zarr.json",
+                    &json!({ "zarr_format": 3, "node_type": "group", "attributes": {} })
+                        .to_string(),
+                ),
+                (
+                    "points/zarr.json",
+                    &json!({ "zarr_format": 3, "node_type": "group", "attributes": {} })
+                        .to_string(),
+                ),
+            ],
+        );
+        write_bytes(
+            &dir,
+            "points/points.parquet/part.0.parquet",
+            &parquet_file(&[Column::Double("x")], 3),
+        );
+
+        let store = CountingStore::new(&dir);
+        let tree = rendered(&store, "store.zarr", None);
+
+        assert!(tree.contains("points [group]"), "{tree}");
+        assert!(!tree.contains("rows:"), "{tree}");
+        // Not read, not opened, not even measured.
+        assert_eq!(store.suffix_bytes.get(), 0);
     }
 }

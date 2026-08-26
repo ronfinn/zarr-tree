@@ -788,11 +788,15 @@ fn spatialdata_elements_are_tagged_but_their_containers_are_not() {
     );
 
     // The payload beside it. Points are written as a partitioned Parquet
-    // dataset, so this is a directory rather than a file -- which is why it
-    // shows up in the walk at all. It carries no Zarr metadata, so it is
-    // `[unknown]`, and this test pins that down: leaving it visible is a
-    // decision, not an oversight. Suppressing it would mean matching on the
-    // name `points.parquet`, and names decide nothing here.
+    // dataset, so this is a directory rather than a file. It is not a Zarr
+    // node and does not appear in the tree as one -- but that is because the
+    // element's own metadata said this is a points element and this is where a
+    // points element's payload lives, not because of what the directory is
+    // called.
+    //
+    // The part is not Parquet, so there is no summary to print either. The
+    // element is still an element: an unreadable payload costs its rows and
+    // nothing else.
     write_file(
         &store.join("points/transcripts/points.parquet/part.0.parquet"),
         "not read",
@@ -841,8 +845,6 @@ fn spatialdata_elements_are_tagged_but_their_containers_are_not() {
         // The elements, tagged with their kind and no version.
         "transcripts [group, SpatialData points]",
         "cell_boundaries [group, SpatialData shapes]",
-        // The payload directory, still shown for what it is.
-        "points.parquet [unknown]",
     ] {
         assert!(
             has(&output_lines, expected),
@@ -850,8 +852,18 @@ fn spatialdata_elements_are_tagged_but_their_containers_are_not() {
         );
     }
 
-    // The root plus the two elements, and nothing else: not the containers,
-    // and not the payload directory.
+    // The payload directory is the element's data, not a node beneath it, so
+    // it is not walked into and not drawn.
+    assert!(
+        !stdout.contains("points.parquet"),
+        "the payload directory is not a child node:\n{stdout}"
+    );
+
+    // Neither payload is readable Parquet, so neither element gained a row.
+    // That is the graceful case: the Zarr metadata still classified them.
+    assert!(!stdout.contains("rows:"), "{stdout}");
+
+    // The root plus the two elements, and nothing else: not the containers.
     assert_eq!(
         stdout.matches("SpatialData").count(),
         3,
