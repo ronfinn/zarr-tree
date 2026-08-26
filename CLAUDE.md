@@ -42,6 +42,15 @@ against throwaway fixture stores.
   SpatialData writer conventions, reached only from a group its own metadata
   already named a points or shapes element. No record, page or row group is
   ever read.
+- SpatialData table AnnData summaries, from Zarr metadata alone: observations
+  and variables (each dataframe's declared `_index` array length, falling back
+  to `X`'s declared shape), `X`'s representation and shape (a Zarr array is
+  dense; a group of `encoding-type` `csr_matrix`/`csc_matrix` is that), the
+  declared `column-order` widths, and the `region`/`region_key`/`instance_key`
+  the table annotates. Five metadata reads below a table -- `obs`, `var`, each
+  index array, `X` -- and no listing, so it costs the same everywhere and comes
+  wholly out of a consolidated snapshot. No value, category or index label is
+  read, and nothing is counted.
 - Read-only S3 access: `zarr-tree s3://bucket/path/store.zarr` produces the
   same tree as a local path. Traversal, interpretation and both renderers are
   storage-neutral; only the `Store` trait and its two implementations
@@ -133,7 +142,9 @@ Do not implement these without an explicit request:
   Polars.
 - Turning an arbitrary `.parquet` file elsewhere in a store into a tree node,
   or guessing the filenames of a points payload a backend cannot list.
-- AnnData interpretation.
+- AnnData beyond the table summary above: reading any value, counting non-zero
+  entries, decoding categories, interpreting `uns`, `layers`, `obsm`, `obsp`,
+  `varm`, `varp` or `raw`, or reading H5AD/HDF5.
 - async / Tokio.
 
 ## Conventions

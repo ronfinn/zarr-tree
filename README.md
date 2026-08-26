@@ -50,6 +50,11 @@ example.zarr [group]
   many rows it holds, how many columns wide it is, how many Parquet files it is
   written across, and what its columns are called and typed. Read from the file
   footer alone — **Parquet records are not read.**
+- Summarises the AnnData table inside a SpatialData table element: how many
+  observations and variables it declares, how `X` is stored and what shape it
+  says it is, how many `obs` and `var` columns it declares, and which elements
+  it annotates. Read from Zarr metadata alone — **expression values and
+  annotation values are not read.**
 - Reads S3 with the same walk, the same output and the same options, stopping
   at arrays there too — so an array's chunk objects are never listed, however
   many millions of them there are.
@@ -303,6 +308,14 @@ experiment.zarr [group, SpatialData 0.2]
 │   └── cell_boundaries [group, SpatialData shapes]
 └── tables [group]
     └── table [group, SpatialData table]
+        ├─ observations: 1,200
+        ├─ variables: 313
+        ├─ X: dense [1200, 313] float32
+        ├─ obs columns: 8
+        ├─ var columns: 3
+        ├─ annotates: cell_boundaries
+        ├─ region key: region
+        ├─ instance key: cell_id
         ├── X [array]
         │   ├─ shape:  [1200, 313]
         │   ├─ chunks: [1200, 313]
@@ -484,6 +497,102 @@ plain.zarr [group]
 The version is printed exactly as stored and is never checked against the
 versions that exist. A root whose marker is present but carries no readable
 version is tagged `[group, SpatialData]`.
+
+### Tables
+
+A SpatialData table is an [AnnData](https://anndata.readthedocs.io/) object
+written into the store, and AnnData records the shape of a table in metadata:
+the length of each dataframe's index, the columns it declares, and how the
+expression matrix is stored. All of that is read from Zarr metadata files, so a
+table says how big it is without a single value being read:
+
+```
+$ zarr-tree xenium.zarr --depth 2
+xenium.zarr [group, SpatialData 0.2]
+└── tables [group]
+    └── table [group, SpatialData table]
+        ├─ observations: 167,780
+        ├─ variables: 313
+        ├─ X: csr [167780, 313]
+        ├─ obs columns: 8
+        ├─ var columns: 3
+        ├─ annotates: cell_circles
+        ├─ region key: region
+        └─ instance key: cell_id
+```
+
+| Row | Where it comes from |
+| --- | --- |
+| `observations` | the length of the array `obs` names in its `_index`, or the first dimension `X` declares |
+| `variables` | the same for `var`, or the second dimension `X` declares |
+| `X` | how the matrix is stored, and the shape it declares |
+| `obs columns` | the length of the `column-order` `obs` declares |
+| `var columns` | the same for `var` |
+| `annotates` | the `region` the table declares |
+| `region key` | the `obs` column naming each observation's region |
+| `instance key` | the `obs` column naming the instance within it |
+
+**Expression values and annotation values are not read.** Nothing is counted,
+either: every number above is a field in a metadata file. A dense `X` is a Zarr
+array and reports its own shape and dtype; a sparse one is a group whose
+attributes declare both the representation and the shape, so the `data`,
+`indices` and `indptr` arrays inside it are never opened.
+
+| `X` written as | Row |
+| --- | --- |
+| a Zarr array | `X: dense [2389, 268] int64` |
+| a group of `encoding-type` `csr_matrix` | `X: csr [167780, 313]` |
+| a group of `encoding-type` `csc_matrix` | `X: csc [167780, 313]` |
+
+The columns are the ones `column-order` declares, and never the children of
+`obs` on disk. The two are usually the same list, but only one of them is what
+the dataframe says about itself — and a listing would also sweep up the index
+array and the `categories`/`codes` groups of every categorical column. The
+counts are shown in the tree; `--json` carries the declared names in full.
+
+Five metadata files are read below a table, whatever the store holds: `obs`,
+`var`, the index array each of them names, and `X`. No listing is made, so the
+summary costs the same handful of `GET`s on a static HTTP server as it does on
+a local disk, and comes wholly out of the snapshot when the store carries
+consolidated metadata.
+
+The rows are a summary, not a replacement. Everything AnnData wrote is still a
+group in the tree and is still walked into at greater depth:
+
+```
+$ zarr-tree xenium.zarr/tables/table --depth 1
+xenium.zarr/tables/table [group, SpatialData table]
+├─ observations: 167,780
+├─ variables: 313
+├─ X: csr [167780, 313]
+├─ obs columns: 8
+├─ var columns: 3
+├─ annotates: cell_circles
+├─ region key: region
+├─ instance key: cell_id
+├── X [group]
+├── layers [group]
+├── obs [group]
+├── obsm [group]
+├── obsp [group]
+├── uns [group]
+├── var [group]
+├── varm [group]
+└── varp [group]
+```
+
+Each row is independent, and a field the metadata does not give up simply has
+no row: a table whose `var` cannot be read still reports the observations its
+`obs` declared. A table that annotates nothing draws none of the last three
+rows — SpatialData writes those keys as nulls rather than leaving them out, and
+a null is not something to print. Nothing here is checked against anything
+else: a table whose `X` declares a shape its `obs` index disagrees with is
+reported as it stands.
+
+This is licensed by the table marker and by nothing else. A group that merely
+holds children called `X`, `obs` and `var`, or that is merely called `table`,
+is an ordinary Zarr group and is read as one. `uns` is walked as the group it
+is and is not interpreted.
 
 ## Installation
 
@@ -838,7 +947,9 @@ applies to it:
 | `children` | yes | The child nodes, in the same order the tree lists them. Empty for an array, and empty at the depth limit. |
 | `array` | arrays only | `shape`, `chunks`, `dtype`, and `shards` on a sharded V3 array |
 | `ome` | OME-Zarr groups | `tag`, `kind` (`image`, `plate`, `well`), `version`, `axes`, `pyramid_levels`, `datasets`, and `rows`, `columns`, `wells` on a plate |
-| `spatialdata` | SpatialData nodes | `kind` (`root`, `image`, `labels`, `points`, `shapes`, `table`) and `version`, which only a store root records |
+| `spatialdata` | SpatialData nodes | `kind` (`root`, `image`, `labels`, `points`, `shapes`, `table`) and `version`, which only a store root records; on a table also `regions`, `region_key` and `instance_key` |
+| `parquet` | points and shapes elements with a readable payload | `rows`, `columns`, `files` and the whole `schema` |
+| `anndata` | SpatialData tables | `encoding_version`, `observations`, `variables`, `x`, and the declared `obs_columns` and `var_columns` in full |
 
 A section is absent when that kind of metadata does not apply; a field inside a
 section is `null` when the file gave no readable value. That is the same rule
@@ -857,6 +968,25 @@ $ zarr-tree --json partial.zarr | jq '.children[0].array'
 the tree draws, and their entries are copied across exactly as stored — a
 malformed `"shape": [1, "x"]` comes out as `[1, "x"]` rather than being
 dropped.
+
+`spatialdata` and `anndata` stay separate objects on a table, because they are
+two vocabularies read from two sets of keys: what SpatialData said about the
+elements the table annotates, and what AnnData said about the table itself.
+
+```
+$ zarr-tree --json xenium.zarr/tables/table --depth 0 | jq '.anndata'
+{
+  "encoding_version": "0.1.0",
+  "obs_columns": ["cell_id", "transcript_counts", "…"],
+  "observations": 167780,
+  "var_columns": ["gene_ids", "feature_types", "genome"],
+  "variables": 313,
+  "x": {
+    "kind": "csr",
+    "shape": [167780, 313]
+  }
+}
+```
 
 The two outputs come from one reading of the metadata: `--json` is a second
 renderer, not a second interpretation, so the tree and the document cannot
@@ -986,12 +1116,22 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
   is read only for its presence, to tell a segmentation from an image. No
   scale factors, pixel sizes or physical extents are calculated.
 - SpatialData support goes no further than recognising a store root and its
-  image, labels, points, shapes and table elements, and summarising the Parquet
-  payload of a points or shapes element from its footer. Element axes, feature
-  keys, instance keys, geometry types, the region a table annotates and
+  image, labels, points, shapes and table elements, summarising the Parquet
+  payload of a points or shapes element from its footer, and summarising the
+  AnnData metadata of a table. Element axes, feature keys, geometry types and
   coordinate transformations are not shown, and no element is joined to any
-  other. A table's `X`, `obs`, `var` and `layers` are walked as the Zarr arrays
-  they are and not interpreted as AnnData.
+  other — a table names the regions it annotates, and nothing checks that those
+  elements exist or links them to the table.
+- A table summary is AnnData *metadata* and nothing more. No expression value,
+  annotation value, category or index label is read, and nothing is counted:
+  the number of non-zero entries in a sparse `X`, the categories of a
+  categorical column and the dtype of a sparse `X` are all absent because
+  finding them would mean opening an array. `layers`, `obsm`, `obsp`, `varm`,
+  `varp`, `uns` and `raw` are walked as the groups they are and are not
+  interpreted or counted, which is what keeps the summary to five metadata
+  reads and no listing. Only `X` written as a Zarr array, a `csr_matrix` or a
+  `csc_matrix` is described; any other representation draws no `X` row. H5AD
+  is not read — only AnnData written into Zarr.
 - No Parquet record is ever read. Only the footer is fetched, so row counts and
   the schema are what the file *declares*: nothing is counted, nothing is
   checked, and a footer that disagrees with the pages below it is reported as

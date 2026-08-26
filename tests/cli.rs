@@ -1976,3 +1976,169 @@ fn json_of(args: &[&str]) -> Value {
     );
     serde_json::from_slice(&output.stdout).expect("valid JSON")
 }
+
+#[test]
+fn a_spatialdata_table_is_summarised_from_metadata_at_every_depth() {
+    // The rows exist to make a table useful before anybody walks into it, so
+    // what this test is really about is what `--depth 1` shows -- and that
+    // `--depth 2` still shows everything underneath.
+    let dir = fixture_dir("anndata-table");
+    let store = dir.join("experiment.zarr");
+
+    write_file(
+        &store.join("zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "spatialdata_attrs": {
+                    "version": "0.2",
+                    "spatialdata_software_version": "0.7.1"
+                }
+            }
+        }"#,
+    );
+
+    write_file(
+        &store.join("tables/zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group", "attributes": {}}"#,
+    );
+
+    // The table group, as SpatialData's writer leaves it: AnnData's own two
+    // keys, the element kind one key over, and the three that say what the
+    // table annotates.
+    write_file(
+        &store.join("tables/table/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "encoding-type": "anndata",
+                "encoding-version": "0.1.0",
+                "spatialdata-encoding-type": "ngff:regions_table",
+                "region": "cell_circles",
+                "region_key": "region",
+                "instance_key": "cell_id",
+                "version": "0.2"
+            }
+        }"#,
+    );
+
+    write_file(
+        &store.join("tables/table/X/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "shape": [167780, 313],
+                "encoding-type": "csr_matrix",
+                "encoding-version": "0.1.0"
+            }
+        }"#,
+    );
+
+    // The three arrays a CSR matrix is made of, with a chunk beneath one of
+    // them. None of the three is opened, and the chunk least of all.
+    for name in ["data", "indices", "indptr"] {
+        write_file(
+            &store.join("tables/table/X").join(name).join("zarr.json"),
+            r#"{
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [23409569],
+                "data_type": "float32",
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [131072]}}
+            }"#,
+        );
+    }
+    write_file(
+        &store.join("tables/table/X/data/c/0"),
+        "expression values, and never read",
+    );
+
+    for (frame, columns, length) in [
+        ("obs", r#"["cell_id", "total_counts", "region"]"#, 167780),
+        ("var", r#"["gene_ids"]"#, 313),
+    ] {
+        write_file(
+            &store.join("tables/table").join(frame).join("zarr.json"),
+            &format!(
+                r#"{{
+                    "zarr_format": 3,
+                    "node_type": "group",
+                    "attributes": {{
+                        "column-order": {columns},
+                        "_index": "_index",
+                        "encoding-type": "dataframe",
+                        "encoding-version": "0.2.0"
+                    }}
+                }}"#
+            ),
+        );
+        write_file(
+            &store
+                .join("tables/table")
+                .join(frame)
+                .join("_index/zarr.json"),
+            &format!(
+                r#"{{
+                    "zarr_format": 3,
+                    "node_type": "array",
+                    "shape": [{length}],
+                    "data_type": "string",
+                    "chunk_grid": {{"name": "regular", "configuration": {{"chunk_shape": [{length}]}}}}
+                }}"#
+            ),
+        );
+        write_file(
+            &store.join("tables/table").join(frame).join("_index/c/0"),
+            "index values, and never read",
+        );
+    }
+
+    let path = store.to_string_lossy().into_owned();
+
+    // Two levels down is where the table's own line is, and the summary comes
+    // with it: the whole shape of the table before a single child is listed.
+    let shallow = run(&["--depth", "2", &path]);
+    assert!(shallow.status.success());
+    let shallow = String::from_utf8(shallow.stdout).unwrap();
+    let shallow = lines(&shallow);
+
+    assert!(
+        has(&shallow, "table [group, SpatialData table]"),
+        "{shallow:?}"
+    );
+    assert!(has(&shallow, "observations: 167,780"), "{shallow:?}");
+    assert!(has(&shallow, "variables: 313"), "{shallow:?}");
+    assert!(has(&shallow, "X: csr [167780, 313]"), "{shallow:?}");
+    assert!(has(&shallow, "obs columns: 3"), "{shallow:?}");
+    assert!(has(&shallow, "var columns: 1"), "{shallow:?}");
+    assert!(has(&shallow, "annotates: cell_circles"), "{shallow:?}");
+    assert!(has(&shallow, "region key: region"), "{shallow:?}");
+    assert!(has(&shallow, "instance key: cell_id"), "{shallow:?}");
+
+    // At this depth the children of the table are not listed at all, which is
+    // exactly the case the rows were written for.
+    assert!(!has(&shallow, "obs [group]"), "{shallow:?}");
+
+    // Deeper, and the subtree the rows summarise is all still there. The rows
+    // did not replace it.
+    let full = run(&[&path]);
+    assert!(full.status.success());
+    let full = String::from_utf8(full.stdout).unwrap();
+    let full = lines(&full);
+
+    for node in ["X [group]", "obs [group]", "var [group]", "_index [array]"] {
+        assert!(
+            has(&full, node),
+            "{node} should still be walked into:\n{full:?}"
+        );
+    }
+
+    // And the chunk under `X/data` is not a node, at any depth.
+    assert!(!has(&full, "c [group]"), "{full:?}");
+    assert!(!has(&full, "c [unknown]"), "{full:?}");
+
+    fs::remove_dir_all(&dir).unwrap();
+}

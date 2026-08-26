@@ -53,6 +53,94 @@ struct GroupMeta {
     /// promising. `None` everywhere else, and also wherever the payload could
     /// not be read -- see `parquet_summary`.
     parquet: Option<ParquetSummary>,
+    /// What the AnnData table inside a SpatialData table element declares
+    /// about itself.
+    ///
+    /// Read under the same licence `parquet` is read under, and for the same
+    /// reason: only a group whose own metadata already said it is a
+    /// SpatialData table is looked into. A group that merely happens to be
+    /// called `table`, or to hold children called `X`, `obs` and `var`, is
+    /// not -- see `anndata_summary`.
+    ///
+    /// Boxed, alone among these fields, because of where a `NodeKind` lives:
+    /// one is built for every node of the walk and passed around by value, and
+    /// this is by far the largest thing a group can carry while being the
+    /// rarest -- a store has one table and thousands of ordinary groups. The
+    /// box keeps all of them small.
+    anndata: Option<Box<AnnData>>,
+}
+
+/// What the AnnData object inside a SpatialData table declares about itself.
+///
+/// Every field here comes out of a Zarr metadata file. AnnData records the
+/// shape of the table in metadata -- the length of each dataframe index, the
+/// declared column order, the shape and representation of `X` -- so none of it
+/// has to be counted, and none of it is. No expression value, no annotation
+/// value and no category is read; no chunk under `X`, `obs` or `var` is
+/// opened.
+///
+/// Nothing is checked against anything. A table whose `X` declares a shape its
+/// `obs` index disagrees with is reported as it stands, the same way a
+/// malformed `shape` is printed as stored: this is inspection, not validation.
+struct AnnData {
+    /// The version stamped on the group by whichever AnnData wrote it, as
+    /// stored. `None` when the group records none.
+    encoding_version: Option<String>,
+    /// The number of observations: the length of the `obs` index array, or
+    /// the first dimension `X` declares when the index could not be read.
+    observations: Option<u64>,
+    /// The number of variables: the length of the `var` index array, or the
+    /// second dimension `X` declares.
+    variables: Option<u64>,
+    /// How the expression matrix is stored and how big it says it is.
+    x: Option<XMatrix>,
+    /// The columns `obs` declares in `column-order`, in that order. The index
+    /// is not one of them -- AnnData keeps it out of that list -- and neither
+    /// is anything counted from the children on disk.
+    obs_columns: Option<Vec<String>>,
+    /// The columns `var` declares, read the same way.
+    var_columns: Option<Vec<String>>,
+}
+
+/// How an AnnData `X` is stored, and the shape it declares.
+///
+/// A dense `X` is one Zarr array, so its own shape and dtype are the answer. A
+/// sparse one is a group of three arrays -- `data`, `indices`, `indptr` --
+/// none of which is opened: what it is and how big it is are both written in
+/// the group's attributes, which is the only thing read.
+///
+/// No non-zero count appears here. That is not in the metadata, and finding it
+/// would mean reading `indptr`.
+struct XMatrix {
+    /// `dense`, `csr` or `csc`.
+    kind: &'static str,
+    /// The shape as declared, kept as the values the file held for the same
+    /// reason `ArrayMeta` keeps them: the tree wants `[167780, 313]` and
+    /// `--json` wants a real JSON array.
+    shape: Option<Vec<Value>>,
+    /// The element type, which only a dense `X` has here. A sparse `X` keeps
+    /// its dtype on the `data` array inside it, and that array is not read.
+    dtype: Option<String>,
+}
+
+/// What a SpatialData table says about the elements it annotates.
+///
+/// SpatialData writes these three beside AnnData's own keys in the table
+/// group's attributes: which region elements the table annotates, and which
+/// two `obs` columns carry the region and instance identifiers. The columns
+/// are *named* here; no column value is ever read to reconstruct any of this.
+///
+/// All three are `None` when the table declares none, which is what a table
+/// annotating nothing looks like -- SpatialData writes the keys with a null
+/// value rather than leaving them out.
+struct TableAnnotation {
+    /// The elements annotated. A single element is stored as a bare string
+    /// and several as a list; both arrive here as a list -- see `regions`.
+    regions: Option<Vec<String>>,
+    /// The `obs` column naming the region each observation belongs to.
+    region_key: Option<String>,
+    /// The `obs` column naming the instance within that region.
+    instance_key: Option<String>,
 }
 
 /// What a SpatialData element's Parquet payload says about itself, read from
@@ -115,8 +203,9 @@ enum SpatialData {
     /// A shapes element: cell boundaries, circles, landmarks.
     Shapes,
     /// A table element: an AnnData annotation table over the regions of
-    /// another element.
-    Table,
+    /// another element, together with what it says it annotates. See
+    /// `TableAnnotation`.
+    Table(TableAnnotation),
     /// A raster image element: microscopy, morphology. See
     /// `spatialdata_raster_element`.
     Image,
@@ -139,7 +228,7 @@ impl SpatialData {
             SpatialData::Root(None) => String::from("SpatialData"),
             SpatialData::Points => String::from("SpatialData points"),
             SpatialData::Shapes => String::from("SpatialData shapes"),
-            SpatialData::Table => String::from("SpatialData table"),
+            SpatialData::Table(_) => String::from("SpatialData table"),
             SpatialData::Image => String::from("SpatialData image"),
             SpatialData::Labels => String::from("SpatialData labels"),
         }
@@ -152,7 +241,7 @@ impl SpatialData {
             SpatialData::Root(_) => "root",
             SpatialData::Points => "points",
             SpatialData::Shapes => "shapes",
-            SpatialData::Table => "table",
+            SpatialData::Table(_) => "table",
             SpatialData::Image => "image",
             SpatialData::Labels => "labels",
         }
@@ -1710,6 +1799,9 @@ fn classify(store: &dyn Store, path: &str) -> NodeKind {
             // metadata said this element is decides whether there is a payload
             // to look for at all.
             parquet: parquet_summary(store, path, spatialdata.as_ref()),
+            // And the same again for the AnnData table inside a table
+            // element, which the same answer licenses.
+            anndata: anndata_summary(store, path, attrs.as_ref(), spatialdata.as_ref()),
             spatialdata,
         });
     }
@@ -1744,6 +1836,12 @@ fn classify_v3(store: &dyn Store, path: &str) -> Option<NodeKind> {
             Some(NodeKind::Group(GroupMeta {
                 ome: ome_info_v3(&value),
                 parquet: parquet_summary(store, path, spatialdata.as_ref()),
+                anndata: anndata_summary(
+                    store,
+                    path,
+                    value.get("attributes"),
+                    spatialdata.as_ref(),
+                ),
                 spatialdata,
             }))
         }
@@ -1987,13 +2085,69 @@ fn spatialdata_encoded_element(attrs: &Value) -> Option<SpatialData> {
 }
 
 /// The element kind named by `key`, or `None` when it names nothing we know.
+///
+/// A table carries what it annotates in the same attributes object, so it is
+/// read here rather than by a second pass: the keys sit beside the one that
+/// just proved this is a table, and reading them costs nothing.
 fn encoded_kind(attrs: &Value, key: &str) -> Option<SpatialData> {
     match attrs.get(key)?.as_str()? {
         "ngff:points" => Some(SpatialData::Points),
         "ngff:shapes" => Some(SpatialData::Shapes),
-        "ngff:regions_table" => Some(SpatialData::Table),
+        "ngff:regions_table" => Some(SpatialData::Table(table_annotation(attrs))),
         _ => None,
     }
+}
+
+/// What a table's attributes say it annotates.
+///
+/// The three keys sit at the top level of the table group's attributes, beside
+/// AnnData's own, which is where every release of SpatialData that writes them
+/// has put them -- in Zarr V2 and V3 alike. A table that annotates nothing
+/// still has all three, written as null, and each falls out here as `None` on
+/// its own.
+///
+/// Nothing is read from `obs` to fill any of this in. `region_key` and
+/// `instance_key` are the *names* of two columns, and names are all that is
+/// reported: the columns themselves are chunk data.
+fn table_annotation(attrs: &Value) -> TableAnnotation {
+    TableAnnotation {
+        regions: regions(attrs.get("region")),
+        region_key: text(attrs.get("region_key")),
+        instance_key: text(attrs.get("instance_key")),
+    }
+}
+
+/// The elements a table annotates, as a list however the file wrote them.
+///
+/// SpatialData stores a single element as a bare string and several as a list,
+/// and the difference says nothing: both mean "these are the regions". They
+/// are levelled here so that neither renderer has to know about the two
+/// spellings, and so that the tree and `--json` cannot disagree about which
+/// one they are looking at.
+///
+/// An entry that is not a string becomes `?` rather than being dropped, the
+/// same way `dataset_paths` treats a nameless dataset: dropping it would
+/// report a table over three regions as one over two.
+fn regions(value: Option<&Value>) -> Option<Vec<String>> {
+    match value? {
+        Value::String(one) => Some(vec![one.clone()]),
+        Value::Array(items) if !items.is_empty() => Some(
+            items
+                .iter()
+                .map(|item| match item.as_str() {
+                    Some(name) => String::from(name),
+                    None => String::from("?"),
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// A string-valued attribute, or `None` when it is missing, null, or not a
+/// string.
+fn text(value: Option<&Value>) -> Option<String> {
+    Some(String::from(value?.as_str()?))
 }
 
 /// A raster element inside a SpatialData store, or `None` when this group is
@@ -2179,6 +2333,210 @@ fn parquet_metadata(store: &dyn Store, path: &str) -> Option<ParquetMetaData> {
     ParquetMetaDataReader::decode_metadata(&bytes).ok()
 }
 
+/// What the AnnData table at `path` declares about itself, or `None` when
+/// there is nothing to report.
+///
+/// `element` is what the group's own metadata said it is, and -- exactly as in
+/// `parquet_summary` -- it is the whole of the licence to go looking. Every
+/// other kind of node returns here at once. That is what keeps an ordinary
+/// Zarr group holding children called `X`, `obs` and `var` from being read as
+/// an AnnData table: the recognition rule is the SpatialData marker, and this
+/// only interprets what that rule has already admitted.
+///
+/// `attrs` is the table group's own attributes, already in hand from
+/// `classify`, which is where AnnData's `encoding-version` sits.
+///
+/// Five metadata files at most are opened below this node -- `obs`, `var`, the
+/// index array each of them names, and `X` -- and nothing else. No listing is
+/// made: every path here is named by a metadata file, so the summary costs the
+/// same handful of reads on a static HTTP server as it does on a local disk,
+/// and comes wholly out of the snapshot when the store is consolidated.
+///
+/// Each field falls out on its own. A table whose `var` cannot be read still
+/// reports the observations its `obs` declared.
+fn anndata_summary(
+    store: &dyn Store,
+    path: &str,
+    attrs: Option<&Value>,
+    element: Option<&SpatialData>,
+) -> Option<Box<AnnData>> {
+    if !matches!(element?, SpatialData::Table(_)) {
+        return None;
+    }
+
+    // Recorded rather than checked. A table whose group says `0.2.0`, or says
+    // nothing at all, is reported as it stands.
+    let encoding_version = text(attrs.and_then(|attrs| attrs.get("encoding-version")));
+
+    let obs = dataframe(store, &child_path(path, "obs"));
+    let var = dataframe(store, &child_path(path, "var"));
+    let x = x_matrix(store, &child_path(path, "X"));
+
+    // The index array's length is the axis length, and it is metadata. `X`'s
+    // declared shape is the fallback for a dataframe we could not read, which
+    // costs nothing: `X` has already been read. The two are not compared --
+    // whichever answered first is the answer.
+    let shape = x.as_ref().and_then(|x| x.shape.as_deref());
+    let observations = obs.as_ref().and_then(|obs| obs.length).or(dim(shape, 0));
+    let variables = var.as_ref().and_then(|var| var.length).or(dim(shape, 1));
+
+    Some(Box::new(AnnData {
+        encoding_version,
+        observations,
+        variables,
+        obs_columns: obs.and_then(|obs| obs.columns),
+        var_columns: var.and_then(|var| var.columns),
+        x,
+    }))
+}
+
+/// One dimension of a declared shape, when it is a number we can use.
+fn dim(shape: Option<&[Value]>, axis: usize) -> Option<u64> {
+    shape?.get(axis)?.as_u64()
+}
+
+/// What an AnnData dataframe group -- `obs` or `var` -- declares about itself.
+///
+/// Both fields are `None` on their own: a dataframe whose `column-order` is
+/// unreadable still yields the length its index declared.
+struct DataFrame {
+    /// The length of the index array the group names, which is the length of
+    /// the axis. `None` when no index was named or its metadata could not be
+    /// read.
+    length: Option<u64>,
+    /// The declared `column-order`, in that order.
+    columns: Option<Vec<String>>,
+}
+
+/// Read an AnnData dataframe group's declared shape, without reading a column.
+///
+/// AnnData writes two things here that between them describe the dataframe
+/// entirely: `column-order`, which is the columns, and `_index`, which names
+/// the array holding the index. The index array's own Zarr metadata carries
+/// its length, and that length is the axis length -- so `n_obs` is read from a
+/// `shape` field rather than counted from anything.
+///
+/// The columns are taken from `column-order` alone and never from the children
+/// on disk. The two are usually the same list, but only one of them is what
+/// the dataframe *declares*, and a listing would also sweep up the index array
+/// and the `categories`/`codes` groups of a categorical column.
+///
+/// Two reads: the group, and the one array it named. Neither array is opened.
+fn dataframe(store: &dyn Store, path: &str) -> Option<DataFrame> {
+    let node = anndata_node(store, path)?;
+
+    // An entry that is not a string becomes `?` rather than being dropped, so
+    // the count stays the count the file declared.
+    let columns = node
+        .attrs
+        .get("column-order")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| match item.as_str() {
+                    Some(name) => String::from(name),
+                    None => String::from("?"),
+                })
+                .collect()
+        });
+
+    let length = text(node.attrs.get("_index"))
+        .and_then(|name| anndata_node(store, &child_path(path, &name)))
+        .and_then(|index| {
+            let shape = index.array?.shape?;
+            shape.first()?.as_u64()
+        });
+
+    Some(DataFrame { length, columns })
+}
+
+/// How the expression matrix at `path` is stored, or `None` when it is neither
+/// a dense array nor a sparse representation this understands.
+///
+/// One read. A dense `X` is a Zarr array and answers out of its own metadata;
+/// a sparse one is a group whose attributes carry both the representation and
+/// the shape. Either way the arrays holding the values -- `X` itself, or
+/// `data`, `indices` and `indptr` beneath it -- are never opened.
+fn x_matrix(store: &dyn Store, path: &str) -> Option<XMatrix> {
+    let node = anndata_node(store, path)?;
+
+    // A dense X is an array, and being an array is what makes it dense.
+    // AnnData also stamps it `encoding-type: "array"`, which says the same
+    // thing one file further away in Zarr V2; the node kind is read instead
+    // because it is already in hand.
+    if let Some(array) = node.array {
+        return Some(XMatrix {
+            kind: "dense",
+            shape: array.shape,
+            dtype: array.dtype,
+        });
+    }
+
+    // Matched exactly. A group under `X` declaring anything else is a
+    // representation this version does not know, and is reported as no row at
+    // all rather than guessed at.
+    let kind = match node.attrs.get("encoding-type")?.as_str()? {
+        "csr_matrix" => "csr",
+        "csc_matrix" => "csc",
+        _ => return None,
+    };
+
+    Some(XMatrix {
+        kind,
+        shape: dims(node.attrs.get("shape")),
+        dtype: None,
+    })
+}
+
+/// One node inside an AnnData table, read the cheapest way its Zarr version
+/// allows.
+///
+/// Both things wanted from such a node come from here: its user attributes,
+/// where AnnData's own vocabulary lives, and its shape, which only an array
+/// has. `classify` cannot serve this -- it throws the attributes away, keeping
+/// only what OME-Zarr and SpatialData made of them.
+struct AnnDataNode {
+    /// The node's user attributes. `Value::Null` when it has none, which reads
+    /// every key as missing without a branch of its own.
+    attrs: Value,
+    /// The array metadata, and so also the proof that this is an array.
+    /// `None` for a group.
+    array: Option<ArrayMeta>,
+}
+
+/// Read one node of an AnnData table: its attributes, and its shape when it
+/// has one.
+///
+/// Zarr V3 first, because that is what every SpatialData store since 0.7
+/// writes and because it answers both questions from one file. V2 splits them,
+/// and which of its two files is there is what says whether this is an array.
+fn anndata_node(store: &dyn Store, path: &str) -> Option<AnnDataNode> {
+    if let Some(value) = read_json(store, &child_path(path, "zarr.json")) {
+        let array = match value.get("node_type").and_then(|kind| kind.as_str()) {
+            Some("array") => Some(array_meta_v3(&value)),
+            _ => None,
+        };
+        let attrs = value.get("attributes").cloned().unwrap_or(Value::Null);
+        return Some(AnnDataNode { attrs, array });
+    }
+
+    // V2 keeps user attributes in `.zattrs` whichever kind of node this is, so
+    // it is read either way; `.zarray` is what adds the shape.
+    let attrs = read_json(store, &child_path(path, ".zattrs"));
+    if let Some(zarray) = store.read(&child_path(path, ".zarray")) {
+        return Some(AnnDataNode {
+            attrs: attrs.unwrap_or(Value::Null),
+            array: Some(array_meta_v2(&zarray)),
+        });
+    }
+
+    Some(AnnDataNode {
+        attrs: attrs?,
+        array: None,
+    })
+}
+
 /// The top-level columns of a Parquet schema, in declaration order.
 ///
 /// The root of a Parquet schema is a group whose fields are the columns a
@@ -2280,10 +2638,108 @@ fn group_rows(kind: &NodeKind) -> Vec<String> {
         return Vec::new();
     };
 
+    // Order is display order and nothing more. The four readers are
+    // independent, and no group has anything to say to more than two of them:
+    // a table has AnnData rows and annotation rows, a points element has
+    // Parquet rows, and neither has the other's.
     let mut rows = ome_rows(meta.ome.as_ref());
+    rows.extend(anndata_rows(meta.anndata.as_deref()));
+    rows.extend(table_rows(meta.spatialdata.as_ref()));
     rows.extend(parquet_rows(meta.parquet.as_ref()));
     rows
 }
+
+/// The rows an AnnData table adds beneath its own line.
+///
+/// The shape of the table, in the order somebody reading it would ask: how
+/// many observations, how many variables, how the matrix between them is
+/// stored, and how wide each annotation frame is. A field the metadata did not
+/// give up simply has no row, so a table whose `X` is a representation this
+/// version does not know still reports its two counts.
+///
+/// The column *names* are deliberately not drawn here, unlike the Parquet
+/// schema row. A Parquet column appears nowhere else in the output; an `obs`
+/// column is a child group of `obs`, which the tree is already printing two
+/// levels down. `--json` carries the declared lists either way.
+fn anndata_rows(anndata: Option<&AnnData>) -> Vec<String> {
+    let Some(anndata) = anndata else {
+        return Vec::new();
+    };
+
+    let mut rows = Vec::new();
+    // Grouped for the same reason a Parquet row count is: a table of 167780
+    // cells is a number nobody reads.
+    if let Some(count) = anndata.observations {
+        rows.push(format!("observations: {}", grouped(count as i64)));
+    }
+    if let Some(count) = anndata.variables {
+        rows.push(format!("variables: {}", grouped(count as i64)));
+    }
+    if let Some(x) = &anndata.x {
+        let mut row = format!("X: {}", x.kind);
+        // The representation alone is still worth a row, so a shape or a dtype
+        // that could not be read shortens the row rather than removing it.
+        if let Some(shape) = &x.shape {
+            row.push(' ');
+            row.push_str(&format_dims(shape));
+        }
+        if let Some(dtype) = &x.dtype {
+            row.push(' ');
+            row.push_str(dtype);
+        }
+        rows.push(row);
+    }
+    if let Some(columns) = &anndata.obs_columns {
+        rows.push(format!("obs columns: {}", columns.len()));
+    }
+    if let Some(columns) = &anndata.var_columns {
+        rows.push(format!("var columns: {}", columns.len()));
+    }
+    rows
+}
+
+/// The rows a SpatialData table adds about what it annotates.
+///
+/// Separate from `anndata_rows` because these are separate facts: those come
+/// from AnnData's vocabulary, these from SpatialData's, and a table written by
+/// one without the other would show one set and not the other.
+fn table_rows(spatialdata: Option<&SpatialData>) -> Vec<String> {
+    let Some(SpatialData::Table(annotation)) = spatialdata else {
+        return Vec::new();
+    };
+
+    let mut rows = Vec::new();
+    // Capped like the Parquet schema row, and for the same reason: a table
+    // over three regions names them, and one over three hundred would run off
+    // the side of the terminal.
+    if let Some(regions) = &annotation.regions {
+        rows.push(format!("annotates: {}", capped(regions).join(", ")));
+    }
+    if let Some(key) = &annotation.region_key {
+        rows.push(format!("region key: {key}"));
+    }
+    if let Some(key) = &annotation.instance_key {
+        rows.push(format!("instance key: {key}"));
+    }
+    rows
+}
+
+/// The first `SHOWN` items of a list, with the rest counted rather than named.
+///
+/// A terminal is only so wide. `--json` carries every one of these lists whole,
+/// which is where a reader who wants them all should look.
+fn capped(items: &[String]) -> Vec<String> {
+    let mut shown: Vec<String> = items.iter().take(SHOWN).cloned().collect();
+
+    if let Some(rest) = items.len().checked_sub(SHOWN).filter(|rest| *rest > 0) {
+        shown.push(format!("... ({rest} more)"));
+    }
+
+    shown
+}
+
+/// How many items of a list a row names before it starts counting instead.
+const SHOWN: usize = 12;
 
 /// The rows an OME-Zarr group adds beneath its own line.
 fn ome_rows(ome: Option<&OmeInfo>) -> Vec<String> {
@@ -2346,20 +2802,14 @@ fn parquet_rows(parquet: Option<&ParquetSummary>) -> Vec<String> {
         format!("parquet files: {}", parquet.files),
     ];
 
-    const SHOWN: usize = 12;
     if !parquet.columns.is_empty() {
-        let mut schema: Vec<String> = parquet
+        let schema: Vec<String> = parquet
             .columns
             .iter()
-            .take(SHOWN)
             .map(|column| format!("{}:{}", column.name, column.kind))
             .collect();
 
-        if let Some(rest) = parquet.columns.len().checked_sub(SHOWN).filter(|n| *n > 0) {
-            schema.push(format!("... ({rest} more)"));
-        }
-
-        rows.push(format!("schema: {}", schema.join(", ")));
+        rows.push(format!("schema: {}", capped(&schema).join(", ")));
     }
 
     rows
@@ -2613,13 +3063,13 @@ fn json_tree(
                 node["ome"] = json_ome(ome);
             }
             if let Some(spatialdata) = &meta.spatialdata {
-                node["spatialdata"] = json!({
-                    "kind": spatialdata.kind(),
-                    "version": spatialdata.version(),
-                });
+                node["spatialdata"] = json_spatialdata(spatialdata);
             }
             if let Some(parquet) = &meta.parquet {
                 node["parquet"] = json_parquet(parquet);
+            }
+            if let Some(anndata) = &meta.anndata {
+                node["anndata"] = json_anndata(anndata);
             }
         }
         NodeKind::Unknown => {}
@@ -2670,6 +3120,74 @@ fn json_array_meta(meta: &ArrayMeta) -> Value {
     // shortest way to add a field only sometimes.
     if let Some(shards) = &meta.shards {
         value["shards"] = json!(shards);
+    }
+
+    value
+}
+
+/// What a group is in SpatialData's vocabulary.
+///
+/// `version` is the container format version, which only a store root records;
+/// it is `null` on every element, as it always has been.
+///
+/// A table adds the three keys describing what it annotates. They appear on a
+/// table and on nothing else -- the same rule a plate's counts follow -- and a
+/// `null` among them is what the file itself holds: SpatialData writes all
+/// three even for a table that annotates nothing.
+///
+/// `regions` is a list whatever the file wrote, because a single region is
+/// stored as a bare string and the difference means nothing -- see `regions`.
+fn json_spatialdata(spatialdata: &SpatialData) -> Value {
+    let mut value = json!({
+        "kind": spatialdata.kind(),
+        "version": spatialdata.version(),
+    });
+
+    if let SpatialData::Table(annotation) = spatialdata {
+        value["regions"] = json!(annotation.regions);
+        value["region_key"] = json!(annotation.region_key);
+        value["instance_key"] = json!(annotation.instance_key);
+    }
+
+    value
+}
+
+/// What the AnnData table inside a SpatialData table declares.
+///
+/// A section of its own beside `spatialdata`, because the two are different
+/// vocabularies read from different keys: `spatialdata` is what SpatialData
+/// wrote about the elements this table annotates, and this is what AnnData
+/// wrote about the table itself.
+///
+/// `null` follows the rule the rest of this output follows -- a field that was
+/// looked for and could not be read -- and every key here applies to every
+/// AnnData table, so every key is always present. The two exceptions are the
+/// ones that are not applicable rather than unread: `x` has a `dtype` only
+/// when it is dense, because a sparse matrix keeps its dtype on an array this
+/// program does not open.
+///
+/// `obs_columns` and `var_columns` are the declared lists whole, however long.
+/// The tree caps its counts into a row because a terminal is only so wide, and
+/// nothing about JSON is. No column value is here, and none was read.
+fn json_anndata(anndata: &AnnData) -> Value {
+    let mut value = json!({
+        "encoding_version": anndata.encoding_version,
+        "observations": anndata.observations,
+        "variables": anndata.variables,
+        "obs_columns": anndata.obs_columns,
+        "var_columns": anndata.var_columns,
+        "x": Value::Null,
+    });
+
+    if let Some(x) = &anndata.x {
+        let mut matrix = json!({
+            "kind": x.kind,
+            "shape": x.shape,
+        });
+        if let Some(dtype) = &x.dtype {
+            matrix["dtype"] = json!(dtype);
+        }
+        value["x"] = matrix;
     }
 
     value
@@ -4355,6 +4873,7 @@ mod tests {
                 ome: Some(info),
                 spatialdata: None,
                 parquet: None,
+                anndata: None,
             })),
             vec!["rows: 2", "columns: 3", "wells: 3"]
         );
@@ -4378,6 +4897,7 @@ mod tests {
                 ome: Some(info),
                 spatialdata: None,
                 parquet: None,
+                anndata: None,
             }))
             .is_empty()
         );
@@ -4407,6 +4927,7 @@ mod tests {
                 ome: Some(info),
                 spatialdata: None,
                 parquet: None,
+                anndata: None,
             }))
             .is_empty()
         );
@@ -4438,6 +4959,7 @@ mod tests {
                 ome: Some(info),
                 spatialdata: None,
                 parquet: None,
+                anndata: None,
             })),
             vec!["rows: 1", "columns: 1"]
         );
@@ -5466,6 +5988,10 @@ mod tests {
         /// Every path `read` was asked for. A Parquet file appearing here
         /// would mean somebody had pulled the whole thing into memory as text.
         reads: Mutex<Vec<String>>,
+        /// How many listings were made, of either kind. Remotely each is a
+        /// request of its own, which is what makes a summary that needs none
+        /// worth proving.
+        listings: Cell<usize>,
     }
 
     impl CountingStore {
@@ -5474,6 +6000,7 @@ mod tests {
                 inner: LocalStore::new(&root.to_string_lossy()),
                 suffix_bytes: Cell::new(0),
                 reads: Mutex::new(Vec::new()),
+                listings: Cell::new(0),
             }
         }
     }
@@ -5485,6 +6012,7 @@ mod tests {
         }
 
         fn children(&self, path: &str) -> io::Result<Vec<String>> {
+            self.listings.set(self.listings.get() + 1);
             self.inner.children(path)
         }
 
@@ -5493,6 +6021,7 @@ mod tests {
         }
 
         fn files(&self, path: &str) -> io::Result<Vec<String>> {
+            self.listings.set(self.listings.get() + 1);
             self.inner.files(path)
         }
 
@@ -5949,5 +6478,664 @@ mod tests {
         assert!(!tree.contains("rows:"), "{tree}");
         // Not read, not opened, not even measured.
         assert_eq!(store.suffix_bytes.get(), 0);
+    }
+
+    // ----------------------------------------------------------------------
+    // AnnData tables inside a SpatialData store.
+    //
+    // The numbers below are the ones the Xenium 1.0 replicate really holds --
+    // 167780 cells over 313 genes, a CSR `X`, eight `obs` columns and three
+    // `var` columns -- so a test that changes one has to mean it.
+    // ----------------------------------------------------------------------
+
+    /// The Zarr V3 metadata of a table group, as SpatialData's writer writes
+    /// it: AnnData's two keys, SpatialData's element kind, and the three that
+    /// say what the table annotates.
+    fn table_metadata(region: Value) -> String {
+        json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "encoding-type": "anndata",
+                "encoding-version": "0.1.0",
+                "spatialdata-encoding-type": "ngff:regions_table",
+                "region": region,
+                "region_key": "region",
+                "instance_key": "cell_id",
+                "version": "0.2",
+            },
+        })
+        .to_string()
+    }
+
+    /// The Zarr V3 metadata of an AnnData dataframe group.
+    fn dataframe_metadata(columns: &[&str]) -> String {
+        json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "column-order": columns,
+                "_index": "_index",
+                "encoding-type": "dataframe",
+                "encoding-version": "0.2.0",
+            },
+        })
+        .to_string()
+    }
+
+    /// The Zarr V3 metadata of a one-dimensional string array, which is what
+    /// an AnnData dataframe index is.
+    fn index_metadata(length: usize) -> String {
+        json!({
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [length],
+            "data_type": "string",
+            "chunk_grid": { "name": "regular", "configuration": { "chunk_shape": [length] } },
+            "attributes": { "encoding-type": "string-array", "encoding-version": "0.2.0" },
+        })
+        .to_string()
+    }
+
+    /// A whole Zarr V3 SpatialData table on disk, with `X` written as given.
+    ///
+    /// Every fixture below differs only in `X` and in what the table says it
+    /// annotates, so those are the two things passed in. The chunk files are
+    /// there to be left alone: nothing in this program should ever open one.
+    fn write_table(dir: &Path, region: Value, x: &[(&str, &str)]) {
+        let table = table_metadata(region);
+        let obs = dataframe_metadata(&[
+            "cell_id",
+            "transcript_counts",
+            "control_probe_counts",
+            "control_codeword_counts",
+            "total_counts",
+            "cell_area",
+            "nucleus_area",
+            "region",
+        ]);
+        let var = dataframe_metadata(&["gene_ids", "feature_types", "genome"]);
+        let obs_index = index_metadata(167780);
+        let var_index = index_metadata(313);
+
+        let mut objects = vec![
+            ("zarr.json", table.as_str()),
+            ("obs/zarr.json", obs.as_str()),
+            ("obs/_index/zarr.json", obs_index.as_str()),
+            ("obs/_index/c/0", "index values, and never read"),
+            ("var/zarr.json", var.as_str()),
+            ("var/_index/zarr.json", var_index.as_str()),
+            ("var/_index/c/0", "index values, and never read"),
+        ];
+        objects.extend_from_slice(x);
+
+        write_fixture(dir, &objects);
+    }
+
+    /// A sparse `X`: the group that declares the representation and the shape,
+    /// and the three arrays beneath it that this program never opens.
+    fn sparse_x(encoding: &str) -> [(&'static str, String); 4] {
+        let group = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "shape": [167780, 313],
+                "encoding-type": encoding,
+                "encoding-version": "0.1.0",
+            },
+        })
+        .to_string();
+
+        let array = json!({
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [23409569],
+            "data_type": "float32",
+            "chunk_grid": { "name": "regular", "configuration": { "chunk_shape": [131072] } },
+        })
+        .to_string();
+
+        [
+            ("X/zarr.json", group),
+            ("X/data/zarr.json", array.clone()),
+            (
+                "X/data/c/0",
+                String::from("expression values, and never read"),
+            ),
+            ("X/indptr/zarr.json", array),
+        ]
+    }
+
+    /// The same as a slice of string pairs, ready for `write_table`.
+    fn as_objects<'a>(objects: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+        objects
+            .iter()
+            .map(|(path, body)| (*path, body.as_str()))
+            .collect()
+    }
+
+    /// The metadata rows a table draws, for a fixture on disk.
+    fn table_rows_of(dir: &Path) -> Vec<String> {
+        group_rows(&classify_dir(dir))
+    }
+
+    #[test]
+    fn a_table_reports_the_shape_and_annotation_its_metadata_declares() {
+        let dir = fixture("anndata-csr");
+        let x = sparse_x("csr_matrix");
+        write_table(&dir, json!("cell_circles"), &as_objects(&x));
+
+        let rows = table_rows_of(&dir);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        // Eight rows, and not one of them was counted. The two lengths come
+        // from the index arrays' declared shapes, the two widths from the
+        // declared `column-order`, and the last three from the table group's
+        // own attributes.
+        assert_eq!(
+            rows,
+            vec![
+                "observations: 167,780",
+                "variables: 313",
+                "X: csr [167780, 313]",
+                "obs columns: 8",
+                "var columns: 3",
+                "annotates: cell_circles",
+                "region key: region",
+                "instance key: cell_id",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_csc_matrix_is_reported_as_csc() {
+        // The other sparse representation AnnData writes. Matched exactly, so
+        // it is a row of its own rather than a csr misreported.
+        let dir = fixture("anndata-csc");
+        let x = sparse_x("csc_matrix");
+        write_table(&dir, json!("cell_circles"), &as_objects(&x));
+
+        let rows = table_rows_of(&dir);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert!(
+            rows.contains(&String::from("X: csc [167780, 313]")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_dense_x_reports_the_shape_and_dtype_of_the_array_it_is() {
+        let dir = fixture("anndata-dense");
+        let dense = json!({
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [167780, 313],
+            "data_type": "float32",
+            "chunk_grid": { "name": "regular", "configuration": { "chunk_shape": [4096, 313] } },
+            "attributes": { "encoding-type": "array", "encoding-version": "0.2.0" },
+        })
+        .to_string();
+
+        write_table(
+            &dir,
+            json!("cell_circles"),
+            &[
+                ("X/zarr.json", dense.as_str()),
+                ("X/c/0/0", "expression values, and never read"),
+            ],
+        );
+
+        let rows = table_rows_of(&dir);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        // A dense `X` is a Zarr array, so it has a dtype of its own to show --
+        // the one thing a sparse row cannot say, because the dtype is on an
+        // array inside the group and that array is not opened.
+        assert!(
+            rows.contains(&String::from("X: dense [167780, 313] float32")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_over_several_regions_names_them_all() {
+        // mibitof: one table annotating three label images, written as a list.
+        // A single region is a bare string, and both mean the same thing.
+        let dir = fixture("anndata-regions");
+        let x = sparse_x("csr_matrix");
+        write_table(
+            &dir,
+            json!(["point8_labels", "point16_labels", "point23_labels"]),
+            &as_objects(&x),
+        );
+
+        let rows = table_rows_of(&dir);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert!(
+            rows.contains(&String::from(
+                "annotates: point8_labels, point16_labels, point23_labels"
+            )),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_annotating_nothing_draws_no_annotation_rows() {
+        // SpatialData writes all three keys even when there is nothing to put
+        // in them, so this is a null rather than a missing key -- and a null
+        // is not something to print.
+        let dir = fixture("anndata-no-region");
+        let x = sparse_x("csr_matrix");
+        let table = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "encoding-type": "anndata",
+                "spatialdata-encoding-type": "ngff:regions_table",
+                "region": Value::Null,
+                "region_key": Value::Null,
+                "instance_key": Value::Null,
+            },
+        })
+        .to_string();
+
+        let mut objects = vec![("zarr.json", table.as_str())];
+        let x = as_objects(&x);
+        objects.extend_from_slice(&x);
+        write_fixture(&dir, &objects);
+
+        let rows = table_rows_of(&dir);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        // The table is still a table, and still says how big it is. It just
+        // has nothing to say about what it annotates.
+        assert_eq!(
+            rows,
+            vec![
+                "observations: 167,780",
+                "variables: 313",
+                "X: csr [167780, 313]"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_table_whose_var_is_unreadable_still_reports_what_obs_declared() {
+        // Every field falls out on its own. Here `var` is missing altogether
+        // and `X` declares a shape that is not a pair of numbers, so the
+        // variable count has nowhere left to come from -- and the rows that
+        // could be read are drawn anyway.
+        let dir = fixture("anndata-degraded");
+        let obs = dataframe_metadata(&["cell_id"]);
+        let obs_index = index_metadata(3309);
+        let x = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": { "shape": "wide", "encoding-type": "csr_matrix" },
+        })
+        .to_string();
+        let table = table_metadata(json!("cells"));
+
+        write_fixture(
+            &dir,
+            &[
+                ("zarr.json", table.as_str()),
+                ("obs/zarr.json", obs.as_str()),
+                ("obs/_index/zarr.json", obs_index.as_str()),
+                ("X/zarr.json", x.as_str()),
+            ],
+        );
+
+        let rows = table_rows_of(&dir);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        // No `variables` row and no `var columns` row, rather than a zero or a
+        // `?`; the representation still shows, because it was readable even
+        // though the shape beside it was not.
+        assert_eq!(
+            rows,
+            vec![
+                "observations: 3,309",
+                "X: csr",
+                "obs columns: 1",
+                "annotates: cells",
+                "region key: region",
+                "instance key: cell_id",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_index_that_cannot_be_read_falls_back_to_the_shape_x_declares() {
+        // The index array is the preferred source because it is the
+        // dataframe's own account of its length. When there is none to read,
+        // `X`'s declared shape is already in hand and says the same thing.
+        let dir = fixture("anndata-fallback");
+        let x = sparse_x("csr_matrix");
+        let empty = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": { "encoding-type": "dataframe" },
+        })
+        .to_string();
+        let table = table_metadata(json!("cell_circles"));
+
+        let mut objects = vec![
+            ("zarr.json", table.as_str()),
+            ("obs/zarr.json", empty.as_str()),
+            ("var/zarr.json", empty.as_str()),
+        ];
+        let x = as_objects(&x);
+        objects.extend_from_slice(&x);
+        write_fixture(&dir, &objects);
+
+        let rows = table_rows_of(&dir);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert!(
+            rows.contains(&String::from("observations: 167,780")),
+            "{rows:?}"
+        );
+        assert!(rows.contains(&String::from("variables: 313")), "{rows:?}");
+        // No `column-order` was declared, so no width is reported. Neither
+        // dataframe's children were listed to make one up.
+        assert!(!rows.iter().any(|row| row.contains("columns")), "{rows:?}");
+    }
+
+    #[test]
+    fn summarising_a_table_reads_metadata_and_never_a_chunk_or_a_listing() {
+        let dir = fixture("anndata-reads");
+        let x = sparse_x("csr_matrix");
+        write_table(&dir, json!("cell_circles"), &as_objects(&x));
+
+        let store = CountingStore::new(&dir);
+        let summary = anndata_summary(
+            &store,
+            "",
+            Some(&json!({ "encoding-version": "0.1.0" })),
+            Some(&SpatialData::Table(table_annotation(&json!({})))),
+        )
+        .expect("a table element should be summarised");
+
+        let reads = store.reads.lock().unwrap().clone();
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(summary.observations, Some(167780));
+        assert_eq!(summary.variables, Some(313));
+
+        // Five nodes, one file each, and every one of them named by a metadata
+        // file rather than found by looking around: `obs` and `var`, the index
+        // array each of them named, and `X`.
+        assert_eq!(
+            reads,
+            vec![
+                "obs/zarr.json",
+                "obs/_index/zarr.json",
+                "var/zarr.json",
+                "var/_index/zarr.json",
+                "X/zarr.json",
+            ]
+        );
+
+        // Said again the other way round, because a list is easy to weaken.
+        // Nothing under an array was opened, and nothing was listed -- which
+        // remotely is what keeps this to five requests wherever the store is.
+        for path in &reads {
+            assert!(!path.contains("/c/"), "{path:?} reaches into chunk storage");
+        }
+        assert_eq!(store.listings.get(), 0);
+    }
+
+    #[test]
+    fn an_ordinary_group_holding_x_obs_and_var_is_not_a_table() {
+        // The recognition rule is the SpatialData marker and nothing else. A
+        // group whose children are called `X`, `obs` and `var` -- or which is
+        // itself called `table` -- says nothing about itself by doing so.
+        let dir = fixture("anndata-lookalike");
+        let plain = json!({ "zarr_format": 3, "node_type": "group" }).to_string();
+        let obs = dataframe_metadata(&["cell_id"]);
+        let obs_index = index_metadata(3309);
+
+        write_fixture(
+            &dir,
+            &[
+                ("zarr.json", plain.as_str()),
+                ("obs/zarr.json", obs.as_str()),
+                ("obs/_index/zarr.json", obs_index.as_str()),
+            ],
+        );
+
+        let meta = group_meta(&dir);
+        let rows = group_rows(&NodeKind::Group(GroupMeta {
+            ome: meta.ome,
+            spatialdata: meta.spatialdata,
+            parquet: meta.parquet,
+            anndata: meta.anndata,
+        }));
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    #[test]
+    fn a_zarr_v2_table_is_read_from_its_split_metadata_files() {
+        // V2 keeps attributes in `.zattrs` and an array's shape in `.zarray`,
+        // and puts the same AnnData and SpatialData keys in them. The reader
+        // above is one reader: only where the bytes are differs.
+        let dir = fixture("anndata-v2");
+        let group = r#"{"zarr_format": 2}"#;
+
+        write_fixture(
+            &dir,
+            &[
+                (".zgroup", group),
+                (
+                    ".zattrs",
+                    &json!({
+                        "encoding-type": "anndata",
+                        "encoding-version": "0.1.0",
+                        "spatialdata-encoding-type": "ngff:regions_table",
+                        "region": "cells",
+                        "region_key": "region",
+                        "instance_key": "cell_id",
+                    })
+                    .to_string(),
+                ),
+                ("obs/.zgroup", group),
+                (
+                    "obs/.zattrs",
+                    &json!({
+                        "column-order": ["cell_id", "region"],
+                        "_index": "_index",
+                        "encoding-type": "dataframe",
+                    })
+                    .to_string(),
+                ),
+                (
+                    "obs/_index/.zarray",
+                    &json!({ "zarr_format": 2, "shape": [2389], "chunks": [2389], "dtype": "|O" })
+                        .to_string(),
+                ),
+                ("var/.zgroup", group),
+                (
+                    "var/.zattrs",
+                    &json!({ "column-order": [], "_index": "_index", "encoding-type": "dataframe" })
+                        .to_string(),
+                ),
+                (
+                    "var/_index/.zarray",
+                    &json!({ "zarr_format": 2, "shape": [268], "chunks": [268], "dtype": "|O" })
+                        .to_string(),
+                ),
+                ("X/.zgroup", group),
+                (
+                    "X/.zattrs",
+                    &json!({ "shape": [2389, 268], "encoding-type": "csr_matrix" }).to_string(),
+                ),
+            ],
+        );
+
+        let rows = table_rows_of(&dir);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                "observations: 2,389",
+                "variables: 268",
+                "X: csr [2389, 268]",
+                "obs columns: 2",
+                "var columns: 0",
+                "annotates: cells",
+                "region key: region",
+                "instance key: cell_id",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_summary_rows_sit_above_the_anndata_subtree_rather_than_replacing_it() {
+        // The rows are a summary, not a substitute. Everything AnnData wrote
+        // is still a group in the tree, and still walked into.
+        let dir = fixture("anndata-subtree");
+        let x = sparse_x("csr_matrix");
+        write_table(&dir, json!("cell_circles"), &as_objects(&x));
+
+        let store = LocalStore::new(&dir.to_string_lossy());
+        let tree = rendered(&store, "table", Some(1));
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            tree.lines().collect::<Vec<&str>>(),
+            vec![
+                "table [group, SpatialData table]",
+                "├─ observations: 167,780",
+                "├─ variables: 313",
+                "├─ X: csr [167780, 313]",
+                "├─ obs columns: 8",
+                "├─ var columns: 3",
+                "├─ annotates: cell_circles",
+                "├─ region key: region",
+                "├─ instance key: cell_id",
+                "├── X [group]",
+                "├── obs [group]",
+                "└── var [group]",
+            ]
+        );
+    }
+
+    #[test]
+    fn json_carries_the_declared_columns_the_tree_only_counted() {
+        let dir = fixture("anndata-json");
+        let x = sparse_x("csr_matrix");
+        write_table(&dir, json!("cell_circles"), &as_objects(&x));
+
+        let store = LocalStore::new(&dir.to_string_lossy());
+        let kind = classify(&store, "");
+        let tree = json_tree(&store, "", "table", kind, Some(0)).unwrap();
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        // The AnnData facts and the SpatialData ones stay in separate objects,
+        // because they were read from separate vocabularies.
+        assert_eq!(
+            tree["anndata"],
+            json!({
+                "encoding_version": "0.1.0",
+                "observations": 167780,
+                "variables": 313,
+                "x": { "kind": "csr", "shape": [167780, 313] },
+                "obs_columns": [
+                    "cell_id",
+                    "transcript_counts",
+                    "control_probe_counts",
+                    "control_codeword_counts",
+                    "total_counts",
+                    "cell_area",
+                    "nucleus_area",
+                    "region",
+                ],
+                "var_columns": ["gene_ids", "feature_types", "genome"],
+            })
+        );
+        assert_eq!(
+            tree["spatialdata"],
+            json!({
+                "kind": "table",
+                "version": Value::Null,
+                "regions": ["cell_circles"],
+                "region_key": "region",
+                "instance_key": "cell_id",
+            })
+        );
+    }
+
+    #[test]
+    fn a_consolidated_table_is_summarised_from_the_snapshot_alone() {
+        // A static server answers `GET` and nothing else, so without the
+        // consolidated document there is no way past the root. With it, the
+        // five metadata files the summary wants are already in hand -- and the
+        // server is asked for none of them.
+        let dir = fixture("anndata-consolidated");
+        let x = sparse_x("csr_matrix");
+        write_table(&dir, json!("cell_circles"), &as_objects(&x));
+
+        // The snapshot, built from the very files just written, so the two
+        // cannot drift apart.
+        let store = LocalStore::new(&dir.to_string_lossy());
+        let mut metadata = serde_json::Map::new();
+        for path in [
+            "obs/zarr.json",
+            "obs/_index/zarr.json",
+            "var/zarr.json",
+            "var/_index/zarr.json",
+            "X/zarr.json",
+        ] {
+            let node: Value = serde_json::from_str(&store.read(path).unwrap()).unwrap();
+            let name = path.trim_end_matches("/zarr.json");
+            metadata.insert(String::from(name), node);
+        }
+
+        let mut root: Value = serde_json::from_str(&store.read("zarr.json").unwrap()).unwrap();
+        root["consolidated_metadata"] = json!({
+            "kind": "inline",
+            "must_understand": false,
+            "metadata": metadata,
+        });
+        let root = root.to_string();
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        let server = TestServer::start("srv/store.zarr", &[("zarr.json", root.as_str())], false);
+        let store = consolidate(server.open());
+        let tree = rendered(store.as_ref(), "table", None);
+
+        assert!(tree.contains("├─ observations: 167,780"), "{tree}");
+        assert!(tree.contains("├─ X: csr [167780, 313]"), "{tree}");
+        assert!(tree.contains("├─ obs columns: 8"), "{tree}");
+        assert!(tree.contains("└── var [group]"), "{tree}");
+
+        // Two requests for the whole store, summary included: the `.zmetadata`
+        // that a V3 store does not have, and the root that holds everything.
+        assert_eq!(
+            server.requests(),
+            vec![
+                String::from("/srv/store.zarr/.zmetadata"),
+                String::from("/srv/store.zarr/zarr.json"),
+            ]
+        );
     }
 }
