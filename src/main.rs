@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io;
@@ -256,9 +257,14 @@ them supplies a credential, requests are sent unsigned, which is what a public
 bucket wants; set AWS_SKIP_SIGNATURE=false to force the credential chain, and
 AWS_REGION when the bucket is not in us-east-1.
 
-Walking an HTTP(S) store needs a server that answers WebDAV PROPFIND, which is
-how children are found. Metadata is read with ordinary GETs, so a static server
-can still be inspected with --depth 0.
+A store carrying consolidated metadata -- Zarr V2's .zmetadata, or a Zarr V3
+root zarr.json holding an inline consolidated_metadata block -- is walked from
+that one document, and the rest of the store is never read.
+
+Walking any other HTTP(S) store needs a server that answers WebDAV PROPFIND,
+which is how children are found. Metadata is read with ordinary GETs, so a
+static server that cannot list can still be inspected with --depth 0, or in
+full when the store is consolidated.
 
 OPTIONS:
         --depth <N>  Descend at most N levels below the root.
@@ -415,6 +421,13 @@ fn run() -> io::Result<()> {
     // Which kind of store this is is settled once, here, by the scheme on the
     // path. Everything below reaches it through `Store` and never asks again.
     let store = open_store(&options.path)?;
+
+    // A store that keeps a copy of all its metadata in one document is read
+    // out of that document instead, which is what lets a server with no
+    // listing of any kind still be walked in full. Opportunistic: when there
+    // is nothing to find, this hands back the store it was given, unchanged.
+    // See `ConsolidatedStore`.
+    let store = consolidate(store);
 
     // The root is named by the path as it was typed, in both outputs. Every
     // node below it is named by its directory, or by its S3 prefix.
@@ -671,6 +684,265 @@ fn open_store(target: &str) -> io::Result<Box<dyn Store>> {
         Location::S3 { bucket, key } => Ok(Box::new(RemoteStore::s3(target, &bucket, &key)?)),
         Location::Http { base, path } => Ok(Box::new(RemoteStore::http(target, &base, &path)?)),
     }
+}
+
+/// Read `store`'s consolidated metadata, and hand back a store that answers
+/// from it. When there is none to read, hand back the store itself.
+///
+/// The one place the swap is made, so that everything above it -- the walk,
+/// both renderers, every reader of Zarr, OME-Zarr and SpatialData metadata --
+/// goes on asking the same three questions of the same trait and never learns
+/// which kind of store answered.
+fn consolidate(store: Box<dyn Store>) -> Box<dyn Store> {
+    match ConsolidatedStore::open(store.as_ref()) {
+        Some(consolidated) => Box::new(consolidated),
+        None => store,
+    }
+}
+
+/// A store's entire metadata, read once out of a single document.
+///
+/// Some stores keep a copy of every metadata file in the tree in one object at
+/// the root. Zarr V2 puts it in `.zmetadata`; Zarr V3 puts a
+/// `consolidated_metadata` block inside the root `zarr.json`. Either way one
+/// read yields the whole hierarchy, and this is what serves it back.
+///
+/// That is what makes an ordinary static HTTP server usable. Such a server
+/// answers `GET` but not the WebDAV `PROPFIND` a listing needs, so without
+/// consolidation the walk cannot get past the root -- see
+/// `RemoteStore::diagnose`. With it, no listing is wanted at all: the children
+/// are in the document. The same holds for a local directory and for S3, where
+/// it saves a request per node rather than making the walk possible.
+///
+/// This holds no store. Once the document has been read the index *is* the
+/// store, and the physical one is dropped -- which is the precedence rule made
+/// structural rather than remembered. Consolidated metadata is a snapshot,
+/// taken at one moment and possibly stale since; a tree that mixed it with
+/// live reads would show two moments at once and say which was which nowhere.
+/// The only read that does come off the store is the one that found the
+/// document, and that happens before this exists.
+struct ConsolidatedStore {
+    /// Metadata path to document text, in exactly the form `Store::read`
+    /// takes: `.zgroup`, `images/0/.zarray`, `a/b/zarr.json`.
+    ///
+    /// The text is written back out from the parsed document rather than
+    /// sliced from the original, because JSON gives no way to point at a
+    /// subtree of itself. What every reader above wants is the object, and the
+    /// object is unchanged; only its whitespace is.
+    documents: BTreeMap<String, String>,
+    /// Node path to its immediate children, sorted. Derived from the metadata
+    /// paths and from nothing else -- see `child_index`.
+    children: BTreeMap<String, Vec<String>>,
+}
+
+impl ConsolidatedStore {
+    /// `store`'s consolidated metadata, if it has any this program reads.
+    ///
+    /// The two conventions are tried in the order the two Zarr versions are
+    /// tried everywhere else here. `None` means there was nothing to find, or
+    /// nothing that could be made sense of, and the walk then reads the store
+    /// directly exactly as it did before any of this existed. Consolidation is
+    /// opportunistic: no store that worked without it may come to depend on
+    /// it.
+    fn open(store: &dyn Store) -> Option<ConsolidatedStore> {
+        let documents = consolidated_v2(store).or_else(|| consolidated_v3(store))?;
+        let children = child_index(&documents);
+        Some(ConsolidatedStore {
+            documents,
+            children,
+        })
+    }
+}
+
+impl Store for ConsolidatedStore {
+    fn read(&self, path: &str) -> Option<String> {
+        // The index and nothing but the index. A metadata file the document
+        // does not mention is missing as far as this store is concerned, which
+        // is what keeps the snapshot whole -- see the type's own note.
+        self.documents.get(path).cloned()
+    }
+
+    fn children(&self, path: &str) -> io::Result<Vec<String>> {
+        // Never an error. The listing that could fail is the very thing
+        // consolidation replaces, and a node the index does not know has no
+        // children rather than an unanswerable question.
+        Ok(self.children.get(path).cloned().unwrap_or_default())
+    }
+
+    fn check_root(&self, _identified: bool) -> io::Result<()> {
+        // The document was read off the store, so the root is there. That is
+        // the whole check, and it is the one a server without a listing could
+        // not otherwise have passed.
+        Ok(())
+    }
+}
+
+/// The metadata map of a Zarr V2 `.zmetadata`, keyed by metadata path.
+///
+/// The document is flat: one entry per metadata file in the store, keyed by
+/// the very path a walk would have read that file from. So there is no
+/// translation to do here, only filtering -- see `metadata_node`.
+///
+/// `zarr_consolidated_format` is a version, and 1 is the only one there has
+/// ever been. Anything else is left alone rather than guessed at: falling back
+/// to reading the store is slower and always right.
+fn consolidated_v2(store: &dyn Store) -> Option<BTreeMap<String, String>> {
+    let value: Value = serde_json::from_str(&store.read(".zmetadata")?).ok()?;
+
+    if value.get("zarr_consolidated_format")?.as_u64()? != 1 {
+        return None;
+    }
+
+    let mut documents = BTreeMap::new();
+    for (path, document) in value.get("metadata")?.as_object()? {
+        // Only the filenames a node's metadata lives in. Anything else in the
+        // map -- a chunk key, something another tool left there -- is not a
+        // document this program can read and must not become a node.
+        if metadata_node(path).is_some() {
+            documents.insert(path.clone(), document.to_string());
+        }
+    }
+
+    Some(documents)
+}
+
+/// The nodes of a Zarr V3 root `zarr.json` that carries an inline
+/// `consolidated_metadata` block, keyed by metadata path.
+///
+/// V3 consolidation is younger than V2's and less settled -- zarr-python warns
+/// that it is not part of the V3 specification and may change -- so only the
+/// one form current zarr-python actually writes is read here. Anything else
+/// falls back to reading the store.
+///
+/// The root's own document goes in as it was read: it is the one thing in the
+/// index that came off the store rather than out of the block, and it is what
+/// classifies the root.
+fn consolidated_v3(store: &dyn Store) -> Option<BTreeMap<String, String>> {
+    let root = store.read("zarr.json")?;
+    let value: Value = serde_json::from_str(&root).ok()?;
+    let block = value.get("consolidated_metadata")?;
+
+    // Checked before anything is built, so that an unsupported block is a
+    // fallback to live reads rather than a half-filled index.
+    inline_metadata(block)?;
+
+    let mut documents = BTreeMap::new();
+    documents.insert(String::from("zarr.json"), root);
+    collect_v3(block, "", &mut documents);
+    Some(documents)
+}
+
+/// The nodes named by one `consolidated_metadata` block, or `None` when the
+/// block is not one this program reads.
+///
+/// `kind` says how the metadata is carried and `inline` -- in the block itself
+/// -- is the only value zarr-python writes. `must_understand` is the Zarr V3
+/// escape hatch: `false` means a reader that does not understand this block
+/// may ignore it, which is exactly what returning `None` here does. `true`
+/// would be a demand, and the honest answer to a demand we cannot meet is to
+/// leave the block alone.
+fn inline_metadata(block: &Value) -> Option<&serde_json::Map<String, Value>> {
+    if block.get("kind")?.as_str()? != "inline" {
+        return None;
+    }
+    if block.get("must_understand")?.as_bool()? {
+        return None;
+    }
+    block.get("metadata")?.as_object()
+}
+
+/// Add the nodes of one `consolidated_metadata` block to `documents`, under
+/// `prefix`.
+///
+/// Each entry is a whole `zarr.json` document, and its key is that node's path
+/// relative to the group holding the block. Current zarr-python writes the
+/// flat form -- `images`, `images/0`, `a/b/arr` all in the root's block, each
+/// nested block left empty -- but a group's block is defined to hold its own
+/// children, so a non-empty one is followed. Both are the same rule read
+/// twice, which is why one function does both.
+///
+/// A nested block that is not the inline form stops the recursion there and
+/// nowhere else: the nodes already collected stand, and the subtree beneath
+/// the block simply has no children in the index.
+fn collect_v3(block: &Value, prefix: &str, documents: &mut BTreeMap<String, String>) {
+    let Some(nodes) = inline_metadata(block) else {
+        return;
+    };
+
+    for (name, node) in nodes {
+        let path = child_path(prefix, name);
+        documents.insert(child_path(&path, "zarr.json"), node.to_string());
+
+        if let Some(nested) = node.get("consolidated_metadata") {
+            collect_v3(nested, &path, documents);
+        }
+    }
+}
+
+/// The node a metadata path belongs to, or `None` when the path does not name
+/// a metadata file this program reads.
+///
+/// `images/0/.zarray` belongs to `images/0`, and `.zgroup` belongs to the
+/// root, which is the empty string. The filenames are never nodes themselves:
+/// a store's tree is its groups and arrays, not the files describing them.
+fn metadata_node(path: &str) -> Option<&str> {
+    let (parent, name) = match path.rsplit_once('/') {
+        Some((parent, name)) => (parent, name),
+        None => ("", path),
+    };
+
+    match name {
+        ".zgroup" | ".zarray" | ".zattrs" | "zarr.json" => Some(parent),
+        _ => None,
+    }
+}
+
+/// Which children each node has, worked out from the metadata paths alone.
+///
+/// Every path above a node is registered as a node too. A group whose own
+/// metadata is missing from the document is then still there -- classified
+/// `[unknown]`, which is the right answer and the same one the walk gives an
+/// unreadable directory -- rather than taking the whole subtree beneath it out
+/// of the tree.
+///
+/// The root is not a child of anything, so it is the one node that never
+/// appears in a list here; it appears only as a key.
+fn child_index(documents: &BTreeMap<String, String>) -> BTreeMap<String, Vec<String>> {
+    let mut nodes: BTreeSet<&str> = BTreeSet::new();
+    for path in documents.keys() {
+        let Some(node) = metadata_node(path) else {
+            continue;
+        };
+        for (index, _) in node.match_indices('/') {
+            nodes.insert(&node[..index]);
+        }
+        if !node.is_empty() {
+            nodes.insert(node);
+        }
+    }
+
+    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for node in nodes {
+        let (parent, name) = match node.rsplit_once('/') {
+            Some((parent, name)) => (parent, name),
+            None => ("", node),
+        };
+        children
+            .entry(String::from(parent))
+            .or_default()
+            .push(String::from(name));
+    }
+
+    // Sorted for the reason every other `children` is: the tree has to know
+    // which child is last before it can draw a connector. The set they came
+    // out of was ordered by full path, which for one parent's children is the
+    // same order -- but that is a coincidence of the encoding, not a promise
+    // this makes, so it is said here rather than relied on.
+    for names in children.values_mut() {
+        names.sort();
+    }
+
+    children
 }
 
 /// A Zarr store in a directory on this machine.
@@ -2035,6 +2307,459 @@ mod tests {
             r#"{"zarr_format": 3, "node_type": "array", "shape": [4], "data_type": "uint8",
                 "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}}}"#,
         ),
+    ];
+
+    /// One small Zarr V2 store with consolidated metadata, exactly as
+    /// zarr-python 3.3.0 wrote it.
+    ///
+    /// Every per-node file is here as well as the `.zmetadata` that copies
+    /// them, because the point of most of these tests is that the per-node
+    /// files are never asked for. So are two chunk objects, for the same
+    /// reason they are in `FIXTURE`: nothing may ever name them.
+    ///
+    /// The empty `consolidated_metadata` blocks inside the nested `.zgroup`
+    /// entries are zarr-python's own -- its flat on-disk form -- and are
+    /// copied here rather than tidied away, so that what is under test is a
+    /// real document and not a cleaned-up idea of one.
+    const CONSOLIDATED_V2: &[(&str, &str)] = &[
+        (
+            ".zattrs",
+            r#"{
+  "note": "root"
+}"#,
+        ),
+        (
+            ".zgroup",
+            r#"{
+  "zarr_format": 2
+}"#,
+        ),
+        (
+            ".zmetadata",
+            r#"{"metadata": {".zgroup": {"zarr_format": 2}, ".zattrs": {"note": "root"}, "images/.zattrs": {"multiscales": [{"version": "0.4", "axes": [{"name": "y", "type": "space"}, {"name": "x", "type": "space"}], "datasets": [{"path": "0"}, {"path": "1"}]}]}, "images/.zgroup": {"zarr_format": 2, "consolidated_metadata": {"metadata": {}, "must_understand": false, "kind": "inline"}}, "labels/.zattrs": {}, "labels/.zgroup": {"zarr_format": 2, "consolidated_metadata": {"metadata": {}, "must_understand": false, "kind": "inline"}}, "images/0/.zattrs": {}, "images/0/.zarray": {"shape": [64, 64], "chunks": [32, 32], "dtype": "|u1", "fill_value": 0, "order": "C", "filters": null, "dimension_separator": ".", "compressor": {"id": "blosc", "cname": "lz4", "clevel": 5, "shuffle": 1, "blocksize": 0}, "zarr_format": 2}, "images/1/.zattrs": {}, "images/1/.zarray": {"shape": [32, 32], "chunks": [16, 16], "dtype": "|u1", "fill_value": 0, "order": "C", "filters": null, "dimension_separator": ".", "compressor": {"id": "blosc", "cname": "lz4", "clevel": 5, "shuffle": 1, "blocksize": 0}, "zarr_format": 2}, "labels/mask/.zattrs": {}, "labels/mask/.zarray": {"shape": [8, 8], "chunks": [4, 4], "dtype": "<i4", "fill_value": 0, "order": "C", "filters": null, "dimension_separator": ".", "compressor": {"id": "blosc", "cname": "lz4", "clevel": 5, "shuffle": 1, "blocksize": 0}, "zarr_format": 2}}, "zarr_consolidated_format": 1}"#,
+        ),
+        (
+            "images/.zattrs",
+            r#"{
+  "multiscales": [
+    {
+      "version": "0.4",
+      "axes": [
+        {
+          "name": "y",
+          "type": "space"
+        },
+        {
+          "name": "x",
+          "type": "space"
+        }
+      ],
+      "datasets": [
+        {
+          "path": "0"
+        },
+        {
+          "path": "1"
+        }
+      ]
+    }
+  ]
+}"#,
+        ),
+        (
+            "images/.zgroup",
+            r#"{
+  "zarr_format": 2
+}"#,
+        ),
+        (
+            "images/0/.zarray",
+            r#"{
+  "shape": [
+    64,
+    64
+  ],
+  "chunks": [
+    32,
+    32
+  ],
+  "dtype": "|u1",
+  "fill_value": 0,
+  "order": "C",
+  "filters": null,
+  "dimension_separator": ".",
+  "compressor": {
+    "id": "blosc",
+    "cname": "lz4",
+    "clevel": 5,
+    "shuffle": 1,
+    "blocksize": 0
+  },
+  "zarr_format": 2
+}"#,
+        ),
+        ("images/0/.zattrs", r#"{}"#),
+        (
+            "images/1/.zarray",
+            r#"{
+  "shape": [
+    32,
+    32
+  ],
+  "chunks": [
+    16,
+    16
+  ],
+  "dtype": "|u1",
+  "fill_value": 0,
+  "order": "C",
+  "filters": null,
+  "dimension_separator": ".",
+  "compressor": {
+    "id": "blosc",
+    "cname": "lz4",
+    "clevel": 5,
+    "shuffle": 1,
+    "blocksize": 0
+  },
+  "zarr_format": 2
+}"#,
+        ),
+        ("images/1/.zattrs", r#"{}"#),
+        ("labels/.zattrs", r#"{}"#),
+        (
+            "labels/.zgroup",
+            r#"{
+  "zarr_format": 2
+}"#,
+        ),
+        (
+            "labels/mask/.zarray",
+            r#"{
+  "shape": [
+    8,
+    8
+  ],
+  "chunks": [
+    4,
+    4
+  ],
+  "dtype": "<i4",
+  "fill_value": 0,
+  "order": "C",
+  "filters": null,
+  "dimension_separator": ".",
+  "compressor": {
+    "id": "blosc",
+    "cname": "lz4",
+    "clevel": 5,
+    "shuffle": 1,
+    "blocksize": 0
+  },
+  "zarr_format": 2
+}"#,
+        ),
+        ("labels/mask/.zattrs", r#"{}"#),
+        ("images/0/0.0", r#"chunk, not metadata"#),
+        ("labels/mask/0.0", r#"chunk, not metadata"#),
+    ];
+
+    /// One small Zarr V3 store with inline consolidated metadata, exactly as
+    /// zarr-python 3.3.0 wrote it.
+    ///
+    /// The root `zarr.json` carries the whole hierarchy in one
+    /// `consolidated_metadata` block, keyed by path from the root -- `a`,
+    /// `a/b`, `a/b/arr` -- with each node's own nested block left empty. That
+    /// flat shape is the writer's, not a guess: see `collect_v3`, which reads
+    /// a non-empty nested block too.
+    const CONSOLIDATED_V3: &[(&str, &str)] = &[
+        (
+            "a/b/arr/zarr.json",
+            r#"{
+  "shape": [
+    4
+  ],
+  "data_type": "float32",
+  "chunk_grid": {
+    "name": "regular",
+    "configuration": {
+      "chunk_shape": [
+        2
+      ]
+    }
+  },
+  "chunk_key_encoding": {
+    "name": "default",
+    "configuration": {
+      "separator": "/"
+    }
+  },
+  "fill_value": 0.0,
+  "codecs": [
+    {
+      "name": "bytes",
+      "configuration": {
+        "endian": "little"
+      }
+    },
+    {
+      "name": "zstd",
+      "configuration": {
+        "level": 0,
+        "checksum": false
+      }
+    }
+  ],
+  "attributes": {},
+  "zarr_format": 3,
+  "node_type": "array",
+  "storage_transformers": []
+}"#,
+        ),
+        (
+            "a/b/zarr.json",
+            r#"{
+  "attributes": {},
+  "zarr_format": 3,
+  "node_type": "group"
+}"#,
+        ),
+        (
+            "a/zarr.json",
+            r#"{
+  "attributes": {},
+  "zarr_format": 3,
+  "node_type": "group"
+}"#,
+        ),
+        (
+            "images/0/zarr.json",
+            r#"{
+  "shape": [
+    64,
+    64
+  ],
+  "data_type": "uint16",
+  "chunk_grid": {
+    "name": "regular",
+    "configuration": {
+      "chunk_shape": [
+        32,
+        32
+      ]
+    }
+  },
+  "chunk_key_encoding": {
+    "name": "default",
+    "configuration": {
+      "separator": "/"
+    }
+  },
+  "fill_value": 0,
+  "codecs": [
+    {
+      "name": "bytes",
+      "configuration": {
+        "endian": "little"
+      }
+    },
+    {
+      "name": "zstd",
+      "configuration": {
+        "level": 0,
+        "checksum": false
+      }
+    }
+  ],
+  "attributes": {},
+  "zarr_format": 3,
+  "node_type": "array",
+  "storage_transformers": []
+}"#,
+        ),
+        (
+            "images/zarr.json",
+            r#"{
+  "attributes": {
+    "ome": {
+      "version": "0.5",
+      "multiscales": [
+        {
+          "axes": [
+            {
+              "name": "y",
+              "type": "space"
+            },
+            {
+              "name": "x",
+              "type": "space"
+            }
+          ],
+          "datasets": [
+            {
+              "path": "0"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}"#,
+        ),
+        (
+            "zarr.json",
+            r#"{
+  "attributes": {
+    "note": "root3"
+  },
+  "zarr_format": 3,
+  "consolidated_metadata": {
+    "kind": "inline",
+    "must_understand": false,
+    "metadata": {
+      "a": {
+        "attributes": {},
+        "zarr_format": 3,
+        "consolidated_metadata": {
+          "kind": "inline",
+          "must_understand": false,
+          "metadata": {}
+        },
+        "node_type": "group"
+      },
+      "images": {
+        "attributes": {
+          "ome": {
+            "version": "0.5",
+            "multiscales": [
+              {
+                "axes": [
+                  {
+                    "name": "y",
+                    "type": "space"
+                  },
+                  {
+                    "name": "x",
+                    "type": "space"
+                  }
+                ],
+                "datasets": [
+                  {
+                    "path": "0"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        "zarr_format": 3,
+        "consolidated_metadata": {
+          "kind": "inline",
+          "must_understand": false,
+          "metadata": {}
+        },
+        "node_type": "group"
+      },
+      "a/b": {
+        "attributes": {},
+        "zarr_format": 3,
+        "consolidated_metadata": {
+          "kind": "inline",
+          "must_understand": false,
+          "metadata": {}
+        },
+        "node_type": "group"
+      },
+      "images/0": {
+        "shape": [
+          64,
+          64
+        ],
+        "data_type": "uint16",
+        "chunk_grid": {
+          "name": "regular",
+          "configuration": {
+            "chunk_shape": [
+              32,
+              32
+            ]
+          }
+        },
+        "chunk_key_encoding": {
+          "name": "default",
+          "configuration": {
+            "separator": "/"
+          }
+        },
+        "fill_value": 0,
+        "codecs": [
+          {
+            "name": "bytes",
+            "configuration": {
+              "endian": "little"
+            }
+          },
+          {
+            "name": "zstd",
+            "configuration": {
+              "level": 0,
+              "checksum": false
+            }
+          }
+        ],
+        "attributes": {},
+        "zarr_format": 3,
+        "node_type": "array",
+        "storage_transformers": []
+      },
+      "a/b/arr": {
+        "shape": [
+          4
+        ],
+        "data_type": "float32",
+        "chunk_grid": {
+          "name": "regular",
+          "configuration": {
+            "chunk_shape": [
+              2
+            ]
+          }
+        },
+        "chunk_key_encoding": {
+          "name": "default",
+          "configuration": {
+            "separator": "/"
+          }
+        },
+        "fill_value": 0.0,
+        "codecs": [
+          {
+            "name": "bytes",
+            "configuration": {
+              "endian": "little"
+            }
+          },
+          {
+            "name": "zstd",
+            "configuration": {
+              "level": 0,
+              "checksum": false
+            }
+          }
+        ],
+        "attributes": {},
+        "zarr_format": 3,
+        "node_type": "array",
+        "storage_transformers": []
+      }
+    }
+  },
+  "node_type": "group"
+}"#,
+        ),
+        ("images/0/c/0/0", r#"chunk, not metadata"#),
     ];
 
     /// Write a fixture into a directory, creating the directories it implies.
@@ -3665,5 +4390,310 @@ mod tests {
             spatialdata_info_v3(&value).map(|info| info.tag()),
             Some(String::from("SpatialData 0.2"))
         );
+    }
+
+    #[test]
+    fn a_real_zarr_python_v2_zmetadata_is_read_in_place_of_the_store() {
+        // The whole store is here, and so is the copy of it in `.zmetadata`.
+        // What proves the copy was used is that nothing else was opened.
+        let store = memory_store("s3://bucket/store.zarr", "store.zarr", CONSOLIDATED_V2);
+        let plain = rendered(&store, "store.zarr", None);
+        let consolidated = rendered(consolidate(Box::new(store)).as_ref(), "store.zarr", None);
+
+        // Reading the flat map gives the same tree as walking the store: the
+        // same nodes, the same order, the same OME-Zarr tag read out of the
+        // same `.zattrs` by the same function.
+        assert_eq!(plain, consolidated);
+        assert!(
+            consolidated.contains("images [group, OME-Zarr 0.4]"),
+            "{consolidated}"
+        );
+        assert!(consolidated.contains("├─ axes: y, x"), "{consolidated}");
+        assert!(consolidated.contains("── mask [array]"), "{consolidated}");
+        assert!(consolidated.contains("dtype:  <i4"), "{consolidated}");
+    }
+
+    #[test]
+    fn v2_children_are_derived_from_the_metadata_keys_and_from_nothing_else() {
+        // `images/0/.zarray` says there is a node at `images/0`, and by saying
+        // so it says there is one at `images` too. The filenames are not nodes
+        // and neither are the chunk keys sitting beside them.
+        let store = consolidate(Box::new(memory_store(
+            "s3://bucket/store.zarr",
+            "store.zarr",
+            CONSOLIDATED_V2,
+        )));
+
+        assert_eq!(
+            store.children("").unwrap(),
+            vec![String::from("images"), String::from("labels")]
+        );
+        assert_eq!(
+            store.children("images").unwrap(),
+            vec![String::from("0"), String::from("1")]
+        );
+        assert_eq!(
+            store.children("labels").unwrap(),
+            vec![String::from("mask")]
+        );
+
+        // An array is a leaf here as everywhere else: its chunk object is in
+        // the fixture, and it is not a child.
+        assert_eq!(store.children("images/0").unwrap(), Vec::<String>::new());
+        assert_eq!(store.children("labels/mask").unwrap(), Vec::<String>::new());
+
+        // And the documents are keyed by the paths a walk asks for, so the
+        // readers above need to know nothing about where they came from.
+        assert!(
+            store
+                .read("images/0/.zarray")
+                .unwrap()
+                .contains("\"shape\"")
+        );
+        assert!(store.read(".zgroup").is_some());
+        assert!(
+            store.read("images/0/0.0").is_none(),
+            "a chunk is not metadata"
+        );
+    }
+
+    #[test]
+    fn a_real_zarr_python_v3_consolidated_block_is_read_in_place_of_the_store() {
+        let store = memory_store("s3://bucket/store.zarr", "store.zarr", CONSOLIDATED_V3);
+        let plain = rendered(&store, "store.zarr", None);
+        let consolidated = rendered(consolidate(Box::new(store)).as_ref(), "store.zarr", None);
+
+        assert_eq!(plain, consolidated);
+
+        // Nesting several levels deep, in a document whose keys are flat.
+        assert!(consolidated.contains("── a [group]"), "{consolidated}");
+        assert!(consolidated.contains("── b [group]"), "{consolidated}");
+        assert!(consolidated.contains("── arr [array]"), "{consolidated}");
+        assert!(consolidated.contains("dtype:  float32"), "{consolidated}");
+
+        // The V3 attributes readers are handed the same document they would
+        // have read off the store, so the OME-Zarr 0.5 tag survives the trip.
+        assert!(
+            consolidated.contains("images [group, OME-Zarr 0.5]"),
+            "{consolidated}"
+        );
+        assert!(consolidated.contains("├─ axes: y, x"), "{consolidated}");
+    }
+
+    #[test]
+    fn a_server_that_cannot_list_walks_a_consolidated_store_in_full() {
+        // The acceptance case: an ordinary static file server, which answers
+        // `GET` and refuses `PROPFIND`. Without consolidation this store could
+        // be inspected no further than its root -- see
+        // `a_server_that_cannot_list_says_so_rather_than_saying_the_store_is_missing`.
+        let server = TestServer::start("data/store.zarr", CONSOLIDATED_V2, false);
+        let store = consolidate(server.open());
+        let tree = rendered(store.as_ref(), "store.zarr", None);
+
+        assert!(tree.contains("── images [group, OME-Zarr 0.4]"), "{tree}");
+        assert!(tree.contains("── mask [array]"), "{tree}");
+
+        // One request for the whole tree, and it is the consolidated document.
+        // Everything after it -- eleven nodes' worth of metadata, and the
+        // children of every group -- came out of that one response.
+        assert_eq!(
+            server.requests(),
+            vec![String::from("/data/store.zarr/.zmetadata")]
+        );
+    }
+
+    #[test]
+    fn a_consolidated_walk_makes_no_listing_and_reads_no_chunk() {
+        // The same over V3, where the document is the root `zarr.json` rather
+        // than a file of its own -- so the root read that found it is the root
+        // read the walk needed anyway.
+        let server = TestServer::start("srv/store.zarr", CONSOLIDATED_V3, false);
+        let store = consolidate(server.open());
+        let tree = rendered(store.as_ref(), "store.zarr", None);
+
+        assert!(tree.contains("── 0 [array]"), "{tree}");
+        assert!(!tree.contains("── c"), "the chunk directory is not a child");
+
+        // Two requests for the whole tree, and the first of them found
+        // nothing: V2's `.zmetadata` is looked for first, as V2 is everywhere
+        // else here, and a V3 store does not have one. That is one miss per
+        // run rather than one per node, and buying it back would mean deciding
+        // which Zarr version a store is before reading any of it.
+        assert_eq!(
+            server.requests(),
+            vec![
+                String::from("/srv/store.zarr/.zmetadata"),
+                String::from("/srv/store.zarr/zarr.json"),
+            ]
+        );
+
+        // Said the other way round, because a count is easy to read and easy
+        // to weaken: no request reached into chunk storage, and none of them
+        // was a listing.
+        for request in server.requests() {
+            assert!(
+                !request.contains("/c/"),
+                "{request:?} reaches into chunk storage"
+            );
+        }
+    }
+
+    #[test]
+    fn depth_limits_a_consolidated_walk_the_way_it_limits_any_other() {
+        let store = consolidate(Box::new(memory_store(
+            "s3://bucket/store.zarr",
+            "store.zarr",
+            CONSOLIDATED_V3,
+        )));
+
+        assert_eq!(
+            rendered(store.as_ref(), "store.zarr", Some(0)),
+            "store.zarr [group]\n"
+        );
+
+        let one = rendered(store.as_ref(), "store.zarr", Some(1));
+        assert!(one.contains("── a [group]"), "{one}");
+        assert!(!one.contains("── b [group]"), "{one}");
+
+        let two = rendered(store.as_ref(), "store.zarr", Some(2));
+        assert!(two.contains("── b [group]"), "{two}");
+        assert!(!two.contains("── arr [array]"), "{two}");
+    }
+
+    #[test]
+    fn a_consolidation_this_program_does_not_read_leaves_the_store_alone() {
+        // Three documents that are not the supported form, and one that is.
+        // Each of the three must fall back to reading the store, because a
+        // walk that reads the store is always right and only slower.
+        let unsupported = [
+            // A format version that has never existed.
+            json!({"zarr_consolidated_format": 2, "metadata": {".zgroup": {"zarr_format": 2}}}),
+            // No version at all.
+            json!({"metadata": {".zgroup": {"zarr_format": 2}}}),
+            // Not an object where one was promised.
+            json!({"zarr_consolidated_format": 1, "metadata": "elsewhere"}),
+        ];
+
+        for document in unsupported {
+            let mut objects = vec![(".zmetadata", document.to_string())];
+            objects.push((".zgroup", String::from(r#"{"zarr_format": 2}"#)));
+            objects.push(("A/.zgroup", String::from(r#"{"zarr_format": 2}"#)));
+            let objects: Vec<(&str, &str)> = objects
+                .iter()
+                .map(|(key, body)| (*key, body.as_str()))
+                .collect();
+
+            let store = consolidate(Box::new(memory_store(
+                "s3://bucket/store.zarr",
+                "store.zarr",
+                &objects,
+            )));
+            // The store answered, not the document: `A` is nowhere in it.
+            assert_eq!(
+                store.children("").unwrap(),
+                vec![String::from("A")],
+                "{document} should have been ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn a_v3_block_demanding_to_be_understood_is_left_alone() {
+        // `must_understand: false` is what every document zarr-python writes
+        // says, and it means a reader may ignore the block. `true` would be a
+        // demand, and the honest answer to one we cannot meet is to read the
+        // store instead. So is an unknown `kind`.
+        for block in [
+            json!({"kind": "inline", "must_understand": true, "metadata": {}}),
+            json!({"kind": "elsewhere", "must_understand": false, "metadata": {}}),
+        ] {
+            let root = json!({
+                "zarr_format": 3, "node_type": "group", "attributes": {},
+                "consolidated_metadata": block,
+            })
+            .to_string();
+            let objects = [
+                ("zarr.json", root.as_str()),
+                ("A/zarr.json", r#"{"zarr_format": 3, "node_type": "group"}"#),
+            ];
+
+            let store = consolidate(Box::new(memory_store(
+                "s3://bucket/store.zarr",
+                "store.zarr",
+                &objects,
+            )));
+            assert_eq!(
+                store.children("").unwrap(),
+                vec![String::from("A")],
+                "{block} should have been ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn a_v3_block_nested_inside_a_group_is_followed_too() {
+        // zarr-python writes the flat form, which the fixtures above cover.
+        // A group's block is defined to hold that group's own children,
+        // though, so a non-empty nested one is read by the same rule.
+        let root = json!({
+            "zarr_format": 3, "node_type": "group", "attributes": {},
+            "consolidated_metadata": {
+                "kind": "inline", "must_understand": false,
+                "metadata": {
+                    "A": {
+                        "zarr_format": 3, "node_type": "group", "attributes": {},
+                        "consolidated_metadata": {
+                            "kind": "inline", "must_understand": false,
+                            "metadata": {
+                                "inner": {
+                                    "zarr_format": 3, "node_type": "array", "attributes": {},
+                                    "shape": [8], "data_type": "uint8",
+                                    "chunk_grid": {"name": "regular",
+                                                   "configuration": {"chunk_shape": [4]}},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        })
+        .to_string();
+
+        let store = consolidate(Box::new(memory_store(
+            "s3://bucket/store.zarr",
+            "store.zarr",
+            &[("zarr.json", root.as_str())],
+        )));
+
+        let tree = rendered(store.as_ref(), "store.zarr", None);
+        assert!(tree.contains("── A [group]"), "{tree}");
+        assert!(tree.contains("── inner [array]"), "{tree}");
+        assert!(tree.contains("shape:  [8]"), "{tree}");
+    }
+
+    #[test]
+    fn a_node_the_document_never_names_is_still_walked_through() {
+        // A `.zgroup` missing from the map, with its children still in it.
+        // The group cannot be classified and is `[unknown]` -- the answer an
+        // unreadable directory gets -- but the subtree below it stays in the
+        // tree rather than disappearing with it.
+        let document = json!({
+            "zarr_consolidated_format": 1,
+            "metadata": {
+                ".zgroup": {"zarr_format": 2},
+                "A/B/.zarray": {"zarr_format": 2, "shape": [4], "chunks": [4], "dtype": "<i4"},
+            },
+        })
+        .to_string();
+
+        let store = consolidate(Box::new(memory_store(
+            "s3://bucket/store.zarr",
+            "store.zarr",
+            &[(".zmetadata", document.as_str())],
+        )));
+
+        let tree = rendered(store.as_ref(), "store.zarr", None);
+        assert!(tree.contains("── A [unknown]"), "{tree}");
+        assert!(tree.contains("── B [array]"), "{tree}");
     }
 }

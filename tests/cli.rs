@@ -1450,3 +1450,517 @@ fn an_hcs_plate_and_its_wells_are_tagged_from_metadata_not_from_their_names() {
         })
     );
 }
+
+/// One Zarr V2 store, written the two ways zarr-python can write it: with a
+/// consolidated `.zmetadata` copying every node's metadata, and without.
+///
+/// The metadata files themselves are identical in the two, and are real
+/// zarr-python 3.3.0 output. What differs is only whether the copy is there.
+const V2_NODES: &[(&str, &str)] = &[
+    (
+        ".zattrs",
+        r#"{
+  "note": "root"
+}"#,
+    ),
+    (
+        ".zgroup",
+        r#"{
+  "zarr_format": 2
+}"#,
+    ),
+    (
+        "images/.zattrs",
+        r#"{
+  "multiscales": [
+    {
+      "version": "0.4",
+      "axes": [
+        {
+          "name": "y",
+          "type": "space"
+        },
+        {
+          "name": "x",
+          "type": "space"
+        }
+      ],
+      "datasets": [
+        {
+          "path": "0"
+        },
+        {
+          "path": "1"
+        }
+      ]
+    }
+  ]
+}"#,
+    ),
+    (
+        "images/.zgroup",
+        r#"{
+  "zarr_format": 2
+}"#,
+    ),
+    (
+        "images/0/.zarray",
+        r#"{
+  "shape": [
+    64,
+    64
+  ],
+  "chunks": [
+    32,
+    32
+  ],
+  "dtype": "|u1",
+  "fill_value": 0,
+  "order": "C",
+  "filters": null,
+  "dimension_separator": ".",
+  "compressor": {
+    "id": "blosc",
+    "cname": "lz4",
+    "clevel": 5,
+    "shuffle": 1,
+    "blocksize": 0
+  },
+  "zarr_format": 2
+}"#,
+    ),
+    ("images/0/.zattrs", r#"{}"#),
+    (
+        "images/1/.zarray",
+        r#"{
+  "shape": [
+    32,
+    32
+  ],
+  "chunks": [
+    16,
+    16
+  ],
+  "dtype": "|u1",
+  "fill_value": 0,
+  "order": "C",
+  "filters": null,
+  "dimension_separator": ".",
+  "compressor": {
+    "id": "blosc",
+    "cname": "lz4",
+    "clevel": 5,
+    "shuffle": 1,
+    "blocksize": 0
+  },
+  "zarr_format": 2
+}"#,
+    ),
+    ("images/1/.zattrs", r#"{}"#),
+    ("labels/.zattrs", r#"{}"#),
+    (
+        "labels/.zgroup",
+        r#"{
+  "zarr_format": 2
+}"#,
+    ),
+    (
+        "labels/mask/.zarray",
+        r#"{
+  "shape": [
+    8,
+    8
+  ],
+  "chunks": [
+    4,
+    4
+  ],
+  "dtype": "<i4",
+  "fill_value": 0,
+  "order": "C",
+  "filters": null,
+  "dimension_separator": ".",
+  "compressor": {
+    "id": "blosc",
+    "cname": "lz4",
+    "clevel": 5,
+    "shuffle": 1,
+    "blocksize": 0
+  },
+  "zarr_format": 2
+}"#,
+    ),
+    ("labels/mask/.zattrs", r#"{}"#),
+];
+
+/// The consolidated document of that same store, verbatim.
+const V2_ZMETADATA: &str = r#"{"metadata": {".zgroup": {"zarr_format": 2}, ".zattrs": {"note": "root"}, "images/.zattrs": {"multiscales": [{"version": "0.4", "axes": [{"name": "y", "type": "space"}, {"name": "x", "type": "space"}], "datasets": [{"path": "0"}, {"path": "1"}]}]}, "images/.zgroup": {"zarr_format": 2, "consolidated_metadata": {"metadata": {}, "must_understand": false, "kind": "inline"}}, "labels/.zattrs": {}, "labels/.zgroup": {"zarr_format": 2, "consolidated_metadata": {"metadata": {}, "must_understand": false, "kind": "inline"}}, "images/0/.zattrs": {}, "images/0/.zarray": {"shape": [64, 64], "chunks": [32, 32], "dtype": "|u1", "fill_value": 0, "order": "C", "filters": null, "dimension_separator": ".", "compressor": {"id": "blosc", "cname": "lz4", "clevel": 5, "shuffle": 1, "blocksize": 0}, "zarr_format": 2}, "images/1/.zattrs": {}, "images/1/.zarray": {"shape": [32, 32], "chunks": [16, 16], "dtype": "|u1", "fill_value": 0, "order": "C", "filters": null, "dimension_separator": ".", "compressor": {"id": "blosc", "cname": "lz4", "clevel": 5, "shuffle": 1, "blocksize": 0}, "zarr_format": 2}, "labels/mask/.zattrs": {}, "labels/mask/.zarray": {"shape": [8, 8], "chunks": [4, 4], "dtype": "<i4", "fill_value": 0, "order": "C", "filters": null, "dimension_separator": ".", "compressor": {"id": "blosc", "cname": "lz4", "clevel": 5, "shuffle": 1, "blocksize": 0}, "zarr_format": 2}}, "zarr_consolidated_format": 1}"#;
+
+/// One Zarr V3 store's per-node metadata, without its root.
+const V3_NODES: &[(&str, &str)] = &[
+    (
+        "a/b/arr/zarr.json",
+        r#"{
+  "shape": [
+    4
+  ],
+  "data_type": "float32",
+  "chunk_grid": {
+    "name": "regular",
+    "configuration": {
+      "chunk_shape": [
+        2
+      ]
+    }
+  },
+  "chunk_key_encoding": {
+    "name": "default",
+    "configuration": {
+      "separator": "/"
+    }
+  },
+  "fill_value": 0.0,
+  "codecs": [
+    {
+      "name": "bytes",
+      "configuration": {
+        "endian": "little"
+      }
+    },
+    {
+      "name": "zstd",
+      "configuration": {
+        "level": 0,
+        "checksum": false
+      }
+    }
+  ],
+  "attributes": {},
+  "zarr_format": 3,
+  "node_type": "array",
+  "storage_transformers": []
+}"#,
+    ),
+    (
+        "a/b/zarr.json",
+        r#"{
+  "attributes": {},
+  "zarr_format": 3,
+  "node_type": "group"
+}"#,
+    ),
+    (
+        "a/zarr.json",
+        r#"{
+  "attributes": {},
+  "zarr_format": 3,
+  "node_type": "group"
+}"#,
+    ),
+    (
+        "images/0/zarr.json",
+        r#"{
+  "shape": [
+    64,
+    64
+  ],
+  "data_type": "uint16",
+  "chunk_grid": {
+    "name": "regular",
+    "configuration": {
+      "chunk_shape": [
+        32,
+        32
+      ]
+    }
+  },
+  "chunk_key_encoding": {
+    "name": "default",
+    "configuration": {
+      "separator": "/"
+    }
+  },
+  "fill_value": 0,
+  "codecs": [
+    {
+      "name": "bytes",
+      "configuration": {
+        "endian": "little"
+      }
+    },
+    {
+      "name": "zstd",
+      "configuration": {
+        "level": 0,
+        "checksum": false
+      }
+    }
+  ],
+  "attributes": {},
+  "zarr_format": 3,
+  "node_type": "array",
+  "storage_transformers": []
+}"#,
+    ),
+    (
+        "images/zarr.json",
+        r#"{
+  "attributes": {
+    "ome": {
+      "version": "0.5",
+      "multiscales": [
+        {
+          "axes": [
+            {
+              "name": "y",
+              "type": "space"
+            },
+            {
+              "name": "x",
+              "type": "space"
+            }
+          ],
+          "datasets": [
+            {
+              "path": "0"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}"#,
+    ),
+];
+
+/// That store's root, with the inline `consolidated_metadata` block that
+/// carries the whole hierarchy.
+const V3_ROOT_CONSOLIDATED: &str = r#"{
+  "attributes": {
+    "note": "root3"
+  },
+  "zarr_format": 3,
+  "consolidated_metadata": {
+    "kind": "inline",
+    "must_understand": false,
+    "metadata": {
+      "a": {
+        "attributes": {},
+        "zarr_format": 3,
+        "consolidated_metadata": {
+          "kind": "inline",
+          "must_understand": false,
+          "metadata": {}
+        },
+        "node_type": "group"
+      },
+      "images": {
+        "attributes": {
+          "ome": {
+            "version": "0.5",
+            "multiscales": [
+              {
+                "axes": [
+                  {
+                    "name": "y",
+                    "type": "space"
+                  },
+                  {
+                    "name": "x",
+                    "type": "space"
+                  }
+                ],
+                "datasets": [
+                  {
+                    "path": "0"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        "zarr_format": 3,
+        "consolidated_metadata": {
+          "kind": "inline",
+          "must_understand": false,
+          "metadata": {}
+        },
+        "node_type": "group"
+      },
+      "a/b": {
+        "attributes": {},
+        "zarr_format": 3,
+        "consolidated_metadata": {
+          "kind": "inline",
+          "must_understand": false,
+          "metadata": {}
+        },
+        "node_type": "group"
+      },
+      "images/0": {
+        "shape": [
+          64,
+          64
+        ],
+        "data_type": "uint16",
+        "chunk_grid": {
+          "name": "regular",
+          "configuration": {
+            "chunk_shape": [
+              32,
+              32
+            ]
+          }
+        },
+        "chunk_key_encoding": {
+          "name": "default",
+          "configuration": {
+            "separator": "/"
+          }
+        },
+        "fill_value": 0,
+        "codecs": [
+          {
+            "name": "bytes",
+            "configuration": {
+              "endian": "little"
+            }
+          },
+          {
+            "name": "zstd",
+            "configuration": {
+              "level": 0,
+              "checksum": false
+            }
+          }
+        ],
+        "attributes": {},
+        "zarr_format": 3,
+        "node_type": "array",
+        "storage_transformers": []
+      },
+      "a/b/arr": {
+        "shape": [
+          4
+        ],
+        "data_type": "float32",
+        "chunk_grid": {
+          "name": "regular",
+          "configuration": {
+            "chunk_shape": [
+              2
+            ]
+          }
+        },
+        "chunk_key_encoding": {
+          "name": "default",
+          "configuration": {
+            "separator": "/"
+          }
+        },
+        "fill_value": 0.0,
+        "codecs": [
+          {
+            "name": "bytes",
+            "configuration": {
+              "endian": "little"
+            }
+          },
+          {
+            "name": "zstd",
+            "configuration": {
+              "level": 0,
+              "checksum": false
+            }
+          }
+        ],
+        "attributes": {},
+        "zarr_format": 3,
+        "node_type": "array",
+        "storage_transformers": []
+      }
+    }
+  },
+  "node_type": "group"
+}"#;
+
+/// The same root with the block removed: the store as it was before
+/// `zarr.consolidate_metadata` was called on it.
+const V3_ROOT_PLAIN: &str = r#"{
+  "attributes": {
+    "note": "root3"
+  },
+  "zarr_format": 3,
+  "node_type": "group"
+}"#;
+
+/// Write a store from a list of (path, contents) pairs.
+fn write_store(root: &Path, files: &[(&str, &str)]) {
+    for (key, body) in files {
+        write_file(&root.join(key), body);
+    }
+}
+
+#[test]
+fn a_consolidated_store_gives_the_same_json_as_the_same_store_without_it() {
+    // The claim consolidation has to earn: it is a faster way to the same
+    // answer, not a different answer. Both stores hold identical per-node
+    // metadata; only one of them also carries the copy.
+    //
+    // Compared as parsed JSON rather than as text, and with the root's name
+    // dropped, because the two stores necessarily sit in different
+    // directories. Everything else -- every node, its kind, its shape, its
+    // chunks, its OME-Zarr tag, and the order the children come in -- must
+    // match exactly.
+    let dir = fixture_dir("consolidated-json");
+
+    for (name, nodes, root_file, extra) in [
+        ("v2", V2_NODES, None, Some((".zmetadata", V2_ZMETADATA))),
+        (
+            "v3",
+            V3_NODES,
+            Some(("zarr.json", V3_ROOT_CONSOLIDATED)),
+            None,
+        ),
+    ] {
+        let consolidated = dir.join(format!("{name}-consolidated.zarr"));
+        let plain = dir.join(format!("{name}-plain.zarr"));
+        write_store(&consolidated, nodes);
+        write_store(&plain, nodes);
+
+        // The one file that separates the two stores.
+        match (root_file, extra) {
+            // V3 keeps the block inside the root document, so the two roots
+            // differ and there is no extra file at all.
+            (Some((key, body)), None) => {
+                write_file(&consolidated.join(key), body);
+                write_file(&plain.join(key), V3_ROOT_PLAIN);
+            }
+            // V2 keeps it in a file of its own, so the plain store is simply
+            // the same store without that file.
+            (None, Some((key, body))) => write_file(&consolidated.join(key), body),
+            _ => unreachable!("one form or the other"),
+        }
+
+        for depth in ["1", "2", "99"] {
+            let mut left = json_of(&["--json", "--depth", depth, &consolidated.to_string_lossy()]);
+            let mut right = json_of(&["--json", "--depth", depth, &plain.to_string_lossy()]);
+            left["name"] = json!("store");
+            right["name"] = json!("store");
+            assert_eq!(left, right, "{name} at --depth {depth}");
+        }
+    }
+}
+
+/// The parsed `--json` output of one run, which must have succeeded.
+fn json_of(args: &[&str]) -> Value {
+    let output = run(args);
+    assert!(
+        output.status.success(),
+        "{args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("valid JSON")
+}

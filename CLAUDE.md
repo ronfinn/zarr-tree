@@ -44,6 +44,17 @@ against throwaway fixture stores.
   keeps a `reachable` flag purely to make that distinction provable.
 - Arrays are leaves remotely as well, so an array's chunk objects are never
   listed. This is what makes remote traversal affordable and must stay true.
+- Read-only consolidated metadata: Zarr V2 `.zmetadata` at
+  `zarr_consolidated_format` 1, and a Zarr V3 root `zarr.json` carrying a
+  `consolidated_metadata` block of `kind` `inline` with `must_understand`
+  false. Only the forms current zarr-python writes are read. This is what lets
+  a plain static HTTP server -- which can never answer a `PROPFIND` -- be
+  walked in full.
+- Consolidation is an overlay, not a second parser: `ConsolidatedStore` is a
+  `Store` built from the document, and every semantic reader above it gets the
+  same JSON it always got. It is opportunistic (no store that worked without it
+  may come to depend on it) and all-or-nothing (once the document is read the
+  physical store is dropped, so a tree is never half snapshot and half live).
 - `--depth N` to limit traversal.
 - `--json` for structured output.
 - Unix `BrokenPipe` handled quietly (exit 0, nothing on stderr).
@@ -93,7 +104,10 @@ Do not implement these without an explicit request:
 
 - GCS, Azure or any object store beyond S3 and HTTP.
 - Scraping HTML directory-index pages to work around a server with no WebDAV.
-- Consolidated metadata (`.zmetadata`, `consolidated_metadata`).
+- Consolidation forms beyond the two above -- a V3 `kind` other than `inline`,
+  or writing/refreshing a consolidated document.
+- Checking consolidated metadata against the store it describes; a stale
+  snapshot is reported as it stands.
 - Writing to a store of any kind.
 - Chunk or pixel reads of any kind.
 - Parquet decoding.

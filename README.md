@@ -53,6 +53,11 @@ example.zarr [group]
   come from a WebDAV `PROPFIND`, so a full tree needs a server that supports
   it, and a server that only does `GET` says so plainly instead of pretending
   the store is missing.
+- Reads a store's consolidated metadata when it has any — Zarr V2's
+  `.zmetadata`, or a Zarr V3 root `zarr.json` carrying an inline
+  `consolidated_metadata` block — and walks the whole tree from that one
+  document. A plain static HTTP server, which can never answer a listing, then
+  needs no listing to be walked in full.
 - Limits how far it descends with `--depth N`.
 - Prints the same walk as JSON with `--json`, for `jq` and scripts.
 - Sits quietly at the producing end of a pipe: `| head` ends the run with no
@@ -599,6 +604,27 @@ https://static.example/data/example.zarr [group, OME-Zarr 0.4]
 └─ datasets: 0, 1, 2
 ```
 
+**Unless the store is consolidated.** A store that carries [consolidated
+metadata](#consolidated-metadata) needs no listing at any depth, and a static
+server serves it in full:
+
+```
+$ zarr-tree --depth 1 https://ncsa.osn.xsede.org/Pangeo/pangeo-forge/gpcp-feedstock/gpcp.zarr
+https://ncsa.osn.xsede.org/Pangeo/pangeo-forge/gpcp-feedstock/gpcp.zarr [group]
+├── lat_bounds [array]
+│   ├─ shape:  [180, 2]
+│   ├─ chunks: [180, 2]
+│   └─ dtype:  <f4
+...
+└── time_bounds [array]
+    ├─ shape:  [9226, 2]
+    ├─ chunks: [200, 2]
+    └─ dtype:  <i8
+```
+
+That server answers `PROPFIND` with `405 Method Not Allowed`. The whole tree
+above came out of one `GET` of `.zmetadata`.
+
 Directory-index pages are never scraped: an HTML listing is a page for people,
 not a protocol, and reading one would mean guessing at a server's theme.
 
@@ -608,6 +634,93 @@ re-applied per path segment rather than pasted together. A query string is kept
 and sent with every request, which is the one shape of access token a static
 server tends to want. There is no credential handling of any other kind: no
 `Authorization` header, no cookie, no `--user`.
+
+### Consolidated metadata
+
+Walking a store means reading one small metadata file per node and asking, at
+every group, what lies beneath it. On a directory that is cheap. On S3 it is a
+request per node and a listing per group; on a static HTTP server the listing
+cannot be answered at all.
+
+Consolidation is Zarr's answer: one document at the store root holding a copy
+of every metadata file in the tree. `zarr-tree` reads it when it is there, and
+the whole walk — every node's metadata, and every group's children — comes out
+of that one read.
+
+Two forms are read, the two that current zarr-python writes:
+
+**Zarr V2** keeps it in a file of its own, `.zmetadata`, whose `metadata` map is
+flat and keyed by the very paths a walk would have read:
+
+```json
+{
+  "zarr_consolidated_format": 1,
+  "metadata": {
+    ".zgroup":            {"zarr_format": 2},
+    ".zattrs":            {"note": "root"},
+    "images/.zgroup":     {"zarr_format": 2},
+    "images/0/.zarray":   {"shape": [64, 64], "chunks": [32, 32], "dtype": "|u1"}
+  }
+}
+```
+
+The keys are what give the hierarchy: `images/0/.zarray` says there is an array
+at `images/0`, and by saying so says there is a node at `images` too. Only the
+metadata filenames are read — `.zgroup`, `.zarray`, `.zattrs` — so nothing else
+in the map can become a node, and a chunk key never does.
+`zarr_consolidated_format` 1 is the only version there has been; another one is
+left alone.
+
+**Zarr V3** keeps it inside the root `zarr.json`, as a `consolidated_metadata`
+block whose entries are whole documents keyed by path from the root:
+
+```json
+{
+  "zarr_format": 3,
+  "node_type": "group",
+  "consolidated_metadata": {
+    "kind": "inline",
+    "must_understand": false,
+    "metadata": {
+      "images":   {"zarr_format": 3, "node_type": "group", "attributes": {}},
+      "images/0": {"zarr_format": 3, "node_type": "array", "shape": [64, 64]}
+    }
+  }
+}
+```
+
+`kind: inline` — the metadata is in the block itself — is the only kind read.
+`must_understand: false` says a reader that does not understand the block may
+ignore it, which is what `zarr-tree` does with anything else. A group's block is
+defined to hold that group's own children, so a non-empty nested one is followed
+by the same rule; zarr-python writes the flat form shown above and leaves the
+nested blocks empty.
+
+V3 consolidation is younger and less settled than V2's — zarr-python warns that
+it is not part of the Zarr V3 specification and may change — so only the form it
+actually writes today is read.
+
+**It is opportunistic.** A store with no consolidated metadata, or with a form
+not read here, is walked exactly as it was before: directory reads locally,
+listings on S3, `PROPFIND` over HTTP. Nothing that worked without consolidation
+comes to depend on it.
+
+**It is all-or-nothing.** Once the document has been read, it is the only thing
+read: the store itself is not consulted again for the rest of the walk. That is
+deliberate. Consolidated metadata is a snapshot, taken when somebody last called
+`zarr.consolidate_metadata`, and it may be stale. A tree that took some nodes
+from the snapshot and some from live reads would show two moments at once and
+mark neither. The only read that comes off the store is the one that found the
+document — `.zmetadata` for V2, the root `zarr.json` for V3 — and it happens
+before any of the tree is built.
+
+So a store whose consolidated metadata is out of date is reported as the
+snapshot has it. `zarr-tree` does not check the two against each other; that
+would cost exactly the requests consolidation exists to avoid.
+
+**What it costs.** V2's `.zmetadata` is looked for first, as V2 is everywhere
+else here, so a V3 store pays one miss for it. A consolidated V2 store is then
+one request for any depth; a consolidated V3 store is two.
 
 ### Depth
 
@@ -761,12 +874,16 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
 
 - Local directories, S3 and HTTP(S) only. There is no GCS or Azure backend, no
   ZIP store, and no writing of any kind.
-- An HTTP(S) tree needs a server that answers WebDAV `PROPFIND`. On a static
-  server only `--depth 0` works, and there is no way to walk it: HTML
-  directory-index pages are deliberately not scraped, and consolidated Zarr
-  metadata (`.zmetadata`, `zarr.json` with `consolidated_metadata`) is not read
-  yet — that would be the way to walk a static server, and it is not
-  implemented.
+- An HTTP(S) tree needs either consolidated metadata or a server that answers
+  WebDAV `PROPFIND`. With neither, only `--depth 0` works: HTML directory-index
+  pages are deliberately not scraped.
+- Only the two consolidation forms current zarr-python writes are read: V2's
+  `.zmetadata` at `zarr_consolidated_format` 1, and a V3 `consolidated_metadata`
+  block of `kind` `inline` with `must_understand` false. Anything else is left
+  alone and the store is read directly.
+- Consolidated metadata is a snapshot and may be stale. `zarr-tree` does not
+  check it against the store, and does not fall back to the store node by node
+  when it disagrees — see [Consolidated metadata](#consolidated-metadata).
 - HTTP(S) access is anonymous. Credentials, custom headers and client
   certificates are not supported; a query string on the URL is passed through,
   and that is all.
@@ -846,9 +963,8 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
 
 Small, in roughly this order:
 
-1. Read consolidated metadata, so a plain static HTTP server can be walked.
-2. Show a node's user attributes when asked.
-3. Report V3 dtypes given in object form, instead of showing them as missing.
+1. Show a node's user attributes when asked.
+2. Report V3 dtypes given in object form, instead of showing them as missing.
 
 GCS and Azure backends, and anything beyond lightweight OME-Zarr and
 SpatialData recognition, are out of scope for now.
