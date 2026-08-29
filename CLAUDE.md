@@ -13,10 +13,35 @@ Layout is deliberately flat: `src/main.rs` holds the whole program plus its unit
 tests, and `tests/cli.rs` holds integration tests that run the compiled binary
 against throwaway fixture stores.
 
-## Current release
+## Development status
 
 - Latest release: **v0.3.0** (tag `v0.3.0`).
 - Current manifest version: `0.3.0`.
+- Development HEAD: post-v0.3.0, validation mode present.
+
+In summary -- the section below is the authoritative detail:
+
+- Storage: local, S3, HTTP/WebDAV, and static HTTP via consolidated metadata.
+- Formats: Zarr V2/V3, consolidated V2/V3, OME-Zarr 0.3/0.4/0.5, HCS,
+  SpatialData.
+- Payload metadata: Parquet points/shapes summaries, AnnData table summaries.
+- Validation: `--validate`, text and JSON findings, `PASS`/`WARN`/`ERROR`,
+  exit status 2 on a structural error.
+
+### Roadmap
+
+Near term:
+
+- Documentation and repository professionalisation.
+- Expanded structural validation.
+- Improved OME metadata presentation.
+
+Research:
+
+- `zarrs` integration.
+- Chunk-aware inspection.
+
+Nothing here is a commitment or a date.
 
 ## Current capabilities
 
@@ -171,7 +196,9 @@ Do not implement these without an explicit request:
 
 ## Conventions
 
-- Edition 2024, MSRV 1.85 (`rust-version` in `Cargo.toml`). No
+- Edition 2024, minimum supported Rust version 1.88 (`rust-version` in
+  `Cargo.toml`). Edition 2024 alone needs only 1.85; 1.88 is the effective MSRV
+  imposed by the current `object_store`, which uses let-chains. CI checks it. No
   `rust-toolchain.toml`, so the ambient toolchain is used; developed on 1.98.0.
 - `Cargo.lock` is committed — this package builds a binary.
 - The user is learning Rust. Explain the idiom behind a change rather than

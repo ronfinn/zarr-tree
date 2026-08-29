@@ -28,3 +28,23 @@ jobs:
 
       - name: Test
         run: cargo test
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # The MSRV this crate claims in Cargo.toml. It is not edition 2024's own
+      # 1.85: object_store uses let-chains, stable for edition 2024 from 1.88.
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # --locked so the committed Cargo.lock is what gets checked, not whatever
+      # a fresh resolve would pick.
+      - name: Check
+        run: cargo check --locked

@@ -638,8 +638,9 @@ The binary lands at `target/release/zarr-tree`. Copy it somewhere on your
 cargo install --path .
 ```
 
-Rust 1.85 or newer is required, as the crate uses edition 2024. It was developed
-with rustc 1.98.0.
+Rust 1.88 or newer is required. Edition 2024 itself needs only 1.85, but the
+current `object_store` release uses let-chains, which are stable for edition
+2024 from 1.88. It was developed with rustc 1.98.0.
 
 ## Usage
 
