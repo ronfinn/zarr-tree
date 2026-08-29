@@ -15,8 +15,8 @@ against throwaway fixture stores.
 
 ## Current release
 
-- Latest release: **v0.2.0** (tag `v0.2.0`).
-- Current manifest version: `0.2.0`.
+- Latest release: **v0.3.0** (tag `v0.3.0`).
+- Current manifest version: `0.3.0`.
 
 ## Current capabilities
 

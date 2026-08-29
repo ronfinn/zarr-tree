@@ -49,7 +49,9 @@ example.zarr [group]
 - Summarises the Parquet payload of a SpatialData points or shapes element: how
   many rows it holds, how many columns wide it is, how many Parquet files it is
   written across, and what its columns are called and typed. Read from the file
-  footer alone — **Parquet records are not read.**
+  footer alone — **Parquet records are not read.** A points payload that is
+  there but could not be inspected says `parquet files: ?`, so it does not read
+  as an element with no payload at all.
 - Summarises the AnnData table inside a SpatialData table element: how many
   observations and variables it declares, how `X` is stored and what shape it
   says it is, how many `obs` and `var` columns it declares, and which elements
@@ -471,13 +473,28 @@ what is in it. That is not a rule about the name: it applies only to a group
 whose own metadata said it is a points element, so an ordinary Zarr group with
 a directory called `points.parquet` is walked into as usual.
 
-The summary is best-effort. A payload that is missing, is not Parquet, has an
-encrypted footer, or — on a plain static HTTP server — is a directory that
-cannot be listed, costs the four rows and nothing else: the element is still
+The summary is best-effort. A payload that is missing, is not Parquet, or has
+an encrypted footer costs the four rows and nothing else: the element is still
 recognised and tagged from its Zarr metadata exactly as before. A shapes
 payload is one file at a name we know, so it is read even from a server with no
 listing at all; a points payload has to be listed first, and its filenames are
 never guessed at.
+
+A points payload that could not be listed — on a plain static HTTP server, or
+behind a WebDAV answer we could not parse — is not the same thing as one that
+is not there, and does not print like one:
+
+```
+$ zarr-tree --depth 1 https://static.example/data/xenium.zarr
+https://static.example/data/xenium.zarr [group, SpatialData 0.2]
+└── points [group]
+    └── transcripts [group, SpatialData points]
+        └─ parquet files: ?
+```
+
+One marker and no more. The rows, the width and the schema are not separately
+unknown — they are all unknown for the one reason, which is that the payload
+was never read. A payload that is genuinely absent still prints nothing.
 
 The directory names `images`, `labels`, `points`, `shapes` and `tables` are
 never used to detect anything. In a real store those groups carry no attributes
@@ -618,6 +635,15 @@ with rustc 1.98.0.
 
 ```sh
 zarr-tree [OPTIONS] <store>
+```
+
+The store is a directory, an `s3://` URI or an `http(s)://` URL, and the walk,
+the tree and the options are the same for all three:
+
+```sh
+zarr-tree /data/example.zarr
+zarr-tree s3://bucket/example.zarr
+zarr-tree https://example.org/example.zarr
 ```
 
 Exactly one store, plus any of the options below in any order. Anything else
@@ -1143,7 +1169,8 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
   named one, and only at the two paths SpatialData's writer uses —
   `points.parquet/` and `shapes.parquet`. An arbitrary `.parquet` file
   elsewhere in a store is not read, and a points payload on a server with no
-  listing is skipped rather than having its part filenames guessed at.
+  listing has its part filenames guessed at by nobody: it reports
+  `parquet files: ?` and stops there.
 - A segmentation that omits the optional `image-label` key is reported as an
   image. Nothing inside `image-label` — colours, properties, the source image —
   is read, and no label value is ever looked at.
