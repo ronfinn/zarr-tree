@@ -2142,3 +2142,233 @@ fn a_spatialdata_table_is_summarised_from_metadata_at_every_depth() {
 
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A small Zarr V3 SpatialData store whose declarations all hold.
+///
+/// One two-level image pyramid, and one table annotating it. Every rule
+/// `--validate` knows has something to look at here and finds it: the OME
+/// dataset paths exist, the levels agree with the axes, the table's region
+/// names the image, and `X` is the shape the two indexes declare.
+///
+/// The broken store below is this one with three values changed, which is what
+/// makes the pair worth reading side by side.
+const SOUND: &[(&str, &str)] = &[
+    (
+        "zarr.json",
+        r#"{"zarr_format": 3, "node_type": "group", "attributes": {
+            "spatialdata_attrs": {"spatialdata_software_version": "0.4.0", "version": "0.1"}
+        }}"#,
+    ),
+    (
+        "images/zarr.json",
+        r#"{"zarr_format": 3, "node_type": "group"}"#,
+    ),
+    (
+        "images/morphology/zarr.json",
+        r#"{"zarr_format": 3, "node_type": "group", "attributes": {
+            "spatialdata_attrs": {"version": "0.4"},
+            "ome": {"version": "0.5", "multiscales": [{
+                "axes": [{"name": "c"}, {"name": "y"}, {"name": "x"}],
+                "datasets": [{"path": "0"}, {"path": "1"}]
+            }]}
+        }}"#,
+    ),
+    (
+        "images/morphology/0/zarr.json",
+        r#"{"zarr_format": 3, "node_type": "array", "shape": [3, 64, 64],
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1, 32, 32]}},
+            "data_type": "uint16"}"#,
+    ),
+    (
+        "images/morphology/1/zarr.json",
+        r#"{"zarr_format": 3, "node_type": "array", "shape": [3, 32, 32],
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1, 32, 32]}},
+            "data_type": "uint16"}"#,
+    ),
+    (
+        "tables/zarr.json",
+        r#"{"zarr_format": 3, "node_type": "group"}"#,
+    ),
+    (
+        "tables/table/zarr.json",
+        r#"{"zarr_format": 3, "node_type": "group", "attributes": {
+            "encoding-type": "anndata", "encoding-version": "0.1.0",
+            "spatialdata-encoding-type": "ngff:regions_table",
+            "region": "morphology", "region_key": "region", "instance_key": "instance_id"
+        }}"#,
+    ),
+    (
+        "tables/table/obs/zarr.json",
+        r#"{"zarr_format": 3, "node_type": "group", "attributes": {
+            "encoding-type": "dataframe", "_index": "_index", "column-order": ["region"]
+        }}"#,
+    ),
+    (
+        "tables/table/obs/_index/zarr.json",
+        r#"{"zarr_format": 3, "node_type": "array", "shape": [10],
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [10]}},
+            "data_type": "int64"}"#,
+    ),
+    (
+        "tables/table/var/zarr.json",
+        r#"{"zarr_format": 3, "node_type": "group", "attributes": {
+            "encoding-type": "dataframe", "_index": "_index", "column-order": []
+        }}"#,
+    ),
+    (
+        "tables/table/var/_index/zarr.json",
+        r#"{"zarr_format": 3, "node_type": "array", "shape": [4],
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
+            "data_type": "int64"}"#,
+    ),
+    (
+        "tables/table/X/zarr.json",
+        r#"{"zarr_format": 3, "node_type": "array", "shape": [10, 4],
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [10, 4]}},
+            "data_type": "float32"}"#,
+    ),
+];
+
+/// The three files that make the sound store an unsound one, each breaking a
+/// different rule: a multiscale declaring a level that was never written, a
+/// table annotating an element that does not exist, and an `X` that is not the
+/// shape its own indexes say it is.
+const BROKEN: &[(&str, &str)] = &[
+    (
+        "images/morphology/zarr.json",
+        r#"{"zarr_format": 3, "node_type": "group", "attributes": {
+            "spatialdata_attrs": {"version": "0.4"},
+            "ome": {"version": "0.5", "multiscales": [{
+                "axes": [{"name": "c"}, {"name": "y"}, {"name": "x"}],
+                "datasets": [{"path": "0"}, {"path": "2"}]
+            }]}
+        }}"#,
+    ),
+    (
+        "tables/table/zarr.json",
+        r#"{"zarr_format": 3, "node_type": "group", "attributes": {
+            "encoding-type": "anndata", "encoding-version": "0.1.0",
+            "spatialdata-encoding-type": "ngff:regions_table",
+            "region": "cells", "region_key": "region", "instance_key": "instance_id"
+        }}"#,
+    ),
+    (
+        "tables/table/X/zarr.json",
+        r#"{"zarr_format": 3, "node_type": "array", "shape": [9, 4],
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [9, 4]}},
+            "data_type": "float32"}"#,
+    ),
+];
+
+#[test]
+fn validation_passes_a_store_whose_declarations_all_hold() {
+    let dir = fixture_dir("validate-sound");
+    let root = dir.join("sound.zarr");
+    write_store(&root, SOUND);
+
+    let output = run(&["--validate", &root.to_string_lossy()]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    fs::remove_dir_all(&dir).unwrap();
+
+    // Nothing worse than a warning means the status a shell script tests for.
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+
+    for expected in [
+        "PASS  /  Zarr root metadata is readable",
+        "PASS  /images/morphology  OME dataset path \"0\" exists",
+        "PASS  /images/morphology  OME dataset path \"1\" exists",
+        "PASS  /images/morphology  pyramid levels agree with the multiscale's axes on 3 dimensions",
+        "PASS  /tables/table  table region \"morphology\" names an existing SpatialData element",
+        "PASS  /tables/table  AnnData X rows match the 10 observations the obs index declares",
+        "PASS  /tables/table  AnnData X columns match the 4 variables the var index declares",
+        "Validation: 12 passed, 0 warnings, 0 errors",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == expected),
+            "expected {expected:?} in:\n{stdout}"
+        );
+    }
+
+    // A sound store says so and nothing else.
+    assert!(!stdout.contains("WARN"), "{stdout}");
+    assert!(!stdout.contains("ERROR"), "{stdout}");
+}
+
+#[test]
+fn validation_reports_a_declaration_the_store_does_not_have() {
+    let dir = fixture_dir("validate-broken");
+    let root = dir.join("broken.zarr");
+    write_store(&root, SOUND);
+    write_store(&root, BROKEN);
+
+    let output = run(&["--validate", &root.to_string_lossy()]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    fs::remove_dir_all(&dir).unwrap();
+
+    // Two, and not one: a validation that found something is not a validation
+    // that failed to run.
+    assert_eq!(output.status.code(), Some(2), "{stdout}");
+
+    for expected in [
+        "ERROR /images/morphology  OME dataset path \"2\" does not exist",
+        "ERROR /tables/table  table region \"cells\" does not name an existing SpatialData element",
+        "ERROR /tables/table  AnnData X has 9 rows but the obs index declares 10 observations",
+        "Validation: 9 passed, 0 warnings, 3 errors",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == expected),
+            "expected {expected:?} in:\n{stdout}"
+        );
+    }
+
+    // The rules that still hold still print. A store is not reported as
+    // nothing but its faults.
+    assert!(
+        stdout.contains("PASS  /images/morphology  OME dataset path \"0\" exists"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn validation_json_carries_the_same_findings_and_a_summary() {
+    let dir = fixture_dir("validate-json");
+    let root = dir.join("broken.zarr");
+    write_store(&root, SOUND);
+    write_store(&root, BROKEN);
+
+    let output = run(&["--validate", "--json", &root.to_string_lossy()]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{stdout}");
+
+    let report: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("--validate --json should print valid JSON: {error}"));
+
+    assert_eq!(
+        report["summary"],
+        json!({"passed": 9, "warnings": 0, "errors": 3})
+    );
+
+    let findings = report["findings"].as_array().expect("a list of findings");
+    assert_eq!(findings.len(), 12, "{stdout}");
+    // The first finding is the first line of the report, so the two outputs
+    // are the same findings in the same order.
+    assert_eq!(
+        findings[0],
+        json!({
+            "severity": "pass",
+            "path": "/",
+            "message": "Zarr root metadata is readable",
+        })
+    );
+    assert!(
+        findings.iter().any(|found| {
+            found["severity"] == "error"
+                && found["path"] == "/tables/table"
+                && found["message"]
+                    == "table region \"cells\" does not name an existing SpatialData element"
+        }),
+        "{stdout}"
+    );
+}

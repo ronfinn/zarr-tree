@@ -87,6 +87,19 @@ against throwaway fixture stores.
   overlay-only, so the Zarr snapshot is never half document and half live.
 - `--depth N` to limit traversal.
 - `--json` for structured output.
+- `--validate`: a metadata-only structural check, printing `PASS`/`WARN`/
+  `ERROR` findings instead of the tree, and a summary line. Seven rules, all
+  over metadata the tree already reads: array shape/chunk/shard dimensionality,
+  OME dataset paths exist and agree on dimensionality, a plate's declared well
+  paths exist, a table's `region` names an existing element, an AnnData `X`
+  matches the `obs`/`var` index lengths, and a points/shapes Parquet payload is
+  readable. `WARN` means "could not check" and never "broken" -- a payload on a
+  listing-less server warns, it does not error. Findings are a
+  `Vec<ValidationFinding>`; there is no rule type, registry or engine. It walks
+  the store whole and so is refused together with `--depth`. `--validate
+  --json` prints one document of `findings` and `summary`.
+- Exit status: 0 walked (with `--validate`, nothing worse than a warning), 1
+  store or command-line failure, 2 `--validate` found at least one `ERROR`.
 - Unix `BrokenPipe` handled quietly (exit 0, nothing on stderr).
 
 ## Development rules
@@ -99,8 +112,10 @@ against throwaway fixture stores.
   dependency list and it should stay that way.
 - No `zarrs` until an actual array-reading, chunk-decoding or remote-store need
   justifies it.
-- This is metadata **inspection, not validation**. Nothing is checked against a
-  specification; unfamiliar values are printed as stored.
+- The default output is metadata **inspection, not validation**. Nothing is
+  checked against a specification; unfamiliar values are printed as stored.
+  `--validate` is the one exception, and it checks structure a store declares
+  against the store itself -- never a document against a schema.
 - Never infer scientific semantics from directory names. A group is recognised
   from its metadata markers or not at all.
 - Malformed metadata degrades gracefully where support already exists: an
@@ -139,6 +154,9 @@ Do not implement these without an explicit request:
   or writing/refreshing a consolidated document.
 - Checking consolidated metadata against the store it describes; a stale
   snapshot is reported as it stands.
+- Validation rules beyond the seven above: schema or specification conformance,
+  a rule registry or policy engine, per-rule or per-severity filtering, or
+  `--validate` combined with `--depth`.
 - Writing to a store of any kind.
 - Chunk or pixel reads of any kind.
 - Parquet record, page or row-group decoding; row-group, encoding, compression

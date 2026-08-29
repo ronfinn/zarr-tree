@@ -70,6 +70,11 @@ example.zarr [group]
   document. A plain static HTTP server, which can never answer a listing, then
   needs no listing to be walked in full.
 - Limits how far it descends with `--depth N`.
+- Checks the structure a store declares against the store with `--validate`:
+  does every OME-Zarr dataset path exist, does every well a plate declares,
+  does a table's region name an element that is there, does `X` match the
+  dimensions the table's own indexes give. Metadata only, `PASS`/`WARN`/`ERROR`
+  a line, and exit status 2 when something is declared and missing.
 - Prints the same walk as JSON with `--json`, for `jq` and scripts.
 - Sits quietly at the producing end of a pipe: `| head` ends the run with no
   panic and no error.
@@ -226,9 +231,10 @@ partial.zarr [group, OME-Zarr 0.4]
 That store declares three levels but has none of them on disk, so nothing
 follows the rows and the last one closes the branch with `└─`.
 
-Nothing checks that a declared path exists on disk, and no scale factors, pixel
-sizes or physical extents are calculated — the `coordinateTransformations` those
-would come from are not read at all.
+The tree does not check that a declared path exists on disk — `--validate`
+does, and nothing else here does. No scale factors, pixel sizes or physical
+extents are calculated either: the `coordinateTransformations` those would come
+from are not read at all.
 
 ### Plates and wells
 
@@ -264,14 +270,17 @@ plate's rows and columns really are called `A`, `B`, `1`, `2`, and any store is
 free to use those names for anything at all — so the row group `A` above is an
 ordinary `[group]`, because that is all its metadata says it is.
 
-Nothing inside `plate` or `well` beyond the three counts is read: well paths,
-acquisitions, field-of-view indices and image paths are all left alone, and no
-declared path is checked against the disk.
+Nothing inside `plate` or `well` beyond the three counts and the well paths is
+read: acquisitions, field-of-view indices and image paths are all left alone.
+The well paths are read for `--validate`, which looks for the group each one
+names; the tree shows the count and nothing more.
 
-This is **recognition, not validation**. Nothing here checks a store against the
-OME-NGFF specification: axes, dataset paths, coordinate transformations, `omero`
-channels, labels and plate/well layouts are never validated, and most of them
-are not read at all. For real validation use the
+The tree is **recognition, not validation**. Nothing it prints is checked
+against the OME-NGFF specification: axes, dataset paths, coordinate
+transformations, `omero` channels, labels and plate/well layouts are never
+validated there, and most of them are not read at all. `--validate` adds the
+handful of structural checks listed under [Validation](#validation) and no
+more. For conformance checking use the
 [OME-NGFF validator](https://ome.github.io/ome-ngff-validator/).
 
 ## SpatialData
@@ -602,9 +611,10 @@ Each row is independent, and a field the metadata does not give up simply has
 no row: a table whose `var` cannot be read still reports the observations its
 `obs` declared. A table that annotates nothing draws none of the last three
 rows — SpatialData writes those keys as nulls rather than leaving them out, and
-a null is not something to print. Nothing here is checked against anything
+a null is not something to print. The tree checks nothing against anything
 else: a table whose `X` declares a shape its `obs` index disagrees with is
-reported as it stands.
+reported as it stands. `--validate` is where that disagreement is called out —
+see [Validation](#validation).
 
 This is licensed by the table marker and by nothing else. A group that merely
 holds children called `X`, `obs` and `var`, or that is merely called `table`,
@@ -662,9 +672,18 @@ usage: zarr-tree [OPTIONS] <STORE>
 ```
         --depth <N>  Descend at most N levels below the root
         --json       Print the same tree as JSON
+        --validate   Check the structure the metadata declares
     -h, --help       Print help
     -V, --version    Print version
 ```
+
+Exit status:
+
+| Status | Meaning |
+| --- | --- |
+| 0 | The store was walked. With `--validate`, nothing worse than a `WARN`. |
+| 1 | The store could not be read, or the command line made no sense. |
+| 2 | `--validate` ran and reported at least one `ERROR`. |
 
 An argument beginning with `-` that is not one of these is read as a mistyped
 option rather than as a path, so a directory whose name starts with `-` cannot
@@ -1020,6 +1039,93 @@ disagree about what a store contains. Object keys come out in alphabetical
 order, which is why `children` leads; that is `serde_json`'s default and
 keeping it avoids a dependency for nothing.
 
+### Validation
+
+`--validate` checks what a store's metadata *declares* against what the store
+*has*, and prints findings instead of the tree. It reads metadata only — the
+same files the tree reads, plus the four an AnnData table names — and opens no
+chunk, no Parquet record and no expression value.
+
+```
+$ zarr-tree --validate experiment.zarr
+PASS  /  Zarr root metadata is readable
+PASS  /images/morphology  OME dataset path "0" exists
+PASS  /images/morphology  OME dataset path "1" exists
+PASS  /images/morphology  pyramid levels agree with the multiscale's axes on 3 dimensions
+WARN  /points/transcripts  SpatialData points payload metadata unavailable
+ERROR /tables/table  table region "cells" does not name an existing SpatialData element
+
+Validation: 4 passed, 1 warning, 1 error
+```
+
+Each line is a severity, the node the finding is about, and what was found.
+The three severities mean three different things, and the middle one carries
+the weight:
+
+| Severity | Meaning |
+| --- | --- |
+| `PASS` | The structure the metadata declares is there. |
+| `WARN` | The check could not be made. Nothing is claimed either way. |
+| `ERROR` | The metadata declares something the store does not have. |
+
+A points payload on a static HTTP server cannot be listed, so it cannot be
+inspected — that is a `WARN`, not a broken store. The same goes for a shape a
+file did not record, or an index length that could not be read.
+
+The rules, all of them over metadata this tool already reads:
+
+1. **Zarr metadata.** Every node this program walked into could be identified,
+   and each array's `shape`, `chunks` and — on a sharded V3 array — `shards`
+   agree on how many dimensions there are. Codecs are not checked.
+2. **OME-Zarr dataset paths.** Every `multiscales[0].datasets[].path` names a
+   node that exists and is an array.
+3. **Pyramid dimensions.** Every resolution level has the same number of
+   dimensions, and the same number as the multiscale declares axes. No scale,
+   resolution or downsampling factor is looked at.
+4. **HCS wells.** Every path in a plate's `wells` list names a group that
+   exists. Acquisitions and fields of view are not checked.
+5. **SpatialData table regions.** Every element named in a table's `region`
+   exists as a recognised image, labels, points or shapes element. No name is
+   inferred from a payload.
+6. **AnnData dimensions.** `X.shape[0]` matches the length the `obs` index
+   declares, and `X.shape[1]` the `var` index. The index lengths come from the
+   index arrays' own metadata; no value is read and nothing is counted.
+7. **Parquet availability.** A points or shapes payload that is there and
+   readable passes; one that is there and could not be inspected warns. A
+   payload that is genuinely absent is not a finding.
+
+`--validate` combines with `--json` and prints one document — the same findings
+in the same order, with the counts the summary line carries:
+
+```
+$ zarr-tree --validate --json experiment.zarr | jq '.summary'
+{
+  "errors": 1,
+  "passed": 4,
+  "warnings": 1
+}
+```
+
+Every finding has three fields: `severity` (`pass`, `warn` or `error`), `path`
+and `message`.
+
+It does not combine with `--depth`, and says so rather than picking one:
+
+```
+$ zarr-tree --validate --depth 1 store.zarr
+error: --depth cannot be combined with --validate
+usage: zarr-tree [OPTIONS] <STORE>
+```
+
+A walk that stopped early would report every node below the limit as missing —
+a dataset path, a well, a region — so the two options cannot both mean what
+they say at once.
+
+This is a structural check and not a specification conformance pass. Nothing
+here validates a Zarr, OME-NGFF or SpatialData document against its schema, and
+the ordinary `zarr-tree` output is unchanged: it still prints what the metadata
+says, unchecked.
+
 ### Pipelines
 
 A large store prints thousands of lines, so `zarr-tree` is built to sit at the
@@ -1036,7 +1142,8 @@ ends there — quietly, with nothing on stderr and exit status 0. The reader
 said it had seen enough, and that is not an error to report.
 
 Every other failure keeps its own behaviour: a line on stderr and exit status
-1.
+1. A `--validate` run that found an `ERROR` exits 2 — see
+[Validation](#validation).
 
 ## Example output
 
@@ -1124,7 +1231,8 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
   shape are read. Compressors, fill values, dimension names and user
   attributes are not shown, and `codecs` is read for the sharding codec
   alone.
-- No output options beyond `--depth` and `--json`: no filtering, no colour.
+- No output options beyond `--depth`, `--json` and `--validate`: no filtering,
+  no colour.
 - V2 dtypes are passed through as stored and V3 dtypes given in object form
   (the extension syntax) are not interpreted.
 - A sharded V3 array reports its chunks and shards, but nothing else about the
@@ -1132,22 +1240,22 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
   are not read.
 - OME-Zarr support goes no further than spotting image, plate and well groups
   and showing their version, and for an image its axis names, declared pyramid
-  level count and dataset paths. Axis
-  `type` and `unit` are not shown, nothing is validated (axis names, ordering or
-  count; whether a declared dataset path exists), and coordinate
-  transformations and `omero` are not read. HCS support goes no further than
-  tagging a plate and a well and showing a plate's three declared counts —
-  well paths, acquisitions and field-of-view indices are not read, and no
-  declared count is checked against the wells actually present. `image-label`
-  is read only for its presence, to tell a segmentation from an image. No
-  scale factors, pixel sizes or physical extents are calculated.
+  level count and dataset paths. Axis `type` and `unit` are not shown, axis
+  names and ordering are not validated, and coordinate transformations and
+  `omero` are not read. HCS support goes no further than tagging a plate and a
+  well and showing a plate's three declared counts — acquisitions and
+  field-of-view indices are not read, and no declared count is checked against
+  the wells actually present. `image-label` is read only for its presence, to
+  tell a segmentation from an image. No scale factors, pixel sizes or physical
+  extents are calculated. `--validate` adds only the existence and
+  dimensionality checks listed under [Validation](#validation).
 - SpatialData support goes no further than recognising a store root and its
   image, labels, points, shapes and table elements, summarising the Parquet
   payload of a points or shapes element from its footer, and summarising the
   AnnData metadata of a table. Element axes, feature keys, geometry types and
   coordinate transformations are not shown, and no element is joined to any
-  other — a table names the regions it annotates, and nothing checks that those
-  elements exist or links them to the table.
+  other — a table names the regions it annotates, and outside `--validate`
+  nothing checks that those elements exist or links them to the table.
 - A table summary is AnnData *metadata* and nothing more. No expression value,
   annotation value, category or index label is read, and nothing is counted:
   the number of non-zero entries in a sparse `X`, the categories of a
@@ -1195,6 +1303,12 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
   the text output is streamed as the walk proceeds. So peak memory grows with
   the number of nodes in the tree, and an error part-way through a walk
   produces no JSON at all rather than a partial document.
+- `--validate` is a structural check over the metadata this tool already reads,
+  and nothing more. It validates no document against a schema, knows no rule
+  the seven listed under [Validation](#validation) do not cover, cannot be
+  limited to one rule or one severity, and holds the whole node map in memory
+  because a table's region may name an element anywhere in the store. It walks
+  the store whole and so cannot be combined with `--depth`.
 
 ## Roadmap
 

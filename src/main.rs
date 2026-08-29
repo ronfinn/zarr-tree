@@ -310,15 +310,20 @@ enum OmeKind {
     /// A multiscale image: the only kind this tool recognised before HCS, and
     /// the only one that carries axes and datasets.
     Image,
-    /// A high-content-screening plate. The three counts are the lengths of the
-    /// lists the metadata declares, each `None` on its own when that list is
-    /// missing or is not a list -- nothing here is counted from the directories
-    /// on disk, so a plate that declares 96 wells says 96 whether or not 96
-    /// were written.
+    /// A high-content-screening plate. Each field is the list the metadata
+    /// declares, `None` on its own when that list is missing or is not a list
+    /// -- nothing here is counted from the directories on disk, so a plate
+    /// that declares 96 wells says 96 whether or not 96 were written.
+    ///
+    /// The first two are lengths because a length is all anything wants of
+    /// them. `wells` keeps the paths themselves, and the count printed beside
+    /// it is that list's length -- the rule `datasets` follows, and for the
+    /// same reason: `--validate` looks for the well each path names, and a
+    /// count it would have to re-read the metadata to expand is no use to it.
     Plate {
         rows: Option<usize>,
         columns: Option<usize>,
-        wells: Option<usize>,
+        wells: Option<Vec<String>>,
     },
     /// A single well of a plate. Tagged and nothing more: what a well holds is
     /// its images, and those are the child groups the tree already prints.
@@ -436,9 +441,18 @@ OPTIONS:
                      0 shows the root on its own. Omitted, the whole store is
                      walked. Arrays are leaves at any depth.
         --json       Print the same tree as JSON, one object per node.
-                     Combines with --depth.
+                     Combines with --depth and with --validate.
+        --validate   Check the structure the metadata declares, instead of
+                     printing the tree. Reads metadata only, exactly as the
+                     tree does. Cannot be combined with --depth: a partial
+                     walk would report a node it never looked for as missing.
     -h, --help       Print help
-    -V, --version    Print version";
+    -V, --version    Print version
+
+EXIT STATUS:
+    0  the store was walked; with --validate, nothing worse than a warning
+    1  the store could not be read, or the command line made no sense
+    2  --validate completed and reported at least one ERROR";
 
 /// The one-line reminder printed on stderr when the command line does not make
 /// sense. Kept in step with the USAGE section above by hand: there are two of
@@ -456,6 +470,9 @@ struct Options {
     /// Print JSON instead of the tree. The two show the same facts about the
     /// same nodes; only the shape of the output differs.
     json: bool,
+    /// Report on the structure the metadata declares instead of printing it.
+    /// Reads the same files the tree reads and nothing else -- see `validate`.
+    validate: bool,
 }
 
 /// What `parse_args` made of the command line.
@@ -526,12 +543,22 @@ fn main() {
     // Every other error keeps exactly the behaviour it had: a line on stderr
     // and exit status 1. A directory we cannot read is still an error worth
     // reporting; `BrokenPipe` cannot reach us from the filesystem.
-    if let Err(error) = run() {
-        if error.kind() == io::ErrorKind::BrokenPipe {
-            return;
+    //
+    // A successful run now carries a status of its own, which is 0 for
+    // everything this program did before `--validate` existed. Only a
+    // validation that found something wrong returns anything else -- see
+    // `exit_status`. It is a value rather than a `process::exit` at the point
+    // it is decided, so that the output is written and flushed first.
+    match run() {
+        Ok(0) => {}
+        Ok(status) => process::exit(status),
+        Err(error) => {
+            if error.kind() == io::ErrorKind::BrokenPipe {
+                return;
+            }
+            eprintln!("error: {error}");
+            process::exit(1);
         }
-        eprintln!("error: {error}");
-        process::exit(1);
     }
 }
 
@@ -547,7 +574,7 @@ fn main() {
 /// same lock on every call -- and passed down the walk. `&mut dyn Write` is a
 /// trait object: the functions below neither know nor care that this is
 /// standard output.
-fn run() -> io::Result<()> {
+fn run() -> io::Result<i32> {
     // args[0] is the program itself, so the command line proper starts at 1.
     let args: Vec<String> = env::args().collect();
 
@@ -570,7 +597,7 @@ fn run() -> io::Result<()> {
     let options = match request {
         Request::Help => {
             writeln!(out, "{HELP}")?;
-            return out.flush();
+            return done(&mut out, 0);
         }
         Request::Version => {
             // env! reads the variable when the crate is compiled, so this is a
@@ -578,7 +605,7 @@ fn run() -> io::Result<()> {
             // version field in Cargo.toml, which is why the two cannot drift
             // apart.
             writeln!(out, "zarr-tree {}", env!("CARGO_PKG_VERSION"))?;
-            return out.flush();
+            return done(&mut out, 0);
         }
         Request::Walk(options) => options,
     };
@@ -604,12 +631,29 @@ fn run() -> io::Result<()> {
     let root_kind = classify(store.as_ref(), "");
     store.check_root(!matches!(root_kind, NodeKind::Unknown))?;
 
+    // The whole of what `--validate` changes, and it changes nothing above
+    // this line: the store is opened, consolidated and classified exactly as
+    // it is for a tree. What follows reads the same metadata and says
+    // something else about it -- see `validate`.
+    if options.validate {
+        let findings = validate(store.as_ref(), root_kind)?;
+
+        if options.json {
+            let report = json_validation(&findings);
+            writeln!(out, "{}", serde_json::to_string_pretty(&report)?)?;
+        } else {
+            print_validation(&mut out, &findings)?;
+        }
+
+        return done(&mut out, exit_status(&findings));
+    }
+
     if options.json {
         let tree = json_tree(store.as_ref(), "", root_name, root_kind, options.depth)?;
         // Indented rather than compact: this is still a command a person runs
         // and reads, and `jq` does not mind either way.
         writeln!(out, "{}", serde_json::to_string_pretty(&tree)?)?;
-        return out.flush();
+        return done(&mut out, 0);
     }
 
     print_store(
@@ -623,7 +667,20 @@ fn run() -> io::Result<()> {
     // Stdout flushes itself when the process ends, but it swallows any error
     // in doing so. Flushing here is what puts a late `BrokenPipe` in front of
     // the handler above instead of losing it.
-    out.flush()
+    done(&mut out, 0)
+}
+
+/// Flush the output and hand back the status this run ended with.
+///
+/// Every exit from `run` goes through here, because every one of them ends the
+/// same way: stdout flushes itself when the process ends but swallows any
+/// error in doing so, and flushing explicitly is what puts a late `BrokenPipe`
+/// in front of the handler in `main` instead of losing it. The status rides
+/// along so that the two facts a caller needs -- did the writing work, and
+/// what should the process exit with -- come back as one value.
+fn done(out: &mut dyn Write, status: i32) -> io::Result<i32> {
+    out.flush()?;
+    Ok(status)
 }
 
 /// Read the command line, or say what is wrong with it.
@@ -639,6 +696,7 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
     let mut path: Option<&str> = None;
     let mut depth: Option<usize> = None;
     let mut json = false;
+    let mut validate = false;
 
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -662,6 +720,7 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
             }
             // Repeating it is not an error: it asks for the same thing twice.
             "--json" => json = true,
+            "--validate" => validate = true,
             // A leading dash we do not know is a mistyped option rather than a
             // path. The cost of reading it that way is that a directory whose
             // name begins with `-` can no longer be inspected -- the same
@@ -676,11 +735,20 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
         }
     }
 
+    // Refused rather than quietly ignored. A validation walk that stopped
+    // early would report every node below the limit as missing -- an OME
+    // dataset path, a well, a region -- so the two options cannot both mean
+    // what they say at once, and saying so is better than picking one.
+    if validate && depth.is_some() {
+        return Err(String::from("--depth cannot be combined with --validate"));
+    }
+
     let path = path.ok_or_else(|| String::from("expected a store"))?;
     Ok(Request::Walk(Options {
         path: String::from(path),
         depth,
         json,
+        validate,
     }))
 }
 
@@ -1963,7 +2031,9 @@ fn ome_info(ome: &Value, version: Option<&Value>) -> Option<OmeInfo> {
             kind: OmeKind::Plate {
                 rows: declared("rows"),
                 columns: declared("columns"),
-                wells: declared("wells"),
+                // The same `{"path": ...}` list a multiscale's `datasets` is,
+                // so it is read by the same function -- see `dataset_paths`.
+                wells: dataset_paths(plate.get("wells")),
             },
             version: stored_version(plate),
             axes: None,
@@ -2819,8 +2889,10 @@ fn ome_rows(ome: Option<&OmeInfo>) -> Vec<String> {
         if let Some(count) = columns {
             rows.push(format!("columns: {count}"));
         }
-        if let Some(count) = wells {
-            rows.push(format!("wells: {count}"));
+        // The count is the length of the declared list, so the row and the
+        // paths `--validate` checks cannot drift apart.
+        if let Some(wells) = wells {
+            rows.push(format!("wells: {}", wells.len()));
         }
     }
     rows
@@ -3009,8 +3081,14 @@ fn axis_names(value: Option<&Value>) -> Option<Vec<String>> {
     Some(names)
 }
 
-/// Read a `multiscales` entry's `datasets` as the list of paths it declares,
-/// or `None` when there is nothing to show.
+/// Read a list of `{"path": ...}` objects as the paths it declares, or `None`
+/// when there is nothing to show.
+///
+/// Two keys have this shape and both are read here: a `multiscales` entry's
+/// `datasets`, which is what the name is for, and a `plate`'s `wells`. They
+/// mean quite different things and neither knows about the other, but the
+/// reading is one reading, and a second copy of it would be a second place for
+/// the `?` rule below to be got wrong.
 ///
 /// The paths are shown exactly as stored. `"0"`, `"1"`, `"2"` is only a
 /// convention -- `"s0"`, `"full"` and nested paths such as `"a/b"` are all
@@ -3309,12 +3387,720 @@ fn json_ome(ome: &OmeInfo) -> Value {
         if let Some(count) = columns {
             value["columns"] = json!(count);
         }
-        if let Some(count) = wells {
-            value["wells"] = json!(count);
+        if let Some(wells) = wells {
+            value["wells"] = json!(wells.len());
         }
     }
 
     value
+}
+
+/// How serious one validation finding is.
+///
+/// Three answers and no more. The middle one is the load-bearing one: a check
+/// this program could not make is not a check that failed, and a store on a
+/// server that will not list a directory must not be reported as a broken
+/// store. `Warn` is what "I could not look" says; `Error` is reserved for
+/// something the metadata declares and the store does not have.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Severity {
+    Pass,
+    Warn,
+    Error,
+}
+
+impl Severity {
+    /// The word that opens a line of the report.
+    fn label(&self) -> &'static str {
+        match self {
+            Severity::Pass => "PASS",
+            Severity::Warn => "WARN",
+            Severity::Error => "ERROR",
+        }
+    }
+
+    /// The same three, for `--json`, which spells its values in lower case.
+    fn key(&self) -> &'static str {
+        match self {
+            Severity::Pass => "pass",
+            Severity::Warn => "warn",
+            Severity::Error => "error",
+        }
+    }
+}
+
+/// One thing `--validate` looked at, and what it made of it.
+///
+/// A single struct for every rule, and a `Vec` of them for a whole run. There
+/// is no rule type, no registry and no engine here on purpose: the rules are a
+/// handful of `if`s over metadata this program already reads, and the moment
+/// they become anything more they stop being cheap to read.
+///
+/// `message` carries its own subject -- "OME dataset path \"0\" exists" -- so a
+/// line of the report is legible on its own when it has been grepped out of a
+/// thousand others.
+struct ValidationFinding {
+    severity: Severity,
+    /// The node this is about, in the form the report prints: `/` for the
+    /// store root, `/images/morphology` for anything below it.
+    path: String,
+    message: String,
+}
+
+/// Build one finding, turning a store path into the form the report prints.
+fn finding(severity: Severity, path: &str, message: String) -> ValidationFinding {
+    ValidationFinding {
+        severity,
+        // The store spells its root as the empty string, which would print as
+        // nothing at all. A leading slash makes the root `/` and leaves every
+        // other path readable as the path it is.
+        path: format!("/{path}"),
+        message,
+    }
+}
+
+/// `count` with its noun, pluralised the only way the words here need.
+///
+/// Used by the summary line and by the payload row, which is the whole reason
+/// it is a function: "1 warning, 2 errors" and "1 file, 8 files" are the same
+/// rule written once.
+fn plural(count: usize, noun: &str) -> String {
+    match count {
+        1 => format!("{count} {noun}"),
+        _ => format!("{count} {noun}s"),
+    }
+}
+
+/// Check what a store's metadata declares against what the store has.
+///
+/// Metadata only, exactly as the tree is: this reads the same files
+/// `classify` reads and adds four of AnnData's own -- see `check_anndata` --
+/// and it opens no chunk, no Parquet row and no expression value.
+///
+/// Two passes, because one of the rules crosses from one node to another. The
+/// first walks the store and keeps what every node was classified as; the
+/// second goes back over that map and asks the questions. A table's `region`
+/// names an element that may sit anywhere in the store, and possibly ahead of
+/// the table in the walk, so there is no order in which a single streaming
+/// pass could answer it.
+///
+/// The map is keyed by store path, so the second pass runs in path order and
+/// the report is the same report every time it is run against the same store.
+///
+/// `root` is what `run` already classified the root as, passed in rather than
+/// worked out again -- the same economy `json_tree` makes.
+fn validate(store: &dyn Store, root: NodeKind) -> io::Result<Vec<ValidationFinding>> {
+    let mut nodes = BTreeMap::new();
+    collect(store, "", root, &mut nodes)?;
+
+    // Gathered once, before the checks, because every table asks the same
+    // question of it -- see `spatialdata_elements`.
+    let elements = spatialdata_elements(&nodes);
+
+    let mut findings = Vec::new();
+    for (path, kind) in &nodes {
+        check_node(store, path, kind, &nodes, &elements, &mut findings);
+    }
+
+    Ok(findings)
+}
+
+/// Walk the store and record what every node is.
+///
+/// The same walk both renderers make, down to the function that decides which
+/// children a node has: `child_dirs` is what drops a points element's Parquet
+/// directory, and validating a store must see exactly the nodes printing it
+/// would show. `None` for the depth because a validation walk is whole or it
+/// is misleading -- a level it never descended into would have every path
+/// above it reported as missing, which is why `--depth` and `--validate` are
+/// refused together.
+///
+/// Arrays are leaves here as everywhere else. What lies beneath one is chunk
+/// storage, and listing it on a real store means millions of objects.
+fn collect(
+    store: &dyn Store,
+    path: &str,
+    kind: NodeKind,
+    nodes: &mut BTreeMap<String, NodeKind>,
+) -> io::Result<()> {
+    let children = match kind {
+        NodeKind::Array(_) => Vec::new(),
+        _ => child_dirs(store, path, &kind, None)?,
+    };
+
+    // Inserted after the children are asked for, because `child_dirs` wants a
+    // borrow of the kind and the map wants to own it.
+    nodes.insert(String::from(path), kind);
+
+    for name in children {
+        let child = child_path(path, &name);
+        let child_kind = classify(store, &child);
+        collect(store, &child, child_kind, nodes)?;
+    }
+
+    Ok(())
+}
+
+/// The names of every SpatialData element the store holds.
+///
+/// SpatialData addresses its elements by name -- `cell_boundaries`, not
+/// `shapes/cell_boundaries` -- and that name is the last segment of the node's
+/// path. A table is not in this set: a table annotates regions, and a region is
+/// an image, a labels, a points or a shapes element.
+///
+/// A `BTreeSet` of borrowed names rather than owned strings, because the map
+/// it is drawn from outlives it and nothing here needs a copy.
+fn spatialdata_elements(nodes: &BTreeMap<String, NodeKind>) -> BTreeSet<&str> {
+    nodes
+        .iter()
+        .filter_map(|(path, kind)| {
+            let NodeKind::Group(meta) = kind else {
+                return None;
+            };
+            match &meta.spatialdata {
+                Some(
+                    SpatialData::Image
+                    | SpatialData::Labels
+                    | SpatialData::Points
+                    | SpatialData::Shapes,
+                ) => path.rsplit('/').next().filter(|name| !name.is_empty()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Every check that applies to one node, in report order.
+fn check_node(
+    store: &dyn Store,
+    path: &str,
+    kind: &NodeKind,
+    nodes: &BTreeMap<String, NodeKind>,
+    elements: &BTreeSet<&str>,
+    findings: &mut Vec<ValidationFinding>,
+) {
+    // Rule one, the half of it that applies to every node: this program had to
+    // be able to read a node's metadata before it can say anything else about
+    // it. A store root that says nothing is not a store, and that is an error.
+    // A directory further down that says nothing is a directory somebody put
+    // there -- a `.git`, a stray export -- and a warning is as much as this can
+    // honestly make of it.
+    if matches!(kind, NodeKind::Unknown) {
+        let severity = match path.is_empty() {
+            true => Severity::Error,
+            false => Severity::Warn,
+        };
+        findings.push(finding(
+            severity,
+            path,
+            String::from("no Zarr metadata this tool can read"),
+        ));
+        return;
+    }
+
+    if path.is_empty() {
+        findings.push(finding(
+            Severity::Pass,
+            path,
+            String::from("Zarr root metadata is readable"),
+        ));
+    }
+
+    match kind {
+        NodeKind::Array(meta) => check_array(path, meta, findings),
+        NodeKind::Group(meta) => {
+            if let Some(ome) = &meta.ome {
+                check_ome(path, ome, nodes, findings);
+            }
+            check_spatialdata(store, path, meta, elements, findings);
+        }
+        // Answered above, and returned from there.
+        NodeKind::Unknown => {}
+    }
+}
+
+/// Rule one, the other half: an array's own dimensions have to agree.
+///
+/// A shape that could not be read is an error, because every Zarr array has
+/// one and this tool needs it. Chunks that could not be read are a warning:
+/// only a "regular" chunk grid records a chunk shape, so an array using
+/// another one has nothing missing -- it has something this program does not
+/// read -- and the comparison is simply not made.
+///
+/// Nothing here looks at a codec, a fill value or a dtype. This is the
+/// dimensionality check the feature asked for and not a Zarr conformance pass.
+fn check_array(path: &str, meta: &ArrayMeta, findings: &mut Vec<ValidationFinding>) {
+    let Some(shape) = &meta.shape else {
+        findings.push(finding(
+            Severity::Error,
+            path,
+            String::from("array declares no readable shape"),
+        ));
+        return;
+    };
+
+    findings.push(match &meta.chunks {
+        Some(chunks) if chunks.len() == shape.len() => finding(
+            Severity::Pass,
+            path,
+            format!(
+                "array shape and chunks agree on {}",
+                plural(shape.len(), "dimension")
+            ),
+        ),
+        Some(chunks) => finding(
+            Severity::Error,
+            path,
+            format!(
+                "array shape has {} but its chunks have {}",
+                plural(shape.len(), "dimension"),
+                plural(chunks.len(), "dimension")
+            ),
+        ),
+        None => finding(
+            Severity::Warn,
+            path,
+            String::from(
+                "array declares no readable chunk shape, so its dimensions were not checked",
+            ),
+        ),
+    });
+
+    // A sharded V3 array has a second grid, and it has to describe the same
+    // array. Only an array that named the sharding codec has one at all, so
+    // every other array is silent here rather than warned about.
+    if let Some(shards) = &meta.shards {
+        findings.push(match shards.len() == shape.len() {
+            true => finding(
+                Severity::Pass,
+                path,
+                format!(
+                    "array shape and shards agree on {}",
+                    plural(shape.len(), "dimension")
+                ),
+            ),
+            false => finding(
+                Severity::Error,
+                path,
+                format!(
+                    "array shape has {} but its shards have {}",
+                    plural(shape.len(), "dimension"),
+                    plural(shards.len(), "dimension")
+                ),
+            ),
+        });
+    }
+}
+
+/// Rules two, three and four: what an OME-Zarr group declares is there.
+///
+/// A well is checked for nothing. What a well holds is fields of view, and
+/// which of them a well must have is an HCS rule this first validation mode
+/// deliberately does not know.
+fn check_ome(
+    path: &str,
+    ome: &OmeInfo,
+    nodes: &BTreeMap<String, NodeKind>,
+    findings: &mut Vec<ValidationFinding>,
+) {
+    match &ome.kind {
+        OmeKind::Image => check_multiscale(path, ome, nodes, findings),
+        OmeKind::Plate { wells, .. } => check_plate(path, wells.as_deref(), nodes, findings),
+        OmeKind::Well => {}
+    }
+}
+
+/// Rules two and three: a multiscale's declared levels exist and agree.
+///
+/// Each `datasets[].path` is resolved against the node map, which is what the
+/// walk already read -- no dataset is opened here, and no chunk of one is
+/// touched. A path that resolves to a group rather than an array is an error
+/// of the same kind as one that resolves to nothing: a pyramid level is an
+/// array.
+///
+/// The dimensions are then compared, and against the axes where the metadata
+/// declared any: OME-NGFF gives one axis per dimension, so the count of axes
+/// is the count every level should have. With no axes to go on, the first
+/// level is the reference -- which still catches a pyramid whose levels
+/// disagree, and claims nothing about which of them is right.
+///
+/// No resolution, scale or downsampling factor is looked at. That is image
+/// science, and this is structure.
+fn check_multiscale(
+    path: &str,
+    ome: &OmeInfo,
+    nodes: &BTreeMap<String, NodeKind>,
+    findings: &mut Vec<ValidationFinding>,
+) {
+    let Some(datasets) = &ome.datasets else {
+        findings.push(finding(
+            Severity::Warn,
+            path,
+            String::from("multiscale declares no readable datasets"),
+        ));
+        return;
+    };
+
+    // The levels that resolved to an array with a readable shape, as
+    // (declared path, number of dimensions). Only these can be compared.
+    let mut levels: Vec<(&str, usize)> = Vec::new();
+
+    for dataset in datasets {
+        // `dataset_paths` writes `?` for an entry whose path it could not
+        // read, and that is what is being recognised here -- not a level
+        // somebody named `?`.
+        if dataset == "?" {
+            findings.push(finding(
+                Severity::Warn,
+                path,
+                String::from("multiscale declares a dataset with no readable path"),
+            ));
+            continue;
+        }
+
+        let target = child_path(path, dataset);
+        findings.push(match nodes.get(&target) {
+            Some(NodeKind::Array(meta)) => {
+                if let Some(shape) = &meta.shape {
+                    levels.push((dataset, shape.len()));
+                }
+                finding(
+                    Severity::Pass,
+                    path,
+                    format!("OME dataset path {dataset:?} exists"),
+                )
+            }
+            Some(_) => finding(
+                Severity::Error,
+                path,
+                format!("OME dataset path {dataset:?} is not an array"),
+            ),
+            None => finding(
+                Severity::Error,
+                path,
+                format!("OME dataset path {dataset:?} does not exist"),
+            ),
+        });
+    }
+
+    let Some((first, first_dims)) = levels.first().copied() else {
+        return;
+    };
+
+    // The axes win where there are any, because they are what the format says
+    // a dimension is. The first level answers otherwise.
+    let (expected, source) = match &ome.axes {
+        Some(axes) => (axes.len(), String::from("the multiscale's axes")),
+        None => (first_dims, format!("level {first:?}")),
+    };
+
+    let mut disagreed = false;
+    for (name, dimensions) in &levels {
+        if *dimensions != expected {
+            disagreed = true;
+            findings.push(finding(
+                Severity::Error,
+                path,
+                format!(
+                    "pyramid level {name:?} has {}, but {source} says {expected}",
+                    plural(*dimensions, "dimension")
+                ),
+            ));
+        }
+    }
+
+    if !disagreed {
+        findings.push(finding(
+            Severity::Pass,
+            path,
+            format!(
+                "pyramid levels agree with {source} on {}",
+                plural(expected, "dimension")
+            ),
+        ));
+    }
+}
+
+/// Rule four: a plate's declared wells exist.
+///
+/// The paths come from the plate's own `wells` list and are resolved against
+/// the node map, exactly as a multiscale's datasets are. Nothing else about
+/// HCS is checked here: not the row and column names, not the acquisitions,
+/// not which fields of view a well holds.
+fn check_plate(
+    path: &str,
+    wells: Option<&[String]>,
+    nodes: &BTreeMap<String, NodeKind>,
+    findings: &mut Vec<ValidationFinding>,
+) {
+    let Some(wells) = wells else {
+        findings.push(finding(
+            Severity::Warn,
+            path,
+            String::from("plate declares no readable wells"),
+        ));
+        return;
+    };
+
+    for well in wells {
+        if well == "?" {
+            findings.push(finding(
+                Severity::Warn,
+                path,
+                String::from("plate declares a well with no readable path"),
+            ));
+            continue;
+        }
+
+        let target = child_path(path, well);
+        findings.push(match nodes.get(&target) {
+            Some(NodeKind::Group(_)) => finding(
+                Severity::Pass,
+                path,
+                format!("plate well path {well:?} exists"),
+            ),
+            Some(_) => finding(
+                Severity::Error,
+                path,
+                format!("plate well path {well:?} is not a group"),
+            ),
+            None => finding(
+                Severity::Error,
+                path,
+                format!("plate well path {well:?} does not exist"),
+            ),
+        });
+    }
+}
+
+/// Rules five, six and seven: what a SpatialData element declares.
+///
+/// The element's own metadata is the licence for every one of these, exactly
+/// as it is for reading the payload in the first place. A group that never
+/// said it was a SpatialData element is checked for nothing here.
+fn check_spatialdata(
+    store: &dyn Store,
+    path: &str,
+    meta: &GroupMeta,
+    elements: &BTreeSet<&str>,
+    findings: &mut Vec<ValidationFinding>,
+) {
+    let Some(element) = &meta.spatialdata else {
+        return;
+    };
+
+    // Rule seven. The three answers are the three `Payload` already
+    // distinguishes, and the middle one is why it distinguishes them: a points
+    // payload on a server that cannot list a directory is unreadable, not
+    // absent and not broken.
+    match &meta.parquet {
+        Payload::Summary(parquet) => findings.push(finding(
+            Severity::Pass,
+            path,
+            format!(
+                "SpatialData {} Parquet payload is readable ({})",
+                element.kind(),
+                plural(parquet.files, "file")
+            ),
+        )),
+        Payload::Unavailable => findings.push(finding(
+            Severity::Warn,
+            path,
+            format!(
+                "SpatialData {} payload metadata unavailable",
+                element.kind()
+            ),
+        )),
+        // A payload that is genuinely not there is not a finding. An element
+        // is free to have none, and this cannot tell a store that never wrote
+        // one from a store that lost it.
+        Payload::Absent => {}
+    }
+
+    let SpatialData::Table(annotation) = element else {
+        return;
+    };
+
+    // Rule five. The names are matched against the elements the walk found,
+    // and against nothing else: no Parquet column and no `obs` value is read
+    // to discover a region name.
+    if let Some(regions) = &annotation.regions {
+        for region in regions {
+            findings.push(if region == "?" {
+                finding(
+                    Severity::Warn,
+                    path,
+                    String::from("table names a region this tool could not read"),
+                )
+            } else if elements.contains(region.as_str()) {
+                finding(
+                    Severity::Pass,
+                    path,
+                    format!("table region {region:?} names an existing SpatialData element"),
+                )
+            } else {
+                finding(
+                    Severity::Error,
+                    path,
+                    format!(
+                        "table region {region:?} does not name an existing SpatialData element"
+                    ),
+                )
+            });
+        }
+    }
+
+    check_anndata(store, path, meta.anndata.as_deref(), findings);
+}
+
+/// Rule six: an AnnData table's declared axes and its `X` agree.
+///
+/// The two axis lengths are read again here rather than taken from the
+/// `AnnData` the tree prints, and the reason is worth the four extra metadata
+/// reads. `AnnData::observations` falls back to `X`'s own shape when the `obs`
+/// index cannot be read, which is the right answer to display and a useless
+/// one to check: comparing `X` against a number taken from `X` would pass
+/// whatever the store held. What this rule needs is the *index* length, which
+/// is what `dataframe` returns and only that.
+///
+/// Nothing is counted and no value is read: the length comes from the index
+/// array's declared `shape`, and `X`'s from its own metadata.
+fn check_anndata(
+    store: &dyn Store,
+    path: &str,
+    anndata: Option<&AnnData>,
+    findings: &mut Vec<ValidationFinding>,
+) {
+    let Some(anndata) = anndata else {
+        return;
+    };
+
+    let Some(x) = &anndata.x else {
+        findings.push(finding(
+            Severity::Warn,
+            path,
+            String::from("AnnData X could not be read, so the table's dimensions were not checked"),
+        ));
+        return;
+    };
+    let shape = x.shape.as_deref();
+
+    for (axis, side, frame, quantity) in [
+        (0usize, "rows", "obs", "observations"),
+        (1usize, "columns", "var", "variables"),
+    ] {
+        let length = dataframe(store, &child_path(path, frame)).and_then(|frame| frame.length);
+        let declared = dim(shape, axis);
+
+        findings.push(match (length, declared) {
+            (Some(length), Some(declared)) if length == declared => finding(
+                Severity::Pass,
+                path,
+                format!("AnnData X {side} match the {length} {quantity} the {frame} index declares"),
+            ),
+            (Some(length), Some(declared)) => finding(
+                Severity::Error,
+                path,
+                format!(
+                    "AnnData X has {declared} {side} but the {frame} index declares {length} {quantity}"
+                ),
+            ),
+            (None, _) => finding(
+                Severity::Warn,
+                path,
+                format!("AnnData {frame} index length unavailable, so the {quantity} were not checked"),
+            ),
+            (_, None) => finding(
+                Severity::Warn,
+                path,
+                format!("AnnData X declares no usable {side}, so the {quantity} were not checked"),
+            ),
+        });
+    }
+}
+
+/// How many findings of each severity there were, in report order.
+fn counts(findings: &[ValidationFinding]) -> (usize, usize, usize) {
+    let count = |wanted: Severity| {
+        findings
+            .iter()
+            .filter(|found| found.severity == wanted)
+            .count()
+    };
+
+    (
+        count(Severity::Pass),
+        count(Severity::Warn),
+        count(Severity::Error),
+    )
+}
+
+/// What the process should exit with once a validation has run.
+///
+/// Only an `ERROR` changes it. A warning is a check that could not be made,
+/// and a tool that failed a build over "I could not list this directory" would
+/// be useless on exactly the stores that need looking at most.
+fn exit_status(findings: &[ValidationFinding]) -> i32 {
+    match findings
+        .iter()
+        .any(|found| found.severity == Severity::Error)
+    {
+        true => 2,
+        false => 0,
+    }
+}
+
+/// Print the findings, one per line, and a summary underneath.
+///
+/// `{:<5}` pads the severity to the width of the longest of the three, so the
+/// paths line up. The path and the message are separated by two spaces rather
+/// than padded to a column: a store path can be any length, and a column wide
+/// enough for the longest would push every short line off the screen.
+fn print_validation(out: &mut dyn Write, findings: &[ValidationFinding]) -> io::Result<()> {
+    for found in findings {
+        writeln!(
+            out,
+            "{:<5} {}  {}",
+            found.severity.label(),
+            found.path,
+            found.message
+        )?;
+    }
+
+    let (passed, warnings, errors) = counts(findings);
+    writeln!(out)?;
+    writeln!(
+        out,
+        "Validation: {passed} passed, {}, {}",
+        plural(warnings, "warning"),
+        plural(errors, "error")
+    )
+}
+
+/// The same findings as JSON.
+///
+/// One object, not a second format: the findings in the order the report
+/// prints them, and the same three counts the summary line carries. A reader
+/// that wants only the verdict reads `summary.errors`, which is what the exit
+/// status is built from too.
+fn json_validation(findings: &[ValidationFinding]) -> Value {
+    let (passed, warnings, errors) = counts(findings);
+
+    json!({
+        "findings": findings
+            .iter()
+            .map(|found| json!({
+                "severity": found.severity.key(),
+                "path": found.path,
+                "message": found.message,
+            }))
+            .collect::<Vec<Value>>(),
+        "summary": {
+            "passed": passed,
+            "warnings": warnings,
+            "errors": errors,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -4621,6 +5407,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_reads_the_validate_flag() {
+        // Off unless asked for: every command line written before the option
+        // existed still means what it meant.
+        let Ok(Request::Walk(options)) = parse_args(&args(&["store.zarr"])) else {
+            panic!("a lone directory is a valid command line");
+        };
+        assert!(!options.validate);
+
+        // On its own, and beside `--json`, which it combines with.
+        for line in [
+            vec!["--validate", "store.zarr"],
+            vec!["--json", "--validate", "store.zarr"],
+        ] {
+            let Ok(Request::Walk(options)) = parse_args(&args(&line)) else {
+                panic!("{line:?} is a valid command line");
+            };
+            assert!(options.validate, "{line:?}");
+        }
+    }
+
+    #[test]
     fn parse_args_answers_a_flag_wherever_it_appears() {
         // Answered on sight, so a flag beside a directory is still a flag.
         assert!(matches!(
@@ -4639,6 +5446,13 @@ mod tests {
             (vec!["--depth", "-1", "store.zarr"], "whole number"),
             (vec!["--depth", "two", "store.zarr"], "whole number"),
             (vec!["--nope", "store.zarr"], "unknown option"),
+            // The one combination of options that cannot mean both things at
+            // once: a validation walk that stopped early would call every node
+            // below the limit missing.
+            (
+                vec!["--validate", "--depth", "1", "store.zarr"],
+                "--depth cannot be combined with --validate",
+            ),
             (vec!["one.zarr", "two.zarr"], "exactly one store"),
             (vec![], "expected a store"),
         ] {
@@ -6179,6 +6993,80 @@ mod tests {
         assert!(
             tree.contains("schema: x:double, y:double, gene:string"),
             "{tree}"
+        );
+    }
+
+    /// The findings a store yields, as `--validate` prints them.
+    ///
+    /// Goes through the printer rather than reading the `Vec` directly, so a
+    /// test asserting on a line is asserting on the line a reader sees --
+    /// severity, path and message, in the order the report puts them.
+    fn validated(store: &dyn Store) -> Vec<String> {
+        let root = classify(store, "");
+        let findings = validate(store, root).expect("a local store can list");
+
+        let mut out: Vec<u8> = Vec::new();
+        print_validation(&mut out, &findings).expect("writing to a Vec cannot fail");
+
+        String::from_utf8(out)
+            .expect("the report is text")
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn a_payload_that_cannot_be_inspected_is_a_warning_and_a_readable_one_is_not() {
+        // Rule seven, both ways round, in one store. The shapes payload is a
+        // real Parquet file and reads; the points payload is a directory of
+        // one part that is not Parquet at all, which is what the walk sees on
+        // a server that will serve a byte range of nonsense -- or on a
+        // half-written store.
+        let dir = fixture("validate-parquet");
+
+        write_fixture(
+            &dir,
+            &[
+                (
+                    "zarr.json",
+                    &json!({ "zarr_format": 3, "node_type": "group", "attributes": {} })
+                        .to_string(),
+                ),
+                ("boundaries/zarr.json", &element_metadata("ngff:shapes")),
+                ("transcripts/zarr.json", &element_metadata("ngff:points")),
+            ],
+        );
+        write_bytes(
+            &dir,
+            "boundaries/shapes.parquet",
+            &parquet_file(&[Column::Binary("geometry")], 12),
+        );
+        write_bytes(
+            &dir,
+            "transcripts/points.parquet/part.0.parquet",
+            b"not a parquet file",
+        );
+
+        let store = LocalStore::new(&dir.to_string_lossy());
+        let report = validated(&store);
+        fs::remove_dir_all(&dir).unwrap();
+
+        let has = |needle: &str| report.iter().any(|line| line.contains(needle));
+
+        assert!(
+            has("PASS  /boundaries  SpatialData shapes Parquet payload is readable (1 file)"),
+            "{report:#?}"
+        );
+        // A warning, never an error: the payload is there and this could not
+        // read it, which is not the same as the store declaring something it
+        // does not have.
+        assert!(
+            has("WARN  /transcripts  SpatialData points payload metadata unavailable"),
+            "{report:#?}"
+        );
+        assert!(
+            !report.iter().any(|line| line.starts_with("ERROR")),
+            "{report:#?}"
         );
     }
 
