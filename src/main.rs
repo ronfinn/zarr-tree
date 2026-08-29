@@ -50,9 +50,9 @@ struct GroupMeta {
     /// those two, which is what keeps an arbitrary `.parquet` file elsewhere
     /// in a store from being interpreted: a payload is looked for because the
     /// element's own metadata named it, never because a filename looked
-    /// promising. `None` everywhere else, and also wherever the payload could
-    /// not be read -- see `parquet_summary`.
-    parquet: Option<ParquetSummary>,
+    /// promising. `Absent` everywhere else, and `Unavailable` where the
+    /// payload should have been readable and was not -- see `parquet_summary`.
+    parquet: Payload,
     /// What the AnnData table inside a SpatialData table element declares
     /// about itself.
     ///
@@ -172,6 +172,27 @@ struct ParquetSummary {
     /// columns are not expanded: a group column is one column here, as it is
     /// to a reader of the table.
     columns: Vec<ParquetColumn>,
+}
+
+/// What became of a SpatialData element's Parquet payload.
+///
+/// Three answers rather than an `Option<ParquetSummary>`, because "there is
+/// nothing there" and "there is something there and we could not read it" are
+/// different facts and a reader deserves to be told which one they have. The
+/// tree printed the same blank for both until it was pointed out that a points
+/// element on a server with no listing looks exactly like one with no payload.
+enum Payload {
+    /// Nothing to report. Not a points or shapes element at all, or one whose
+    /// payload is genuinely not beside it.
+    Absent,
+    /// A payload that ought to be there and could not be inspected: the parts
+    /// could not be listed, or a footer could not be read. Printed as
+    /// `parquet files: ?` -- one unavailable marker, since the rows, the width
+    /// and the schema are not separately unknown, they are all unknown for the
+    /// one reason.
+    Unavailable,
+    /// Read from the footers, exactly as before.
+    Summary(ParquetSummary),
 }
 
 /// One column of a Parquet schema: its name, and the type it was written as.
@@ -2205,35 +2226,39 @@ fn spatialdata_raster_element(attrs: &Value, ome: Option<&Value>) -> Option<Spat
 /// footers of about three.
 const PARQUET_TAIL: u64 = 64 * 1024;
 
-/// The Parquet payload of a SpatialData points or shapes element, or `None`
-/// when there is nothing to report.
+/// The Parquet payload of a SpatialData points or shapes element, as far as
+/// it can be made out.
 ///
 /// `element` is what the group's own metadata said it is, and it is the whole
 /// of the licence to go looking. Every other kind of node -- an ordinary Zarr
-/// group, a SpatialData image, a store root -- returns here at once, which is
-/// what keeps this from wandering into files it was never told about. A
-/// `.parquet` file sitting somewhere else in a store is not a payload and is
-/// not read: this program never infers meaning from a name.
+/// group, a SpatialData image, a store root -- returns `Absent` here at once,
+/// which is what keeps this from wandering into files it was never told
+/// about. A `.parquet` file sitting somewhere else in a store is not a payload
+/// and is not read: this program never infers meaning from a name.
 ///
-/// `None` covers every way a payload can fail to be summarised, and they are
-/// all ordinary. The parts cannot be listed, because the server has no listing
-/// to give. A file is missing, or is not Parquet, or has an encrypted footer.
-/// Any of those and the element still prints exactly as it did before this
-/// existed -- a graceful degradation, not an error, because the Zarr metadata
-/// that made this an element was read successfully and is what the tree is
-/// really showing.
-fn parquet_summary(
-    store: &dyn Store,
-    path: &str,
-    element: Option<&SpatialData>,
-) -> Option<ParquetSummary> {
-    let files = payload_files(store, path, element?)?;
+/// The two failing answers are told apart by what the store was able to say,
+/// and by nothing else -- see `Payload` and `unreadable`.
+fn parquet_summary(store: &dyn Store, path: &str, element: Option<&SpatialData>) -> Payload {
+    let Some(element) = element else {
+        return Payload::Absent;
+    };
+
+    let files = match payload_files(store, path, element) {
+        Ok(files) if files.is_empty() => return Payload::Absent,
+        Ok(files) => files,
+        // The listing failed, so there may well be a payload there and we
+        // cannot see it. Only a points element ever gets this far, because
+        // only a points payload needs listing at all.
+        Err(_) => return Payload::Unavailable,
+    };
 
     let mut rows = 0i64;
     let mut columns = Vec::new();
 
     for (index, file) in files.iter().enumerate() {
-        let metadata = parquet_metadata(store, file)?;
+        let Some(metadata) = parquet_metadata(store, file) else {
+            return unreadable(element);
+        };
         let file_metadata = metadata.file_metadata();
 
         rows += file_metadata.num_rows();
@@ -2244,11 +2269,26 @@ fn parquet_summary(
         }
     }
 
-    Some(ParquetSummary {
+    Payload::Summary(ParquetSummary {
         rows,
         files: files.len(),
         columns,
     })
+}
+
+/// What a payload file we could not read the footer of amounts to, which is
+/// not the same thing for the two element kinds.
+///
+/// A points part was named by a listing, so the payload is demonstrably there
+/// and what failed is the inspection of it. A shapes file was named by nobody
+/// -- the convention supplied the filename -- and `read_suffix` answers
+/// `None` whether the file is missing, is not Parquet, or has an encrypted
+/// footer. With no way to tell those apart, absence stays the honest reading.
+fn unreadable(element: &SpatialData) -> Payload {
+    match element {
+        SpatialData::Points => Payload::Unavailable,
+        _ => Payload::Absent,
+    }
 }
 
 /// Where a SpatialData element keeps its Parquet payload, in the order the
@@ -2269,33 +2309,40 @@ fn parquet_summary(
 /// A points payload therefore needs a file listing, and a shapes payload does
 /// not. On a plain static HTTP server, which can answer a `GET` but no kind of
 /// listing at all, that is the difference between a shapes element that
-/// summarises and a points element that quietly does not.
-fn payload_files(store: &dyn Store, path: &str, element: &SpatialData) -> Option<Vec<String>> {
+/// summarises and a points element that cannot be inspected.
+///
+/// An empty list is a payload that is not there. `Err` is the other thing
+/// entirely -- a listing we could not get -- and only a points element can
+/// produce one.
+fn payload_files(store: &dyn Store, path: &str, element: &SpatialData) -> io::Result<Vec<String>> {
     match element {
-        SpatialData::Shapes => Some(vec![child_path(path, "shapes.parquet")]),
+        SpatialData::Shapes => Ok(vec![child_path(path, "shapes.parquet")]),
         SpatialData::Points => {
             let directory = child_path(path, "points.parquet");
-            let mut names = store.files(&directory).ok()?;
+            let mut names = match store.files(&directory) {
+                Ok(names) => names,
+                // A directory that is not there is a payload that is not
+                // there, and that much a local store says precisely. Every
+                // other failure is a listing we did not get, which says
+                // nothing at all about whether a payload exists.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => return Err(error),
+            };
 
             // dask writes only the parts unless it is asked for a metadata
             // file as well, but it can be asked, and `_metadata` is not a part
             // and has no rows to count.
             names.retain(|name| name.ends_with(".parquet"));
-            if names.is_empty() {
-                return None;
-            }
 
             // Already sorted by `files`, which is lexicographic and so orders
             // ten parts `part.0, part.1, part.10, part.2`. Nothing here cares:
             // the rows are summed and the schema is one schema.
-            Some(
-                names
-                    .iter()
-                    .map(|name| child_path(&directory, name))
-                    .collect(),
-            )
+            Ok(names
+                .iter()
+                .map(|name| child_path(&directory, name))
+                .collect())
         }
-        _ => None,
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -2645,7 +2692,7 @@ fn group_rows(kind: &NodeKind) -> Vec<String> {
     let mut rows = ome_rows(meta.ome.as_ref());
     rows.extend(anndata_rows(meta.anndata.as_deref()));
     rows.extend(table_rows(meta.spatialdata.as_ref()));
-    rows.extend(parquet_rows(meta.parquet.as_ref()));
+    rows.extend(parquet_rows(&meta.parquet));
     rows
 }
 
@@ -2786,14 +2833,22 @@ fn ome_rows(ome: Option<&OmeInfo>) -> Vec<String> {
 /// holds, how many columns wide it is, how many files it is written across,
 /// and what those columns are called and typed.
 ///
+/// A payload that could not be inspected gets the file count and a `?`, and
+/// nothing else. That follows the rule an unreadable array field follows --
+/// print `?` rather than nothing -- but only once: `rows: ?`, `columns: ?` and
+/// `schema: ?` would be four rows saying the same single thing, which is that
+/// the payload was not read.
+///
 /// The schema row is capped. A points payload has a handful of columns and
 /// prints whole; a table written with three hundred would run off the side of
 /// any terminal, so past a dozen the rest are counted rather than named. The
 /// `--json` output carries every column either way, which is where a reader
 /// who wants them all should look.
-fn parquet_rows(parquet: Option<&ParquetSummary>) -> Vec<String> {
-    let Some(parquet) = parquet else {
-        return Vec::new();
+fn parquet_rows(payload: &Payload) -> Vec<String> {
+    let parquet = match payload {
+        Payload::Absent => return Vec::new(),
+        Payload::Unavailable => return vec![String::from("parquet files: ?")],
+        Payload::Summary(parquet) => parquet,
     };
 
     let mut rows = vec![
@@ -3065,8 +3120,10 @@ fn json_tree(
             if let Some(spatialdata) = &meta.spatialdata {
                 node["spatialdata"] = json_spatialdata(spatialdata);
             }
-            if let Some(parquet) = &meta.parquet {
-                node["parquet"] = json_parquet(parquet);
+            match &meta.parquet {
+                Payload::Absent => {}
+                Payload::Unavailable => node["parquet"] = Value::Null,
+                Payload::Summary(parquet) => node["parquet"] = json_parquet(parquet),
             }
             if let Some(anndata) = &meta.anndata {
                 node["anndata"] = json_anndata(anndata);
@@ -3198,8 +3255,9 @@ fn json_anndata(anndata: &AnnData) -> Value {
 /// A section of its own beside `spatialdata` rather than a field inside it,
 /// because it is a different kind of fact: `spatialdata` is what a Zarr
 /// metadata file said, and this is what a Parquet file said. A node has this
-/// key only when there was a payload and it could be read, which is the same
-/// rule `ome` and `array` follow.
+/// key only when there was a payload, which is the same rule `ome` and `array`
+/// follow -- and the key is `null` when there was one and it could not be
+/// read, which is the rule every field inside those sections follows.
 ///
 /// `columns` is the count and `schema` the columns themselves, so a reader
 /// wanting only the width need not measure the list. The schema is whole here
@@ -4872,7 +4930,7 @@ mod tests {
             group_rows(&NodeKind::Group(GroupMeta {
                 ome: Some(info),
                 spatialdata: None,
-                parquet: None,
+                parquet: Payload::Absent,
                 anndata: None,
             })),
             vec!["rows: 2", "columns: 3", "wells: 3"]
@@ -4896,7 +4954,7 @@ mod tests {
             group_rows(&NodeKind::Group(GroupMeta {
                 ome: Some(info),
                 spatialdata: None,
-                parquet: None,
+                parquet: Payload::Absent,
                 anndata: None,
             }))
             .is_empty()
@@ -4926,7 +4984,7 @@ mod tests {
             group_rows(&NodeKind::Group(GroupMeta {
                 ome: Some(info),
                 spatialdata: None,
-                parquet: None,
+                parquet: Payload::Absent,
                 anndata: None,
             }))
             .is_empty()
@@ -4958,7 +5016,7 @@ mod tests {
             group_rows(&NodeKind::Group(GroupMeta {
                 ome: Some(info),
                 spatialdata: None,
-                parquet: None,
+                parquet: Payload::Absent,
                 anndata: None,
             })),
             vec!["rows: 1", "columns: 1"]
@@ -6340,8 +6398,82 @@ mod tests {
 
         // The shapes payload came off the physical store behind the snapshot.
         assert!(tree.contains("rows: 42"), "{tree}");
-        // The points one could not, and says nothing rather than guessing.
+        // The points one could not. Its parts are not guessed at, and the row
+        // that would have counted them says `?` instead -- an element whose
+        // payload could not be reached does not print like one with no
+        // payload at all.
         assert!(!tree.contains("rows: 9"), "{tree}");
+        assert!(tree.contains("parquet files: ?"), "{tree}");
+    }
+
+    #[test]
+    fn a_points_payload_that_cannot_be_listed_is_marked_unavailable_not_absent() {
+        // The same server that cannot answer a listing, asked about a store
+        // holding one points element and one ordinary group. The element is
+        // the case this exists for; the group is the control, and must gain
+        // nothing at all from it.
+        let consolidated = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {},
+            "consolidated_metadata": {
+                "kind": "inline",
+                "must_understand": false,
+                "metadata": {
+                    "transcripts": {
+                        "zarr_format": 3,
+                        "node_type": "group",
+                        "attributes": { "encoding-type": "ngff:points" },
+                    },
+                    "other": {
+                        "zarr_format": 3,
+                        "node_type": "group",
+                        "attributes": {},
+                    },
+                },
+            },
+        })
+        .to_string();
+
+        let server = TestServer::serving(
+            "data/store.zarr",
+            &[("zarr.json", consolidated.as_str())],
+            &[(
+                "transcripts/points.parquet/part.0.parquet",
+                parquet_file(&[Column::Double("x")], 9),
+            )],
+            false,
+        );
+
+        let store = consolidate(server.open());
+        let tree = rendered(store.as_ref(), "store.zarr", None);
+
+        // One marker and one only: the rows, the width and the schema are not
+        // separately unknown.
+        assert!(tree.contains("parquet files: ?"), "{tree}");
+        assert_eq!(tree.matches('?').count(), 1, "{tree}");
+        assert!(!tree.contains("rows:"), "{tree}");
+        assert!(!tree.contains("schema:"), "{tree}");
+
+        let root = classify(store.as_ref(), "");
+        let value = json_tree(store.as_ref(), "", "store.zarr", root, None).unwrap();
+
+        // `null` says the section was there and could not be read, which is
+        // the rule every field inside a section already follows. The ordinary
+        // group has no such section, so it has no key.
+        let children = value["children"].as_array().unwrap();
+        let element = children
+            .iter()
+            .find(|child| child["name"] == "transcripts")
+            .unwrap();
+        let group = children
+            .iter()
+            .find(|child| child["name"] == "other")
+            .unwrap();
+
+        assert_eq!(element["parquet"], Value::Null);
+        assert!(element.get("parquet").is_some());
+        assert!(group.get("parquet").is_none());
     }
 
     #[test]
@@ -6429,7 +6561,7 @@ mod tests {
             })
             .collect();
 
-        let rows = parquet_rows(Some(&ParquetSummary {
+        let rows = parquet_rows(&Payload::Summary(ParquetSummary {
             rows: 4_825_319,
             files: 12,
             columns,

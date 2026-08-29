@@ -41,7 +41,11 @@ against throwaway fixture stores.
   can serve it). Neither path is declared in the element's metadata; both are
   SpatialData writer conventions, reached only from a group its own metadata
   already named a points or shapes element. No record, page or row group is
-  ever read.
+  ever read. A points element whose payload exists but could not be inspected
+  -- the parts could not be listed, or a part's footer could not be read --
+  prints `parquet files: ?` and carries `"parquet": null` in `--json`, so it
+  does not read as an element with no payload. A payload that is genuinely
+  absent still prints nothing.
 - SpatialData table AnnData summaries, from Zarr metadata alone: observations
   and variables (each dataframe's declared `_index` array length, falling back
   to `X`'s declared shape), `X`'s representation and shape (a Zarr array is
