@@ -144,13 +144,16 @@ are as much a part of the design as the features.
   sharding, consolidated metadata, and how malformed metadata degrades.
 - [OME-Zarr reference](docs/ome-zarr.md) — recognition, versions, axes,
   multiscale datasets, HCS plates and wells, and what is deliberately absent.
+- [SpatialData reference](docs/spatialdata.md) — store and element recognition,
+  the Parquet and AnnData payload conventions, region linkage, and the
+  SpatialData validation rules.
 - [Project status](docs/status.md) — the capability matrix, and what is
   deliberately absent.
 - [Roadmap](docs/roadmap.md) — direction, with nothing promised.
 - [Releases](https://github.com/ronfinn/zarr-tree/releases)
 
-The SpatialData, Parquet and AnnData reference material is still below, and is
-being split out of this file one subject at a time.
+The general CLI reference — usage, `--depth`, `--json` and `--validate` — is
+still below, and is being split out of this file one subject at a time.
 
 ## Features
 
@@ -174,7 +177,8 @@ being split out of this file one subject at a time.
   count and schema — from the file footer alone. **No Parquet record is read.**
 - Summarises the AnnData table inside a table element — observations,
   variables, how `X` is stored, column counts, and what it annotates — from
-  Zarr metadata alone. **No expression or annotation value is read.**
+  Zarr metadata alone. **No expression or annotation value is read.** See
+  [docs/spatialdata.md](docs/spatialdata.md).
 - Reads a store's consolidated metadata when it has any, and walks the whole
   tree from that one document — so a plain static HTTP server, which can never
   answer a listing, needs none.
@@ -260,340 +264,75 @@ limitations.
 ## SpatialData
 
 [SpatialData](https://spatialdata.scverse.org/) keeps a spatial omics
-experiment in a Zarr container: microscopy images, segmentation masks,
-transcript locations, geometries and annotation tables, all in one store. The
-root of such a store is tagged, with the container format version appended when
-one is recorded, and so are the elements inside it:
+experiment in one Zarr container: microscopy images, segmentation masks,
+transcript locations, geometries and annotation tables. `zarr-tree` recognises
+a store root and its five element kinds from their metadata markers, and
+summarises the two payload formats those elements use:
 
 ```
-$ zarr-tree experiment.zarr
+$ zarr-tree --depth 2 experiment.zarr
 experiment.zarr [group, SpatialData 0.2]
 ├── images [group]
 │   └── morphology [group, OME-Zarr 0.5-dev-spatialdata, SpatialData image]
 │       ├─ axes: c, y, x
 │       ├─ pyramid levels: 1
-│       ├─ datasets: s0
-│       └── s0 [array]
-│           ├─ shape:  [4, 2048, 2048]
-│           ├─ chunks: [1, 512, 512]
-│           └─ dtype:  uint16
+│       └─ datasets: s0
 ├── labels [group]
 │   └── nuclei [group, OME-Zarr 0.5-dev-spatialdata, SpatialData labels]
 │       ├─ axes: y, x
 │       ├─ pyramid levels: 1
-│       ├─ datasets: s0
-│       └── s0 [array]
-│           ├─ shape:  [2048, 2048]
-│           ├─ chunks: [512, 512]
-│           └─ dtype:  uint32
+│       └─ datasets: s0
 ├── points [group]
 │   └── transcripts [group, SpatialData points]
-│       └── points.parquet [unknown]
+│       ├─ rows: 3,714
+│       ├─ columns: 4
+│       ├─ parquet files: 2
+│       └─ schema: x:double, y:double, feature_name:string, cell_id:int32
 ├── shapes [group]
 │   └── cell_boundaries [group, SpatialData shapes]
+│       ├─ rows: 1,200
+│       ├─ columns: 2
+│       ├─ parquet files: 1
+│       └─ schema: geometry:byte_array, cell_id:int32
 └── tables [group]
     └── table [group, SpatialData table]
         ├─ observations: 1,200
         ├─ variables: 313
         ├─ X: dense [1200, 313] float32
-        ├─ obs columns: 8
-        ├─ var columns: 3
+        ├─ obs columns: 3
+        ├─ var columns: 2
         ├─ annotates: cell_boundaries
-        ├─ region key: region
-        ├─ instance key: cell_id
-        ├── X [array]
-        │   ├─ shape:  [1200, 313]
-        │   ├─ chunks: [1200, 313]
-        │   └─ dtype:  float32
-        ├── obs [group]
-        └── var [group]
-```
-
-### The store root
-
-The container format version also decides which Zarr layout the store uses, and
-so where every marker below lives:
-
-| Container | Zarr | Attributes |
-| --- | --- | --- |
-| 0.1 | V2 | `.zattrs`, keys at the top level |
-| 0.2 | V3 | `attributes` inside `zarr.json` |
-
-Root detection requires `spatialdata_attrs.spatialdata_software_version`, not
-merely the presence of `spatialdata_attrs`. The elements inside a store each
-carry a `spatialdata_attrs` of their own, holding just the version of their own
-encoding; only the root records the software that wrote it. Without that
-distinction every element would be reported as a store of its own.
-
-### Elements
-
-Points, shapes and tables name their own kind as a plain string in their
-attributes:
-
-| Element | Key | Value |
-| --- | --- | --- |
-| points | `encoding-type` | `ngff:points` |
-| shapes | `encoding-type` | `ngff:shapes` |
-| table | `spatialdata-encoding-type` | `ngff:regions_table` |
-
-Two key names, for a historical reason rather than a semantic one: a table's
-group is written by AnnData, which claims `encoding-type` for its own
-`"anndata"`, so SpatialData records the kind one key over.
-
-Each value is matched exactly, never by prefix or by the presence of a key
-alone. AnnData writes `encoding-type` throughout the subtree beneath a table —
-`"dataframe"`, `"csr_matrix"`, `"array"` — and none of those is an element.
-
-Naming a table does not collapse it. The AnnData subtree below it is an
-ordinary Zarr hierarchy of groups and arrays, and it is walked and printed like
-any other. Recognising a node and deciding what to show underneath it are
-separate questions; nothing inside a table — `X`, `obs`, `var`, `layers`, the
-sparse matrix components, the region it annotates — is read or interpreted.
-
-Rasters name themselves nowhere: SpatialData writes them through the OME-Zarr
-writers, which have no `encoding-type` of their own. They are recognised from
-two facts together:
-
-| Element | SpatialData's mark | OME-Zarr metadata |
-| --- | --- | --- |
-| image | `spatialdata_attrs` (an object) | `multiscales` |
-| labels | `spatialdata_attrs` (an object) | `multiscales` **and** `image-label` |
-
-Both halves are needed. `spatialdata_attrs` alone is weak evidence — it is the
-same object a store root carries, minus the software version — but paired with
-OME-Zarr image metadata it separates an element of a store from an ordinary
-microscopy image that has nothing to do with SpatialData. Without it, every
-OME-Zarr image ever written would be tagged as a SpatialData element:
-
-```
-$ zarr-tree plain-image.zarr
-plain-image.zarr [group, OME-Zarr 0.4]
-├─ axes: c, y, x
-├─ pyramid levels: 1
-└─ datasets: 0
-```
-
-`image-label` is an OME-NGFF construct, not a SpatialData one: it is an object
-describing the colours and properties of the label values, and OME-NGFF places
-it beside `multiscales` in the same metadata object. It is read for its
-presence alone — no label value, colour or property is looked at. The
-specification says a label image *should* carry it rather than *must*, so a
-segmentation that omits it is reported as an image; the alternative would be to
-guess from the `labels/` directory name.
-
-Element tags carry no version. The number an element records is the version of
-its own encoding, which is a different quantity from the container version on
-the root line: in a container 0.2 store the points element is 0.2 and the
-shapes element is 0.3, and printing those next to `SpatialData 0.2` would
-suggest a disagreement that is not there.
-
-Recognition does not depend on the format version. Both markers have been
-written unchanged since the earliest releases and are the same in Zarr V2 and
-V3. What changed between element versions is where the *payload* lives — older
-shapes kept their geometry in sibling Zarr arrays, newer ones in a GeoParquet
-file — and no payload is read here.
-
-Elements are also recognised independently of the root, so a store written
-before SpatialData recorded a software version still has its elements tagged
-even though its root cannot be.
-
-Nothing beyond the kind is read. An element's axis names (which the writer
-sorts, so they do not record dimension order), its feature and instance keys,
-and its coordinate transformations are all left alone.
-
-### Payload files
-
-A points or shapes element keeps its data outside the Zarr hierarchy, in
-Parquet beside the element's own metadata. The two are not written the same
-way. Points are a *partitioned* Parquet dataset, so `points.parquet` is a
-directory of `part.0.parquet`, `part.1.parquet` and so on — one file where the
-frame had one partition, eight for the Xenium transcripts. Shapes are a
-GeoDataFrame written in one go, so `shapes.parquet` is a single file.
-
-zarr-tree reads the footer of each of those files and prints four rows:
-
-```
-$ zarr-tree xenium.zarr
-xenium.zarr [group, SpatialData 0.2]
-├── points [group]
-│   └── transcripts [group, SpatialData points]
-│       ├─ rows: 638,083
-│       ├─ columns: 9
-│       ├─ parquet files: 1
-│       └─ schema: x:float, y:float, z:float, feature_name:string, cell_id:int32, ...
-└── shapes [group]
-    ├── cell_boundaries [group, SpatialData shapes]
-    │   ├─ rows: 167,780
-    │   ├─ columns: 2
-    │   ├─ parquet files: 1
-    │   └─ schema: geometry:byte_array, cell_id:int32
-    └── cell_circles [group, SpatialData shapes]
-        ├─ rows: 167,780
-        ├─ columns: 3
-        ├─ parquet files: 1
-        └─ schema: geometry:byte_array, radius:double, cell_id:int32
-```
-
-**Parquet records are not read.** A Parquet file keeps its metadata in a footer
-at the very end, so only the end of the file is fetched — 64 KiB at most, twice
-at worst, whether the file is three kilobytes or two gigabytes. No row group is
-opened, no page is decoded, no coordinate or geometry is touched, and the
-`--json` output carries the same four facts and nothing more. A 77 MB
-transcripts payload on an HTTP server costs one `HEAD` and one 64 KiB range
-`GET`: 0.09% of the file.
-
-`rows` is the total across every file of the payload, summed from the footers.
-`columns` and `schema` are the top-level columns of the first file — the parts
-of one payload are one table written in pieces and share a schema. Column types
-are Parquet's own: the logical type where a column declares one (`string`,
-`uint8`), and the physical type otherwise (`double`, `byte_array`). Past a
-dozen columns the tree's `schema` row counts the rest rather than naming them;
-`--json` always carries the whole schema.
-
-A points element's `points.parquet` directory is not drawn as a child node. It
-is the element's data, not a node beneath it, and the rows above already say
-what is in it. That is not a rule about the name: it applies only to a group
-whose own metadata said it is a points element, so an ordinary Zarr group with
-a directory called `points.parquet` is walked into as usual.
-
-The summary is best-effort. A payload that is missing, is not Parquet, or has
-an encrypted footer costs the four rows and nothing else: the element is still
-recognised and tagged from its Zarr metadata exactly as before. A shapes
-payload is one file at a name we know, so it is read even from a server with no
-listing at all; a points payload has to be listed first, and its filenames are
-never guessed at.
-
-A points payload that could not be listed — on a plain static HTTP server, or
-behind a WebDAV answer we could not parse — is not the same thing as one that
-is not there, and does not print like one:
-
-```
-$ zarr-tree --depth 1 https://static.example/data/xenium.zarr
-https://static.example/data/xenium.zarr [group, SpatialData 0.2]
-└── points [group]
-    └── transcripts [group, SpatialData points]
-        └─ parquet files: ?
-```
-
-One marker and no more. The rows, the width and the schema are not separately
-unknown — they are all unknown for the one reason, which is that the payload
-was never read. A payload that is genuinely absent still prints nothing.
-
-The directory names `images`, `labels`, `points`, `shapes` and `tables` are
-never used to detect anything. In a real store those groups carry no attributes
-at all, so the name would be the only thing left to go on — and an ordinary
-Zarr store whose children happen to be called `images` and `points` is not a
-SpatialData store:
-
-```
-$ zarr-tree plain.zarr
-plain.zarr [group]
-├── images [group]
-├── points [group]
-├── shapes [group]
-└── tables [group]
-```
-
-The version is printed exactly as stored and is never checked against the
-versions that exist. A root whose marker is present but carries no readable
-version is tagged `[group, SpatialData]`.
-
-### Tables
-
-A SpatialData table is an [AnnData](https://anndata.readthedocs.io/) object
-written into the store, and AnnData records the shape of a table in metadata:
-the length of each dataframe's index, the columns it declares, and how the
-expression matrix is stored. All of that is read from Zarr metadata files, so a
-table says how big it is without a single value being read:
-
-```
-$ zarr-tree xenium.zarr --depth 2
-xenium.zarr [group, SpatialData 0.2]
-└── tables [group]
-    └── table [group, SpatialData table]
-        ├─ observations: 167,780
-        ├─ variables: 313
-        ├─ X: csr [167780, 313]
-        ├─ obs columns: 8
-        ├─ var columns: 3
-        ├─ annotates: cell_circles
         ├─ region key: region
         └─ instance key: cell_id
 ```
 
-| Row | Where it comes from |
-| --- | --- |
-| `observations` | the length of the array `obs` names in its `_index`, or the first dimension `X` declares |
-| `variables` | the same for `var`, or the second dimension `X` declares |
-| `X` | how the matrix is stored, and the shape it declares |
-| `obs columns` | the length of the `column-order` `obs` declares |
-| `var columns` | the same for `var` |
-| `annotates` | the `region` the table declares |
-| `region key` | the `obs` column naming each observation's region |
-| `instance key` | the `obs` column naming the instance within it |
+| Element | Recognised from | Summarised from |
+| --- | --- | --- |
+| root | `spatialdata_attrs.spatialdata_software_version` | — |
+| image | `spatialdata_attrs` and OME-Zarr `multiscales` | Zarr and OME-Zarr metadata |
+| labels | the same, plus OME-Zarr `image-label` | Zarr and OME-Zarr metadata |
+| points | `encoding-type` = `ngff:points` | Parquet footers |
+| shapes | `encoding-type` = `ngff:shapes` | a Parquet footer |
+| table | `spatialdata-encoding-type` = `ngff:regions_table` | AnnData's Zarr metadata |
 
-**Expression values and annotation values are not read.** Nothing is counted,
-either: every number above is a field in a metadata file. A dense `X` is a Zarr
-array and reports its own shape and dtype; a sparse one is a group whose
-attributes declare both the representation and the shape, so the `data`,
-`indices` and `indptr` arrays inside it are never opened.
+Every one of those markers is matched exactly, and **nothing is inferred from a
+directory name**: the `images`, `points` and `tables` container groups carry no
+attributes at all, so they are printed untagged.
 
-| `X` written as | Row |
-| --- | --- |
-| a Zarr array | `X: dense [2389, 268] int64` |
-| a group of `encoding-type` `csr_matrix` | `X: csr [167780, 313]` |
-| a group of `encoding-type` `csc_matrix` | `X: csc [167780, 313]` |
+A points or shapes element keeps its data outside the Zarr hierarchy, in
+Parquet. Only the **file footer** is read — 64 KiB from the end of each file,
+at the two paths SpatialData's writer uses — so no record, page or row group is
+decoded, and a points element's `points.parquet/` directory is data rather than
+a child node and is not drawn as one. A table holds an
+[AnnData](https://anndata.readthedocs.io/) object, and its summary is **Zarr
+metadata alone**: five reads and no listing, with no expression value,
+annotation value or category read and nothing counted.
 
-The columns are the ones `column-order` declares, and never the children of
-`obs` on disk. The two are usually the same list, but only one of them is what
-the dataframe says about itself — and a listing would also sweep up the index
-array and the `categories`/`codes` groups of every categorical column. The
-counts are shown in the tree; `--json` carries the declared names in full.
-
-Five metadata files are read below a table, whatever the store holds: `obs`,
-`var`, the index array each of them names, and `X`. No listing is made, so the
-summary costs the same handful of `GET`s on a static HTTP server as it does on
-a local disk, and comes wholly out of the snapshot when the store carries
-consolidated metadata.
-
-The rows are a summary, not a replacement. Everything AnnData wrote is still a
-group in the tree and is still walked into at greater depth:
-
-```
-$ zarr-tree xenium.zarr/tables/table --depth 1
-xenium.zarr/tables/table [group, SpatialData table]
-├─ observations: 167,780
-├─ variables: 313
-├─ X: csr [167780, 313]
-├─ obs columns: 8
-├─ var columns: 3
-├─ annotates: cell_circles
-├─ region key: region
-├─ instance key: cell_id
-├── X [group]
-├── layers [group]
-├── obs [group]
-├── obsm [group]
-├── obsp [group]
-├── uns [group]
-├── var [group]
-├── varm [group]
-└── varp [group]
-```
-
-Each row is independent, and a field the metadata does not give up simply has
-no row: a table whose `var` cannot be read still reports the observations its
-`obs` declared. A table that annotates nothing draws none of the last three
-rows — SpatialData writes those keys as nulls rather than leaving them out, and
-a null is not something to print. The tree checks nothing against anything
-else: a table whose `X` declares a shape its `obs` index disagrees with is
-reported as it stands. `--validate` is where that disagreement is called out —
-see [Validation](#validation).
-
-This is licensed by the table marker and by nothing else. A group that merely
-holds children called `X`, `obs` and `var`, or that is merely called `table`,
-is an ordinary Zarr group and is read as one. `uns` is walked as the group it
-is and is not interpreted.
+**[docs/spatialdata.md](docs/spatialdata.md)** is the reference: root and
+element recognition, the Parquet and AnnData payload conventions, footer
+access, readable-versus-unavailable-versus-absent payloads, region linkage, the
+JSON shape, the three SpatialData validation rules, and the current
+limitations.
 
 ## Installation
 
@@ -1132,38 +871,15 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
   coordinate transformations are not shown, and no element is joined to any
   other — a table names the regions it annotates, and outside `--validate`
   nothing checks that those elements exist or links them to the table.
-- A table summary is AnnData *metadata* and nothing more. No expression value,
-  annotation value, category or index label is read, and nothing is counted:
-  the number of non-zero entries in a sparse `X`, the categories of a
-  categorical column and the dtype of a sparse `X` are all absent because
-  finding them would mean opening an array. `layers`, `obsm`, `obsp`, `varm`,
-  `varp`, `uns` and `raw` are walked as the groups they are and are not
-  interpreted or counted, which is what keeps the summary to five metadata
-  reads and no listing. Only `X` written as a Zarr array, a `csr_matrix` or a
-  `csc_matrix` is described; any other representation draws no `X` row. H5AD
-  is not read — only AnnData written into Zarr.
-- No Parquet record is ever read. Only the footer is fetched, so row counts and
-  the schema are what the file *declares*: nothing is counted, nothing is
-  checked, and a footer that disagrees with the pages below it is reported as
-  it stands. Row-group layout, encodings, compression, statistics, key/value
-  metadata and the GeoParquet `geo` block are not read, so a shapes column
-  shows as `byte_array` rather than as the geometry type it encodes. Nested
-  columns are counted once and not expanded.
-- A Parquet payload is looked for only where a SpatialData element's metadata
-  named one, and only at the two paths SpatialData's writer uses —
-  `points.parquet/` and `shapes.parquet`. An arbitrary `.parquet` file
-  elsewhere in a store is not read, and a points payload on a server with no
-  listing has its part filenames guessed at by nobody: it reports
-  `parquet files: ?` and stops there.
+- No Parquet record is ever read, and no expression value, annotation value,
+  category or index label is. Row counts and schemas are what a footer
+  *declares*; a sparse `X` reports no dtype and no non-zero count; GeoParquet
+  semantics, `layers`, `obsm`, `uns` and the rest are not interpreted; and H5AD
+  is not read. The full list is in
+  [docs/spatialdata.md](docs/spatialdata.md#current-limitations).
 - A segmentation that omits the optional `image-label` key is reported as an
   image. Nothing inside `image-label` — colours, properties, the source image —
   is read, and no label value is ever looked at.
-- A store root written before SpatialData recorded a software version carries
-  no root marker and is not recognised as one; its points, shapes and table
-  elements still are, because those name themselves in a key such a store does
-  carry. Its images and labels do not, since they are recognised in part by a
-  `spatialdata_attrs` those older stores do not write. Nothing is inferred from
-  directory names in any case.
 - Symlinks are not followed, and a symlinked directory is not listed at all:
   the walk keeps only entries the filesystem reports as real directories.
   That is also what stops a link pointing back at an ancestor from looping.

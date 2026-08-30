@@ -113,6 +113,8 @@ costs the same locally and remotely and comes wholly out of a consolidated
 snapshot. `X` is described when written as a Zarr array, a `csr_matrix` or a
 `csc_matrix`; any other representation draws no `X` row.
 
+The [SpatialData reference](spatialdata.md) documents all of this in detail.
+
 ## Validation
 
 `--validate` is a metadata-only structural check. It was merged after v0.3.0 and
@@ -180,6 +182,8 @@ on:
   metadata, and the degradation model.
 - [OME-Zarr reference](ome-zarr.md) — recognition, versions, axes, multiscale
   datasets, plates and wells.
+- [SpatialData reference](spatialdata.md) — store and element recognition, the
+  Parquet and AnnData payload summaries, and region linkage.
 - [Roadmap](roadmap.md) — direction, with nothing promised.
 - [README](../README.md) — the current detailed documentation, being split into
   this directory one subject at a time.

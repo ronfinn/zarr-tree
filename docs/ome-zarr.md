@@ -57,7 +57,7 @@ Tags the program emits, and no others:
 The last is a group whose OME-Zarr metadata is present but records no readable
 version. On a SpatialData store an element carries both vocabularies, and both
 appear: `[group, OME-Zarr 0.5-dev-spatialdata, SpatialData labels]` — see the
-[SpatialData material](../README.md#spatialdata).
+[SpatialData reference](spatialdata.md).
 
 ## Recognition
 
@@ -512,6 +512,8 @@ the full matrix is in [Project status](status.md#ome-zarr).
 
 - [Zarr reference](zarr.md) — the layer underneath: node classification,
   arrays, sharding, consolidated metadata.
+- [SpatialData reference](spatialdata.md) — the layer above: how a raster
+  element is told from an ordinary OME-Zarr image.
 - [Getting started](getting-started.md) — building it, the option set, and exit
   status.
 - [Architecture](architecture.md#ome-zarr) — where the OME-Zarr reader sits and

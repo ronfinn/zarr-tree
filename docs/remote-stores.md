@@ -291,7 +291,8 @@ costs two.
 A SpatialData points or shapes element keeps its data in Parquet beside the
 element's metadata, and `zarr-tree` summarises it from the **file footer alone**
 — no row group, page, record or value is ever read. See
-[Payload files](../README.md#payload-files) for what the summary contains.
+[Parquet metadata summaries](spatialdata.md#parquet-metadata-summaries) for what
+the summary contains.
 
 Remotely this uses bounded range reads rather than a download. The current
 footer window is 64 KiB: one `HEAD` for the object size, then one range `GET` of
@@ -400,6 +401,8 @@ Remote-specific. The full list is under
 - [Getting started](getting-started.md) — build, first store, the option set.
 - [Zarr reference](zarr.md) — what is read from each metadata layout, and the
   consolidated metadata formats these servers serve.
+- [SpatialData reference](spatialdata.md) — what a Parquet or AnnData summary
+  reads, and why a points payload needs a listing.
 - [Architecture](architecture.md) — the `Store` trait and the consolidated
   overlay.
 - [Project status](status.md) — the capability matrix.

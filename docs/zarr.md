@@ -551,6 +551,8 @@ pages. The full matrix, including what is supported in v0.3.0 versus on
   status.
 - [OME-Zarr reference](ome-zarr.md) — the metadata layered on top of these
   groups.
+- [SpatialData reference](spatialdata.md) — the conventions layered on top of
+  those, and the two payload formats they use.
 - [Remote stores](remote-stores.md) — S3, HTTP, WebDAV, and static HTTP via
   consolidated metadata.
 - [Architecture](architecture.md) — the `Store` trait, the consolidated

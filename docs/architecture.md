@@ -344,6 +344,9 @@ A table also declares what it annotates — `region`, `region_key`,
 object. Those are *names* of elements and of `obs` columns; no column value is
 read to reconstruct any of it.
 
+The [SpatialData reference](spatialdata.md) documents what each of these
+readers reports, and what it deliberately does not.
+
 ## The Parquet path
 
 `zarr-tree` reads Parquet footers and nothing else. No row group, no page, no

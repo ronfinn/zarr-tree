@@ -208,6 +208,8 @@ The seven rules are listed under [Validation](../README.md#validation).
   metadata, and how malformed metadata degrades.
 - [OME-Zarr reference](ome-zarr.md) — recognition, versions, axes, multiscale
   datasets, plates and wells.
+- [SpatialData reference](spatialdata.md) — elements, Parquet payload
+  summaries, and AnnData table summaries.
 - [Project status](status.md) — the capability matrix, and what is deliberately
   absent.
 - [Roadmap](roadmap.md) — direction, with nothing promised.
