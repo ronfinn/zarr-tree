@@ -1,28 +1,143 @@
 # zarr-tree
 
 [![CI](https://github.com/ronfinn/zarr-tree/actions/workflows/ci.yml/badge.svg)](https://github.com/ronfinn/zarr-tree/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/ronfinn/zarr-tree?label=release)](https://github.com/ronfinn/zarr-tree/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange)](#project-status)
 
-A small Rust CLI for exploring the structure and metadata of Zarr stores, on
-this machine, in an S3 bucket, or on an HTTP server.
+`zarr-tree` is a read-only Rust CLI for inspecting the hierarchy and metadata of
+Zarr stores — on a local filesystem, in an S3 bucket, or on an HTTP server. It
+reads Zarr V2 and V3 layouts, recognises OME-Zarr and SpatialData conventions
+from their metadata markers, and can check the structure a store declares
+against the store itself.
+
+It reads metadata only. Arrays are leaves: chunk objects are never listed and
+chunk data is never fetched.
 
 ```
-$ zarr-tree example.zarr
-example.zarr [group]
+$ zarr-tree --depth 2 experiment.zarr
+experiment.zarr [group, SpatialData 0.2]
+├── images [group]
+│   └── morphology [group, OME-Zarr 0.5-dev-spatialdata, SpatialData image]
+│       ├─ axes: c, y, x
+│       ├─ pyramid levels: 1
+│       └─ datasets: s0
 ├── labels [group]
-│   └── cells [array]
-│       ├─ shape:  [1, 2048, 2048]
-│       ├─ chunks: [1, 512, 512]
-│       └─ dtype:  <u4
-└── raw [group]
-    ├── 0 [array]
-    │   ├─ shape:  [1, 2048, 2048]
-    │   ├─ chunks: [1, 512, 512]
-    │   └─ dtype:  uint16
-    └── 1 [array]
-        ├─ shape:  [1, 1024, 1024]
-        ├─ chunks: [1, 512, 512]
-        └─ dtype:  uint16
+│   └── nuclei [group, OME-Zarr 0.5-dev-spatialdata, SpatialData labels]
+│       ├─ axes: y, x
+│       ├─ pyramid levels: 1
+│       └─ datasets: s0
+├── points [group]
+│   └── transcripts [group, SpatialData points]
+├── shapes [group]
+│   └── cell_boundaries [group, SpatialData shapes]
+└── tables [group]
+    └── table [group, SpatialData table]
+        ├─ observations: 1,200
+        ├─ variables: 313
+        ├─ X: dense [1200, 313] float32
+        ├─ obs columns: 3
+        ├─ var columns: 2
+        ├─ annotates: cell_boundaries
+        ├─ region key: region
+        └─ instance key: cell_id
 ```
+
+## Why zarr-tree?
+
+A Zarr store is not a file. It is a directory tree, or an object-store key
+prefix, whose structure lives in small JSON documents scattered through it —
+and whose bulk is chunk objects, often millions of them. `ls`, `tree` and
+`aws s3 ls` show the bulk and bury the structure.
+
+What you usually want to know is the structure: what groups are in here, what
+arrays, what shape and dtype, and — for a microscopy or spatial-omics store —
+what the OME-Zarr and SpatialData metadata says the pieces are and how they
+relate. That information is spread across several conventions layered on top of
+plain Zarr, and reading it by hand means opening a dozen JSON files.
+
+`zarr-tree` reads those documents and prints one tree. It stops at array and
+chunk boundaries deliberately: an array is a leaf, so a walk costs a few
+requests per node and none at all per chunk — which is what makes a store you
+could not afford to list at all inspectable. Nothing is inferred from a
+directory name, and no scientific data is read.
+
+## Quick start
+
+Build from source with a Rust toolchain of 1.88 or newer:
+
+```sh
+git clone https://github.com/ronfinn/zarr-tree.git
+cd zarr-tree
+cargo install --path .
+```
+
+Then point it at a store. A local directory, an S3 URI and an HTTP URL take the
+same walk, print the same tree and accept the same options:
+
+```sh
+zarr-tree /data/example.zarr
+zarr-tree s3://bucket/path/example.zarr
+zarr-tree https://example.org/path/example.zarr
+```
+
+Limit how far it descends, or print the same walk as JSON:
+
+```sh
+zarr-tree --depth 2 example.zarr
+zarr-tree --json example.zarr | jq '.children[].name'
+```
+
+Check what the metadata declares against what the store has:
+
+```sh
+zarr-tree --validate example.zarr
+```
+
+`--validate` was added after v0.3.0 and is currently on `master` only — build
+from source to use it. Everything else above is in v0.3.0.
+
+## What it understands
+
+| Area | Support |
+| --- | --- |
+| Zarr | V2 and V3, sharding, consolidated metadata |
+| OME-Zarr | 0.3–0.5, multiscales, axes, dataset paths, HCS plates and wells |
+| SpatialData | store root, images, labels, points, shapes, tables |
+| Parquet | footer summaries only — rows, columns, file count, schema |
+| AnnData | metadata summaries only — no value is read, nothing is counted |
+| Storage | local filesystem, S3, HTTP/WebDAV, static HTTP via consolidated metadata |
+| Validation | metadata-only structural checks, on `master` after v0.3.0 |
+
+[docs/status.md](docs/status.md) carries the exact matrix, including what is
+deliberately not implemented.
+
+## Project status
+
+The latest release is [v0.3.0](https://github.com/ronfinn/zarr-tree/releases).
+Development continues on `master`, which currently carries metadata structural
+validation (`--validate`) added after that release.
+
+| | |
+| --- | --- |
+| Latest release | v0.3.0 |
+| Development HEAD | post-v0.3.0, `--validate` present |
+| Tests | 112 passing — 94 unit, 18 integration |
+| Minimum supported Rust version | 1.88 |
+
+This is a small utility maintained by one person, not a certified product. The
+scope is deliberately narrow and the [non-goals](docs/status.md#explicit-non-goals)
+are as much a part of the design as the features.
+
+## Documentation
+
+- [Project status](docs/status.md) — the capability matrix, and what is
+  deliberately absent.
+- [Roadmap](docs/roadmap.md) — direction, with nothing promised.
+- [Releases](https://github.com/ronfinn/zarr-tree/releases)
+
+More focused guides for architecture, remote stores, OME-Zarr, SpatialData and
+validation are being split out of the reference material below.
 
 ## Features
 
@@ -1182,8 +1297,8 @@ cargo clippy --all-targets -- -D warnings  # lints, as CI runs them
 cargo fmt --check            # formatting, as CI runs it
 ```
 
-The suite is in two parts: 78 unit tests in `src/main.rs`, which cover metadata
-parsing directly, and 14 integration tests in `tests/cli.rs`, which run the
+The suite is in two parts: 94 unit tests in `src/main.rs`, which cover metadata
+parsing directly, and 18 integration tests in `tests/cli.rs`, which run the
 compiled binary against throwaway fixture stores and assert on what it prints.
 The Parquet fixtures are written by the same crate that reads them back, so
 those tests run against real Parquet bytes with a real footer.
@@ -1313,13 +1428,11 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
 
 ## Roadmap
 
-Small, in roughly this order:
-
-1. Show a node's user attributes when asked.
-2. Report V3 dtypes given in object form, instead of showing them as missing.
-
-GCS and Azure backends, and anything beyond lightweight OME-Zarr and
-SpatialData recognition, are out of scope for now.
+Direction, with nothing promised, lives in [docs/roadmap.md](docs/roadmap.md).
+Near term it is documentation work, more structural validation within the
+existing model, and better OME-Zarr presentation. GCS and Azure backends, and
+anything beyond lightweight OME-Zarr and SpatialData recognition, remain out of
+scope.
 
 ## Why this project exists
 
