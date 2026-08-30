@@ -97,6 +97,9 @@ zarr-tree --validate example.zarr
 `--validate` was added after v0.3.0 and is currently on `master` only — build
 from source to use it. Everything else above is in v0.3.0.
 
+[docs/getting-started.md](docs/getting-started.md) covers this at more length,
+and [docs/remote-stores.md](docs/remote-stores.md) covers the S3 and HTTP cases.
+
 ## What it understands
 
 | Area | Support |
@@ -131,13 +134,17 @@ are as much a part of the design as the features.
 
 ## Documentation
 
+- [Getting started](docs/getting-started.md) — build it, inspect a first store,
+  and the whole option set in one page.
+- [Remote stores](docs/remote-stores.md) — S3, AWS credentials and endpoints,
+  HTTP and WebDAV, static HTTP via consolidated metadata, troubleshooting.
 - [Project status](docs/status.md) — the capability matrix, and what is
   deliberately absent.
 - [Roadmap](docs/roadmap.md) — direction, with nothing promised.
 - [Releases](https://github.com/ronfinn/zarr-tree/releases)
 
-More focused guides for architecture, remote stores, OME-Zarr, SpatialData and
-validation are being split out of the reference material below.
+More focused guides for architecture, OME-Zarr, SpatialData and validation are
+being split out of the reference material below.
 
 ## Features
 
@@ -738,24 +745,22 @@ is and is not interpreted.
 
 ## Installation
 
-From source:
+`zarr-tree` is not on crates.io and there are no release binaries yet, so it is
+built from source:
 
 ```sh
 git clone https://github.com/ronfinn/zarr-tree.git
 cd zarr-tree
-cargo build --release
-```
-
-The binary lands at `target/release/zarr-tree`. Copy it somewhere on your
-`PATH`, or install it into `~/.cargo/bin`:
-
-```sh
-cargo install --path .
+cargo build --release      # binary at target/release/zarr-tree
+cargo install --path .     # or install it into ~/.cargo/bin
 ```
 
 Rust 1.88 or newer is required. Edition 2024 itself needs only 1.85, but the
 current `object_store` release uses let-chains, which are stable for edition
 2024 from 1.88. It was developed with rustc 1.98.0.
+
+[docs/getting-started.md](docs/getting-started.md) walks through the build, a
+first store and the option set in more detail.
 
 ## Usage
 
@@ -824,22 +829,14 @@ this machine, exactly as before — including a relative path that happens to
 contain `s3://` somewhere after its start.
 
 **Credentials.** Settings come from the usual `AWS_*` environment variables and
-nothing else: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
-`AWS_REGION`, `AWS_ENDPOINT_URL`, and the web-identity and container credential
-variables. There is no login, no profile manager and no credential file of
-zarr-tree's own.
-
-When none of those names a credential, requests go out **unsigned**, which is
-what a public bucket wants and what the example above relies on. Set
-`AWS_SKIP_SIGNATURE=false` to force the credential chain — on an EC2 instance
-with an instance role, that is what you want.
-
-`AWS_REGION` matters: without it the bucket is assumed to be in `us-east-1`, and
-S3 answers a bucket in another region with a redirect rather than data.
-
-Note that the underlying library does not read `~/.aws/credentials`, so a named
-profile has no effect on its own. `aws configure export-credentials --format
-env` bridges the gap.
+nothing else — there is no login, no profile manager and no credential file of
+zarr-tree's own. When none of them names a credential, requests go out
+**unsigned**, which is what a public bucket wants and what the example above
+relies on; `AWS_SKIP_SIGNATURE=false` forces the credential chain instead.
+`AWS_REGION` matters, because without it the bucket is assumed to be in
+`us-east-1`. `~/.aws/credentials` is not read, so a named profile has no effect
+on its own. [docs/remote-stores.md](docs/remote-stores.md#aws-credentials) has
+the full variable list, the anonymous-default rationale and the profile bridge.
 
 **Requests.** An array is a leaf on S3 exactly as it is on disk, and that is
 what makes remote traversal affordable: a listing is made only for a group, so
@@ -903,13 +900,9 @@ http://server.example/data/example.zarr [group, OME-Zarr 0.5]
 **Listing needs WebDAV.** Metadata is read with ordinary `GET` requests, which
 every server supports. Finding a node's *children* is a different question, and
 HTTP has no operation for it — so `zarr-tree` asks with a WebDAV `PROPFIND`,
-`Depth: 1`. A server configured for WebDAV (Apache `mod_dav`, nginx
-`ngx_http_dav_module` with `PROPFIND`, ownCloud/Nextcloud, and most object
-gateways that offer a DAV endpoint) gives a full tree.
-
-An ordinary static file server does not. It is told apart from a missing store,
-because saying "not found" about a URL we have just read metadata from would be
-wrong:
+`Depth: 1`. A server configured for WebDAV gives a full tree; an ordinary
+static file server does not, and is told apart from a missing store, because
+saying "not found" about a URL we have just read metadata from would be wrong:
 
 ```
 $ zarr-tree --depth 1 https://static.example/data/example.zarr
@@ -918,47 +911,21 @@ error: cannot list https://static.example/data/example.zarr: the server answers
 GET but not the WebDAV listing needed to find child nodes
 ```
 
-Such a store can still be inspected one node at a time, since `--depth 0` needs
-no listing at all:
-
-```
-$ zarr-tree --depth 0 https://static.example/data/example.zarr
-https://static.example/data/example.zarr [group, OME-Zarr 0.4]
-├─ axes: c, z, y, x
-├─ pyramid levels: 3
-└─ datasets: 0, 1, 2
-```
-
-**Unless the store is consolidated.** A store that carries [consolidated
-metadata](#consolidated-metadata) needs no listing at any depth, and a static
-server serves it in full:
-
-```
-$ zarr-tree --depth 1 https://ncsa.osn.xsede.org/Pangeo/pangeo-forge/gpcp-feedstock/gpcp.zarr
-https://ncsa.osn.xsede.org/Pangeo/pangeo-forge/gpcp-feedstock/gpcp.zarr [group]
-├── lat_bounds [array]
-│   ├─ shape:  [180, 2]
-│   ├─ chunks: [180, 2]
-│   └─ dtype:  <f4
-...
-└── time_bounds [array]
-    ├─ shape:  [9226, 2]
-    ├─ chunks: [200, 2]
-    └─ dtype:  <i8
-```
-
-That server answers `PROPFIND` with `405 Method Not Allowed`. The whole tree
-above came out of one `GET` of `.zmetadata`.
-
-Directory-index pages are never scraped: an HTML listing is a page for people,
-not a protocol, and reading one would mean guessing at a server's theme.
+Such a store can still be inspected one node at a time with `--depth 0`, which
+needs no listing at all — and in full at any depth if it carries [consolidated
+metadata](#consolidated-metadata), which is what lets a plain static server
+serve a whole tree. Directory-index pages are never scraped: an HTML listing is
+a page for people, not a protocol, and reading one would mean guessing at a
+server's theme.
 
 **URLs.** The URL is the store root, and internal paths resolve beneath it. A
-trailing slash makes no difference, and percent-escapes are decoded and
-re-applied per path segment rather than pasted together. A query string is kept
-and sent with every request, which is the one shape of access token a static
-server tends to want. There is no credential handling of any other kind: no
-`Authorization` header, no cookie, no `--user`.
+query string is kept and sent with every request, which is the one shape of
+access token a static server tends to want. There is no credential handling of
+any other kind: no `Authorization` header, no cookie, no `--user`.
+
+[docs/remote-stores.md](docs/remote-stores.md) is the practical guide to all of
+this: which servers list, what a static store can and cannot do, how remote
+Parquet footers are read, and what to check when a remote store will not open.
 
 ### Consolidated metadata
 
