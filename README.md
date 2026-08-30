@@ -140,94 +140,70 @@ are as much a part of the design as the features.
   HTTP and WebDAV, static HTTP via consolidated metadata, troubleshooting.
 - [Architecture](docs/architecture.md) — the `Store` trait, the consolidated
   overlay, how metadata is classified, and how validation reuses the walk.
+- [Zarr reference](docs/zarr.md) — V2 and V3 layouts, arrays and dtypes,
+  sharding, consolidated metadata, and how malformed metadata degrades.
+- [OME-Zarr reference](docs/ome-zarr.md) — recognition, versions, axes,
+  multiscale datasets, HCS plates and wells, and what is deliberately absent.
 - [Project status](docs/status.md) — the capability matrix, and what is
   deliberately absent.
 - [Roadmap](docs/roadmap.md) — direction, with nothing promised.
 - [Releases](https://github.com/ronfinn/zarr-tree/releases)
 
-More focused guides for OME-Zarr, SpatialData and validation are being split
-out of the reference material below.
+The SpatialData, Parquet and AnnData reference material is still below, and is
+being split out of this file one subject at a time.
 
 ## Features
 
-- Prints a tree of a Zarr store, given a directory, an `s3://` URI or an
-  `http(s)://` URL.
-- Labels each directory as `[group]`, `[array]` or `[unknown]`.
-- Shows `shape`, `chunks` and `dtype` underneath every array.
-- Tells a Zarr V3 sharded array's inner chunks from its shards, and adds a
-  `shards:` row when the array is sharded.
-- Stops descending at arrays, so chunk storage (a V3 `c/` directory, V2 chunk
-  keys) does not clutter the output.
-- Recognises OME-Zarr image groups and tags them, e.g. `[group, OME-Zarr 0.4]`.
-- Shows an OME-Zarr image's axis names on one row, e.g. `axes: c, y, x`.
-- Summarises an OME-Zarr multiscale pyramid: how many resolution levels the
-  metadata declares, and the paths it declares them at.
-- Recognises OME-Zarr HCS plates and wells and tags them, e.g.
-  `[group, OME-Zarr 0.5 plate]`, and shows a plate's declared row, column and
-  well counts.
-- Recognises the root of a SpatialData store and tags it, e.g.
-  `[group, SpatialData 0.2]`.
-- Recognises SpatialData elements — images, labels, points, shapes and tables —
-  e.g. `[group, SpatialData points]`, and tells a segmentation from an image by
-  its OME-Zarr metadata rather than by its directory name.
-- Summarises the Parquet payload of a SpatialData points or shapes element: how
-  many rows it holds, how many columns wide it is, how many Parquet files it is
-  written across, and what its columns are called and typed. Read from the file
-  footer alone — **Parquet records are not read.** A points payload that is
-  there but could not be inspected says `parquet files: ?`, so it does not read
-  as an element with no payload at all.
-- Summarises the AnnData table inside a SpatialData table element: how many
-  observations and variables it declares, how `X` is stored and what shape it
-  says it is, how many `obs` and `var` columns it declares, and which elements
-  it annotates. Read from Zarr metadata alone — **expression values and
-  annotation values are not read.**
-- Reads S3 with the same walk, the same output and the same options, stopping
-  at arrays there too — so an array's chunk objects are never listed, however
-  many millions of them there are.
-- Reads HTTP(S) the same way. Metadata comes from ordinary `GET`s; children
-  come from a WebDAV `PROPFIND`, so a full tree needs a server that supports
-  it, and a server that only does `GET` says so plainly instead of pretending
-  the store is missing.
-- Reads a store's consolidated metadata when it has any — Zarr V2's
-  `.zmetadata`, or a Zarr V3 root `zarr.json` carrying an inline
-  `consolidated_metadata` block — and walks the whole tree from that one
-  document. A plain static HTTP server, which can never answer a listing, then
-  needs no listing to be walked in full.
-- Limits how far it descends with `--depth N`.
-- Checks the structure a store declares against the store with `--validate`:
-  does every OME-Zarr dataset path exist, does every well a plate declares,
-  does a table's region name an element that is there, does `X` match the
-  dimensions the table's own indexes give. Metadata only, `PASS`/`WARN`/`ERROR`
-  a line, and exit status 2 when something is declared and missing.
-- Prints the same walk as JSON with `--json`, for `jq` and scripts.
-- Sits quietly at the producing end of a pipe: `| head` ends the run with no
-  panic and no error.
+- Prints a tree of a Zarr store from a directory, an `s3://` URI or an
+  `http(s)://` URL — the same walk, the same output and the same options
+  wherever the bytes are.
+- Reads Zarr V2 and V3 metadata layouts, labelling each node `[group]`,
+  `[array]` or `[unknown]`, and showing `shape`, `chunks` and `dtype` under
+  every array.
+- Tells a Zarr V3 sharded array's inner chunks from its shards and reports both
+  — see [docs/zarr.md](docs/zarr.md#sharding).
+- Stops descending at arrays, so an array's chunk objects are never listed,
+  however many millions of them there are. That is what makes a remote walk
+  affordable.
+- Recognises OME-Zarr images, HCS plates and wells from their metadata markers,
+  and shows an image's axis names, declared pyramid level count and dataset
+  paths — see [docs/ome-zarr.md](docs/ome-zarr.md).
+- Recognises a SpatialData store root and its image, labels, points, shapes and
+  table elements, from metadata markers rather than directory names.
+- Summarises a points or shapes element's Parquet payload — rows, columns, file
+  count and schema — from the file footer alone. **No Parquet record is read.**
+- Summarises the AnnData table inside a table element — observations,
+  variables, how `X` is stored, column counts, and what it annotates — from
+  Zarr metadata alone. **No expression or annotation value is read.**
+- Reads a store's consolidated metadata when it has any, and walks the whole
+  tree from that one document — so a plain static HTTP server, which can never
+  answer a listing, needs none.
+- Checks the structure a store declares against the store itself with
+  `--validate`: `PASS`/`WARN`/`ERROR` a line, and exit status 2 when something
+  declared is missing.
+- Limits depth with `--depth N`, prints the same walk as JSON with `--json`,
+  and sits quietly at the producing end of a pipe.
 - Degrades gracefully: metadata that cannot be read or parsed costs only that
   node's label or a single field, never the rest of the walk.
 
-## Supported Zarr versions
+## Zarr
 
-Both Zarr V2 and V3 metadata layouts are recognised:
+Both Zarr metadata layouts are read, and only the fields needed to identify a
+node and describe its structure:
 
-| Version | Group marker | Array marker | Fields read |
-| --- | --- | --- | --- |
-| V2 | `.zgroup` | `.zarray` | `shape`, `chunks`, `dtype` |
-| V3 | `zarr.json` with `"node_type": "group"` | `zarr.json` with `"node_type": "array"` | `shape`, `chunk_grid.configuration.chunk_shape`, `codecs`, `data_type` |
+| Concept | V2 | V3 |
+| --- | --- | --- |
+| Group marker | `.zgroup` | `zarr.json`, `"node_type": "group"` |
+| Array marker | `.zarray` | `zarr.json`, `"node_type": "array"` |
+| Attributes | `.zattrs` | `attributes` in `zarr.json` |
+| Chunk shape | `chunks` | `chunk_grid`, or the sharding codec when sharded |
+| dtype | `dtype`, NumPy notation | `data_type` |
+| Consolidation | `.zmetadata` | inline `consolidated_metadata` |
 
-V2 is checked first, so a directory carrying both V2 and V3 metadata is reported
-as V2.
-
-V2 `dtype` values are displayed exactly as stored, in NumPy notation — `<u2`,
-`|u1`, `<M8[ns]`. They are not translated into V3 names such as `uint16`, and no
-attempt is made to validate them.
-
-### Sharding
-
-A Zarr V3 array may store many chunks together in one file — a *shard* — using
-the `sharding_indexed` codec. When it does, `chunk_grid` no longer describes the
-chunks: it describes the shards, and the chunk shape lives in the codec's own
-`configuration.chunk_shape`. Both are shown, under the names that match what
-they are:
+V2 is checked first, so a directory carrying both is reported as V2. V2 dtypes
+are printed exactly as stored — `<u2`, `|u1` — and are never translated. A
+sharded V3 array reports `chunks` (the inner chunk shape) and `shards` (the
+chunk grid) under separate names:
 
 ```
 $ zarr-tree sharded.zarr
@@ -239,24 +215,19 @@ sharded.zarr [group]
     └─ dtype:  uint16
 ```
 
-The `shards:` row appears only for a sharded array. An unsharded array has no
-shards to report, so nothing is printed and `--json` omits the key entirely —
-unlike `chunks`, which is always applicable and shows `?` (or `null`) when it
-cannot be read.
+Arrays are leaves: once a node is an array the walk stops, so chunk storage —
+a V3 `c/` tree, V2 chunk keys — is never listed at any depth.
 
-A `sharding_indexed` codec whose inner chunk shape cannot be read leaves
-`chunks` as `?` rather than falling back to the grid shape, which would print a
-shard under the name `chunks`.
-
-Zarr V2 has no sharding: there is one grid, `chunks` is it, and no `shards` row
-is ever drawn.
+**[docs/zarr.md](docs/zarr.md)** is the reference: the exact fields read from
+each layout, sharding semantics, consolidated metadata, how malformed metadata
+degrades, and what is deliberately not implemented.
 
 ## OME-Zarr
 
 An [OME-Zarr](https://ngff.openmicroscopy.org/) image is an ordinary Zarr group
-whose attributes carry a `multiscales` key, describing the same image stored at
-several resolutions. Groups like that are tagged, with the metadata version
-appended when one is recorded:
+whose attributes carry a `multiscales` key. Groups like that are tagged, with
+the version as stored, and their axis names, declared pyramid level count and
+dataset paths are shown:
 
 ```
 $ zarr-tree image.zarr
@@ -268,144 +239,23 @@ image.zarr [group, OME-Zarr 0.4]
 │   ├─ shape:  [2, 2048, 2048]
 │   ├─ chunks: [1, 512, 512]
 │   └─ dtype:  <u2
-├── 1 [array]
-│   ├─ shape:  [2, 1024, 1024]
-│   ├─ chunks: [1, 512, 512]
-│   └─ dtype:  <u2
-└── 2 [array]
-    ├─ shape:  [2, 512, 512]
-    ├─ chunks: [1, 512, 512]
-    └─ dtype:  <u2
-```
-
-Where the metadata lives follows the Zarr version:
-
-| OME-Zarr | Zarr | Attributes | Version field |
-| --- | --- | --- | --- |
-| 0.1 - 0.4 | V2 | `.zattrs`, keys at the top level | first `multiscales` entry's `version`, often absent |
-| 0.5 | V3 | `attributes.ome` inside `zarr.json` | `attributes.ome.version` |
-
-The version is printed exactly as stored and is never checked against the
-versions that exist, so an unfamiliar one still shows. A group whose
-`multiscales` is present but carries no readable version is tagged
-`[group, OME-Zarr]`.
-
-Axis names come from the first `multiscales` entry's `axes`, whose form changed
-over the course of the specification:
-
-| OME-Zarr | `axes` |
-| --- | --- |
-| 0.1, 0.2 | no `axes` field |
-| 0.3 | a list of names, `["c", "y", "x"]` |
-| 0.4, 0.5 | a list of objects, `{"name": "y", "type": "space", "unit": "micrometer"}` |
-
-Both forms are read, and only `name` is displayed. An entry whose name cannot be
-read shows as `?`, so the number of axes always matches the number the file
-declares. Axes that are absent, empty or not a list print no row at all —
-nothing is inferred from an array's dimensionality.
-
-### Pyramid levels
-
-The same `multiscales` entry's `datasets` lists the resolution levels the image
-is stored at. Unlike `axes`, this has had the same shape since OME-Zarr 0.1 — a
-list of objects each carrying a `path` — so one reading serves every version.
-What 0.4 added to each entry, `coordinateTransformations`, is not read.
-
-Two rows come from it: how many levels are declared, and the paths they are
-declared at.
-
-```
-├─ pyramid levels: 3
-├─ datasets: 0, 1, 2
-```
-
-The count comes from the metadata, **never from counting child directories**.
-The two often disagree: an image group commonly holds a `labels` group beside
-its levels, a 0.5 store adds an `OME` directory, a path may be nested such as
-`a/b`, and a truncated copy may declare more levels than it actually contains.
-The directories are already listed below these rows; what the metadata claims is
-the part you cannot otherwise see.
-
-Paths are printed exactly as stored. `0`, `1`, `2` is only a convention —
-`s0`, `full`, `half` and nested paths are all legal — so nothing is sorted,
-renumbered or interpreted:
-
-```
-$ zarr-tree named.zarr
-named.zarr [group, OME-Zarr 0.3]
-├─ axes: y, x
-├─ pyramid levels: 2
-├─ datasets: full, half
-├── full [array]
 ...
 ```
 
-An entry whose path cannot be read shows as `?`, so the count still matches what
-the file declares. `datasets` that is absent, empty or not a list prints neither
-row:
+HCS plates and wells are recognised the same way — from a `plate` or `well` key
+in the attributes, never from a directory name — and a plate shows its declared
+row, column and well counts. Every count comes from the metadata and never from
+counting directories.
 
-```
-$ zarr-tree partial.zarr
-partial.zarr [group, OME-Zarr 0.4]
-├─ axes: y, x
-├─ pyramid levels: 3
-└─ datasets: 0, ?, 2
-```
-
-That store declares three levels but has none of them on disk, so nothing
-follows the rows and the last one closes the branch with `└─`.
-
-The tree does not check that a declared path exists on disk — `--validate`
-does, and nothing else here does. No scale factors, pixel sizes or physical
-extents are calculated either: the `coordinateTransformations` those would come
-from are not read at all.
-
-### Plates and wells
-
-High-content screening stores a plate of wells rather than a single image. The
-two groups name themselves the way an image does — with a key in their
-attributes, `plate` or `well` — and are tagged with the kind after the version:
-
-```
-$ zarr-tree plate.zarr
-plate.zarr [group, OME-Zarr 0.5 plate]
-├─ rows: 2
-├─ columns: 3
-├─ wells: 6
-└── A [group]
-    └── 1 [group, OME-Zarr 0.5 well]
-        └── 0 [group, OME-Zarr 0.5]
-            ├─ axes: c, y, x
-            ├─ pyramid levels: 1
-            └─ datasets: 0
-```
-
-A plate's three rows are the lengths of the lists its metadata declares. Like
-the pyramid level count, they come from the metadata and **never** from counting
-directories: a plate that declares 96 wells says 96 whether or not 96 were
-written. Each count is independent, so a plate that declares only some of the
-three lists shows only those rows.
-
-A well adds no rows of its own. What it holds is its images, and the tree is
-already printing them.
-
-The kind is decided by which key the attributes carry, never by a name. A
-plate's rows and columns really are called `A`, `B`, `1`, `2`, and any store is
-free to use those names for anything at all — so the row group `A` above is an
-ordinary `[group]`, because that is all its metadata says it is.
-
-Nothing inside `plate` or `well` beyond the three counts and the well paths is
-read: acquisitions, field-of-view indices and image paths are all left alone.
-The well paths are read for `--validate`, which looks for the group each one
-names; the tree shows the count and nothing more.
-
-The tree is **recognition, not validation**. Nothing it prints is checked
-against the OME-NGFF specification: axes, dataset paths, coordinate
-transformations, `omero` channels, labels and plate/well layouts are never
-validated there, and most of them are not read at all. `--validate` adds the
-handful of structural checks listed under [Validation](#validation) and no
-more. For conformance checking use the
+The tree is **recognition, not validation**: nothing it prints is checked
+against the OME-NGFF specification. `--validate` adds the structural checks
+listed under [Validation](#validation); for conformance checking use the
 [OME-NGFF validator](https://ome.github.io/ome-ngff-validator/).
+
+**[docs/ome-zarr.md](docs/ome-zarr.md)** is the reference: recognition rules,
+version and metadata locations, both axis forms, multiscale datasets, plates
+and wells, what `image-label` does and does not do, and the current
+limitations.
 
 ## SpatialData
 
@@ -939,82 +789,28 @@ cannot be answered at all.
 Consolidation is Zarr's answer: one document at the store root holding a copy
 of every metadata file in the tree. `zarr-tree` reads it when it is there, and
 the whole walk — every node's metadata, and every group's children — comes out
-of that one read.
+of that one read. Two forms are read, the two that current zarr-python writes:
+Zarr V2's `.zmetadata` at `zarr_consolidated_format` 1, and a Zarr V3 root
+`zarr.json` carrying a `consolidated_metadata` block of `kind` `inline` with
+`must_understand` false.
 
-Two forms are read, the two that current zarr-python writes:
+That is what makes a plain static HTTP server usable. Such a server answers
+`GET` but not the WebDAV `PROPFIND` a listing needs, so without consolidation
+the walk cannot get past the root; with it, no listing is wanted at all. See
+[docs/remote-stores.md](docs/remote-stores.md#static-http-and-consolidated-metadata)
+for a worked example against a real server.
 
-**Zarr V2** keeps it in a file of its own, `.zmetadata`, whose `metadata` map is
-flat and keyed by the very paths a walk would have read:
+Two properties matter more than the formats. **It is opportunistic**: a store
+with no consolidated metadata, or with a form not read here, is walked exactly
+as it was before — nothing that worked without consolidation comes to depend on
+it. **It is all-or-nothing**: once the document has been read it is the only
+thing read, because a consolidated document is a snapshot and a tree mixing it
+with live reads would show two moments at once and mark neither. So a stale
+snapshot is reported as it stands, unchecked.
 
-```json
-{
-  "zarr_consolidated_format": 1,
-  "metadata": {
-    ".zgroup":            {"zarr_format": 2},
-    ".zattrs":            {"note": "root"},
-    "images/.zgroup":     {"zarr_format": 2},
-    "images/0/.zarray":   {"shape": [64, 64], "chunks": [32, 32], "dtype": "|u1"}
-  }
-}
-```
-
-The keys are what give the hierarchy: `images/0/.zarray` says there is an array
-at `images/0`, and by saying so says there is a node at `images` too. Only the
-metadata filenames are read — `.zgroup`, `.zarray`, `.zattrs` — so nothing else
-in the map can become a node, and a chunk key never does.
-`zarr_consolidated_format` 1 is the only version there has been; another one is
-left alone.
-
-**Zarr V3** keeps it inside the root `zarr.json`, as a `consolidated_metadata`
-block whose entries are whole documents keyed by path from the root:
-
-```json
-{
-  "zarr_format": 3,
-  "node_type": "group",
-  "consolidated_metadata": {
-    "kind": "inline",
-    "must_understand": false,
-    "metadata": {
-      "images":   {"zarr_format": 3, "node_type": "group", "attributes": {}},
-      "images/0": {"zarr_format": 3, "node_type": "array", "shape": [64, 64]}
-    }
-  }
-}
-```
-
-`kind: inline` — the metadata is in the block itself — is the only kind read.
-`must_understand: false` says a reader that does not understand the block may
-ignore it, which is what `zarr-tree` does with anything else. A group's block is
-defined to hold that group's own children, so a non-empty nested one is followed
-by the same rule; zarr-python writes the flat form shown above and leaves the
-nested blocks empty.
-
-V3 consolidation is younger and less settled than V2's — zarr-python warns that
-it is not part of the Zarr V3 specification and may change — so only the form it
-actually writes today is read.
-
-**It is opportunistic.** A store with no consolidated metadata, or with a form
-not read here, is walked exactly as it was before: directory reads locally,
-listings on S3, `PROPFIND` over HTTP. Nothing that worked without consolidation
-comes to depend on it.
-
-**It is all-or-nothing.** Once the document has been read, it is the only thing
-read: the store itself is not consulted again for the rest of the walk. That is
-deliberate. Consolidated metadata is a snapshot, taken when somebody last called
-`zarr.consolidate_metadata`, and it may be stale. A tree that took some nodes
-from the snapshot and some from live reads would show two moments at once and
-mark neither. The only read that comes off the store is the one that found the
-document — `.zmetadata` for V2, the root `zarr.json` for V3 — and it happens
-before any of the tree is built.
-
-So a store whose consolidated metadata is out of date is reported as the
-snapshot has it. `zarr-tree` does not check the two against each other; that
-would cost exactly the requests consolidation exists to avoid.
-
-**What it costs.** V2's `.zmetadata` is looked for first, as V2 is everywhere
-else here, so a V3 store pays one miss for it. A consolidated V2 store is then
-one request for any depth; a consolidated V3 store is two.
+The document formats, the filtering rules and the cost per store are in
+[docs/zarr.md](docs/zarr.md#consolidated-metadata), and the overlay design in
+[docs/architecture.md](docs/architecture.md#consolidated-metadata).
 
 ### Depth
 
@@ -1253,6 +1049,8 @@ broken.zarr [group]
 
 A field that could not be read is printed as `?`. A directory whose metadata is
 missing or not understood is labelled `[unknown]` and is still descended into.
+The full degradation model — and how it differs from a store access error — is
+in [docs/zarr.md](docs/zarr.md#unknown-and-malformed-nodes).
 
 ## Development
 
@@ -1314,26 +1112,19 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
   listing is paginated to the end.
 - Only `shape`, `chunks`/`chunk_shape`, `dtype`/`data_type` and the shard
   shape are read. Compressors, fill values, dimension names and user
-  attributes are not shown, and `codecs` is read for the sharding codec
-  alone.
+  attributes are not shown, `codecs` is read for the sharding codec alone, V2
+  dtypes are passed through as stored, and V3 dtypes given in object form are
+  not interpreted — see
+  [docs/zarr.md](docs/zarr.md#deliberately-not-implemented).
 - No output options beyond `--depth`, `--json` and `--validate`: no filtering,
   no colour.
-- V2 dtypes are passed through as stored and V3 dtypes given in object form
-  (the extension syntax) are not interpreted.
-- A sharded V3 array reports its chunks and shards, but nothing else about the
-  sharding: the index location, the inner codecs and the shard layout on disk
-  are not read.
 - OME-Zarr support goes no further than spotting image, plate and well groups
   and showing their version, and for an image its axis names, declared pyramid
-  level count and dataset paths. Axis `type` and `unit` are not shown, axis
-  names and ordering are not validated, and coordinate transformations and
-  `omero` are not read. HCS support goes no further than tagging a plate and a
-  well and showing a plate's three declared counts — acquisitions and
-  field-of-view indices are not read, and no declared count is checked against
-  the wells actually present. `image-label` is read only for its presence, to
-  tell a segmentation from an image. No scale factors, pixel sizes or physical
-  extents are calculated. `--validate` adds only the existence and
-  dimensionality checks listed under [Validation](#validation).
+  level count and dataset paths. Coordinate transformations, `omero`, axis
+  `type` and `unit`, acquisitions and field-of-view indices are not read, no
+  scale factor or pixel size is calculated, and `image-label` is read only for
+  its presence — the full list is in
+  [docs/ome-zarr.md](docs/ome-zarr.md#current-limitations).
 - SpatialData support goes no further than recognising a store root and its
   image, labels, points, shapes and table elements, summarising the Parquet
   payload of a points or shapes element from its footer, and summarising the

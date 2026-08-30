@@ -56,7 +56,8 @@ credentials` is not read. HTTP access is anonymous.
 
 V2 `dtype` strings are printed exactly as stored, in NumPy notation, and are not
 translated into V3 names. A directory carrying both V2 and V3 metadata is
-reported as V2.
+reported as V2. The [Zarr reference](zarr.md) documents each of these in
+detail.
 
 ## OME-Zarr
 
@@ -80,7 +81,9 @@ reported as V2.
 
 The declared pyramid level count comes from `multiscales[0].datasets`, never
 from counting child directories. Group kinds are recognised from metadata
-markers alone; nothing is inferred from a directory name.
+markers alone; nothing is inferred from a directory name. The
+[OME-Zarr reference](ome-zarr.md) documents each of these in detail, including
+exactly what `image-label` does and does not do.
 
 ## SpatialData
 
@@ -173,6 +176,10 @@ on:
 - [Remote stores](remote-stores.md) — S3, HTTP, WebDAV and static HTTP.
 - [Architecture](architecture.md) — how the storage, classification and
   validation layers fit together.
+- [Zarr reference](zarr.md) — V2 and V3 layouts, arrays, sharding, consolidated
+  metadata, and the degradation model.
+- [OME-Zarr reference](ome-zarr.md) — recognition, versions, axes, multiscale
+  datasets, plates and wells.
 - [Roadmap](roadmap.md) — direction, with nothing promised.
 - [README](../README.md) — the current detailed documentation, being split into
   this directory one subject at a time.

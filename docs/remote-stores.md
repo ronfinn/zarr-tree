@@ -250,8 +250,9 @@ that current zarr-python writes:
 
 Either document holds a copy of every metadata file in the tree, keyed by path,
 so the hierarchy can be reconstructed from it without a single directory
-listing. The format detail is in the README's
-[Consolidated metadata](../README.md#consolidated-metadata) section.
+listing. The format detail — the accepted documents, what is filtered out of
+them, and how the overlay behaves — is in the
+[Zarr reference](zarr.md#consolidated-metadata).
 
 ```
 $ zarr-tree --depth 1 https://ncsa.osn.xsede.org/Pangeo/pangeo-forge/gpcp-feedstock/gpcp.zarr
@@ -397,5 +398,9 @@ Remote-specific. The full list is under
 ## See also
 
 - [Getting started](getting-started.md) — build, first store, the option set.
+- [Zarr reference](zarr.md) — what is read from each metadata layout, and the
+  consolidated metadata formats these servers serve.
+- [Architecture](architecture.md) — the `Store` trait and the consolidated
+  overlay.
 - [Project status](status.md) — the capability matrix.
 - [README](../README.md) — the full reference.

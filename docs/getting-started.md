@@ -204,8 +204,12 @@ The seven rules are listed under [Validation](../README.md#validation).
 
 - [Remote stores](remote-stores.md) — S3, HTTP, WebDAV, and static HTTP via
   consolidated metadata.
+- [Zarr reference](zarr.md) — V2 and V3 layouts, arrays, sharding, consolidated
+  metadata, and how malformed metadata degrades.
+- [OME-Zarr reference](ome-zarr.md) — recognition, versions, axes, multiscale
+  datasets, plates and wells.
 - [Project status](status.md) — the capability matrix, and what is deliberately
   absent.
 - [Roadmap](roadmap.md) — direction, with nothing promised.
-- [README](../README.md) — the full reference, including OME-Zarr, SpatialData
-  and the complete list of limitations.
+- [README](../README.md) — the full reference, including SpatialData and the
+  complete list of limitations.
