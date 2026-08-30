@@ -98,7 +98,8 @@ zarr-tree --validate example.zarr
 from source to use it. Everything else above is in v0.3.0.
 
 [docs/getting-started.md](docs/getting-started.md) covers this at more length,
-and [docs/remote-stores.md](docs/remote-stores.md) covers the S3 and HTTP cases.
+[docs/cli.md](docs/cli.md) is the full command-line reference, and
+[docs/remote-stores.md](docs/remote-stores.md) covers the S3 and HTTP cases.
 
 ## What it understands
 
@@ -134,8 +135,10 @@ are as much a part of the design as the features.
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md) — build it, inspect a first store,
-  and the whole option set in one page.
+- [Getting started](docs/getting-started.md) — build it and inspect a first
+  store, as a tutorial.
+- [Command-line reference](docs/cli.md) — every option, the JSON fields, the
+  seven validation rules, exit statuses, and shell and CI patterns.
 - [Remote stores](docs/remote-stores.md) — S3, AWS credentials and endpoints,
   HTTP and WebDAV, static HTTP via consolidated metadata, troubleshooting.
 - [Architecture](docs/architecture.md) — the `Store` trait, the consolidated
@@ -152,8 +155,8 @@ are as much a part of the design as the features.
 - [Roadmap](docs/roadmap.md) — direction, with nothing promised.
 - [Releases](https://github.com/ronfinn/zarr-tree/releases)
 
-The general CLI reference — usage, `--depth`, `--json` and `--validate` — is
-still below, and is being split out of this file one subject at a time.
+The storage-backend and format sections below are being split out of this file
+one subject at a time.
 
 ## Features
 
@@ -253,7 +256,7 @@ counting directories.
 
 The tree is **recognition, not validation**: nothing it prints is checked
 against the OME-NGFF specification. `--validate` adds the structural checks
-listed under [Validation](#validation); for conformance checking use the
+listed in [docs/cli.md](docs/cli.md#the-seven-rules); for conformance checking use the
 [OME-NGFF validator](https://ome.github.io/ome-ngff-validator/).
 
 **[docs/ome-zarr.md](docs/ome-zarr.md)** is the reference: recognition rules,
@@ -356,7 +359,7 @@ first store and the option set in more detail.
 ## Usage
 
 ```sh
-zarr-tree [OPTIONS] <store>
+zarr-tree [OPTIONS] <STORE>
 ```
 
 The store is a directory, an `s3://` URI or an `http(s)://` URL, and the walk,
@@ -368,38 +371,32 @@ zarr-tree s3://bucket/example.zarr
 zarr-tree https://example.org/example.zarr
 ```
 
-Exactly one store, plus any of the options below in any order. Anything else
-names what was wrong and exits with status 1:
+| Option | Meaning |
+| --- | --- |
+| `--depth <N>` | Descend at most N levels below the root. Arrays are leaves at any depth. |
+| `--json` | Print the same walk as one JSON document. Combines with `--depth` and `--validate`. |
+| `--validate` | Check the structure the metadata declares against the store, and print findings instead of the tree. |
+| `-h`, `--help` | Print help. |
+| `-V`, `--version` | Print version. |
 
-```
-$ zarr-tree
-error: expected a store
-usage: zarr-tree [OPTIONS] <STORE>
-
-$ zarr-tree --depth two store.zarr
-error: --depth needs a whole number, not "two"
-usage: zarr-tree [OPTIONS] <STORE>
-```
-
-```
-        --depth <N>  Descend at most N levels below the root
-        --json       Print the same tree as JSON
-        --validate   Check the structure the metadata declares
-    -h, --help       Print help
-    -V, --version    Print version
-```
-
-Exit status:
-
-| Status | Meaning |
+| Exit status | Meaning |
 | --- | --- |
 | 0 | The store was walked. With `--validate`, nothing worse than a `WARN`. |
 | 1 | The store could not be read, or the command line made no sense. |
 | 2 | `--validate` ran and reported at least one `ERROR`. |
 
-An argument beginning with `-` that is not one of these is read as a mistyped
-option rather than as a path, so a directory whose name starts with `-` cannot
-be inspected.
+`--validate`, and exit status 2 with it, were added after v0.3.0 and are on
+`master` only. `zarr-tree` sits quietly at the producing end of a pipe:
+`zarr-tree big.zarr | head` stops when the reader does, with nothing on stderr
+and exit status 0.
+
+**[docs/cli.md](docs/cli.md) is the complete command-line reference** — every
+option in detail, the JSON field tables and their absence-versus-`null`
+semantics, the seven validation rules and their severities, the exit-status
+contract, `jq` recipes, and shell and CI patterns.
+
+The three storage backends are covered below, and in full in
+[docs/remote-stores.md](docs/remote-stores.md).
 
 ### S3
 
@@ -551,220 +548,6 @@ The document formats, the filtering rules and the cost per store are in
 [docs/zarr.md](docs/zarr.md#consolidated-metadata), and the overlay design in
 [docs/architecture.md](docs/architecture.md#consolidated-metadata).
 
-### Depth
-
-`--depth N` limits how far below the root the walk goes. `0` shows the root on
-its own, `1` adds its direct children, and so on. Left out, the whole store is
-walked, exactly as before the option existed.
-
-```
-$ zarr-tree --depth 1 experiment.zarr
-experiment.zarr [group, SpatialData 0.2]
-├── images [group]
-├── labels [group]
-├── points [group]
-├── shapes [group]
-└── tables [group]
-```
-
-A node that is shown keeps its own metadata rows: those describe the node
-itself, not anything below it. So an image group at the limit still shows its
-axes, pyramid levels and dataset paths, even though its resolution arrays are
-one level too far to appear.
-
-Arrays are leaves at any depth. The limit never has anything to say about them,
-because the walk already stops there.
-
-At the limit the directory is not read at all, which is what makes `--depth 0`
-cheap on a store with a million chunk files.
-
-### JSON
-
-`--json` prints the same walk as one JSON document, for piping into `jq` or
-reading from a script. It combines with `--depth`.
-
-```
-$ zarr-tree --json --depth 1 experiment.zarr
-{
-  "children": [
-    {
-      "children": [],
-      "kind": "group",
-      "name": "images"
-    }
-  ],
-  "kind": "group",
-  "name": "experiment.zarr",
-  "spatialdata": {
-    "kind": "root",
-    "version": "0.2"
-  }
-}
-```
-
-Every node has three fields, and then a section for each kind of metadata that
-applies to it:
-
-| Field | Always | Meaning |
-| --- | --- | --- |
-| `name` | yes | The directory name. On the root, the path as it was typed — the same thing the tree's first line shows. |
-| `kind` | yes | `group`, `array` or `unknown` |
-| `children` | yes | The child nodes, in the same order the tree lists them. Empty for an array, and empty at the depth limit. |
-| `array` | arrays only | `shape`, `chunks`, `dtype`, and `shards` on a sharded V3 array |
-| `ome` | OME-Zarr groups | `tag`, `kind` (`image`, `plate`, `well`), `version`, `axes`, `pyramid_levels`, `datasets`, and `rows`, `columns`, `wells` on a plate |
-| `spatialdata` | SpatialData nodes | `kind` (`root`, `image`, `labels`, `points`, `shapes`, `table`) and `version`, which only a store root records; on a table also `regions`, `region_key` and `instance_key` |
-| `parquet` | points and shapes elements with a readable payload | `rows`, `columns`, `files` and the whole `schema` |
-| `anndata` | SpatialData tables | `encoding_version`, `observations`, `variables`, `x`, and the declared `obs_columns` and `var_columns` in full |
-
-A section is absent when that kind of metadata does not apply; a field inside a
-section is `null` when the file gave no readable value. That is the same rule
-the tree follows when it prints `?`:
-
-```
-$ zarr-tree --json partial.zarr | jq '.children[0].array'
-{
-  "chunks": null,
-  "dtype": null,
-  "shape": [1024, 1024]
-}
-```
-
-`shape` and `chunks` are real JSON arrays rather than the `[1024, 1024]` text
-the tree draws, and their entries are copied across exactly as stored — a
-malformed `"shape": [1, "x"]` comes out as `[1, "x"]` rather than being
-dropped.
-
-`spatialdata` and `anndata` stay separate objects on a table, because they are
-two vocabularies read from two sets of keys: what SpatialData said about the
-elements the table annotates, and what AnnData said about the table itself.
-
-```
-$ zarr-tree --json xenium.zarr/tables/table --depth 0 | jq '.anndata'
-{
-  "encoding_version": "0.1.0",
-  "obs_columns": ["cell_id", "transcript_counts", "…"],
-  "observations": 167780,
-  "var_columns": ["gene_ids", "feature_types", "genome"],
-  "variables": 313,
-  "x": {
-    "kind": "csr",
-    "shape": [167780, 313]
-  }
-}
-```
-
-The two outputs come from one reading of the metadata: `--json` is a second
-renderer, not a second interpretation, so the tree and the document cannot
-disagree about what a store contains. Object keys come out in alphabetical
-order, which is why `children` leads; that is `serde_json`'s default and
-keeping it avoids a dependency for nothing.
-
-### Validation
-
-`--validate` checks what a store's metadata *declares* against what the store
-*has*, and prints findings instead of the tree. It reads metadata only — the
-same files the tree reads, plus the four an AnnData table names — and opens no
-chunk, no Parquet record and no expression value.
-
-```
-$ zarr-tree --validate experiment.zarr
-PASS  /  Zarr root metadata is readable
-PASS  /images/morphology  OME dataset path "0" exists
-PASS  /images/morphology  OME dataset path "1" exists
-PASS  /images/morphology  pyramid levels agree with the multiscale's axes on 3 dimensions
-WARN  /points/transcripts  SpatialData points payload metadata unavailable
-ERROR /tables/table  table region "cells" does not name an existing SpatialData element
-
-Validation: 4 passed, 1 warning, 1 error
-```
-
-Each line is a severity, the node the finding is about, and what was found.
-The three severities mean three different things, and the middle one carries
-the weight:
-
-| Severity | Meaning |
-| --- | --- |
-| `PASS` | The structure the metadata declares is there. |
-| `WARN` | The check could not be made. Nothing is claimed either way. |
-| `ERROR` | The metadata declares something the store does not have. |
-
-A points payload on a static HTTP server cannot be listed, so it cannot be
-inspected — that is a `WARN`, not a broken store. The same goes for a shape a
-file did not record, or an index length that could not be read.
-
-The rules, all of them over metadata this tool already reads:
-
-1. **Zarr metadata.** Every node this program walked into could be identified,
-   and each array's `shape`, `chunks` and — on a sharded V3 array — `shards`
-   agree on how many dimensions there are. Codecs are not checked.
-2. **OME-Zarr dataset paths.** Every `multiscales[0].datasets[].path` names a
-   node that exists and is an array.
-3. **Pyramid dimensions.** Every resolution level has the same number of
-   dimensions, and the same number as the multiscale declares axes. No scale,
-   resolution or downsampling factor is looked at.
-4. **HCS wells.** Every path in a plate's `wells` list names a group that
-   exists. Acquisitions and fields of view are not checked.
-5. **SpatialData table regions.** Every element named in a table's `region`
-   exists as a recognised image, labels, points or shapes element. No name is
-   inferred from a payload.
-6. **AnnData dimensions.** `X.shape[0]` matches the length the `obs` index
-   declares, and `X.shape[1]` the `var` index. The index lengths come from the
-   index arrays' own metadata; no value is read and nothing is counted.
-7. **Parquet availability.** A points or shapes payload that is there and
-   readable passes; one that is there and could not be inspected warns. A
-   payload that is genuinely absent is not a finding.
-
-`--validate` combines with `--json` and prints one document — the same findings
-in the same order, with the counts the summary line carries:
-
-```
-$ zarr-tree --validate --json experiment.zarr | jq '.summary'
-{
-  "errors": 1,
-  "passed": 4,
-  "warnings": 1
-}
-```
-
-Every finding has three fields: `severity` (`pass`, `warn` or `error`), `path`
-and `message`.
-
-It does not combine with `--depth`, and says so rather than picking one:
-
-```
-$ zarr-tree --validate --depth 1 store.zarr
-error: --depth cannot be combined with --validate
-usage: zarr-tree [OPTIONS] <STORE>
-```
-
-A walk that stopped early would report every node below the limit as missing —
-a dataset path, a well, a region — so the two options cannot both mean what
-they say at once.
-
-This is a structural check and not a specification conformance pass. Nothing
-here validates a Zarr, OME-NGFF or SpatialData document against its schema, and
-the ordinary `zarr-tree` output is unchanged: it still prints what the metadata
-says, unchecked.
-
-### Pipelines
-
-A large store prints thousands of lines, so `zarr-tree` is built to sit at the
-producing end of a pipe:
-
-```sh
-zarr-tree big.zarr | head
-zarr-tree big.zarr | less
-zarr-tree big.zarr | grep SpatialData
-```
-
-When the reader stops reading, the write fails with `BrokenPipe` and the run
-ends there — quietly, with nothing on stderr and exit status 0. The reader
-said it had seen enough, and that is not an error to report.
-
-Every other failure keeps its own behaviour: a line on stderr and exit status
-1. A `--validate` run that found an `ERROR` exits 2 — see
-[Validation](#validation).
-
 ## Example output
 
 Metadata that is missing, unreadable or malformed shows up in place rather than
@@ -855,8 +638,6 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
   dtypes are passed through as stored, and V3 dtypes given in object form are
   not interpreted — see
   [docs/zarr.md](docs/zarr.md#deliberately-not-implemented).
-- No output options beyond `--depth`, `--json` and `--validate`: no filtering,
-  no colour.
 - OME-Zarr support goes no further than spotting image, plate and well groups
   and showing their version, and for an image its axis names, declared pyramid
   level count and dataset paths. Coordinate transformations, `omero`, axis
@@ -887,20 +668,13 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
   but not the path, and there is no way to skip past it: the text output
   keeps whatever it had already printed, while `--json` prints nothing at
   all, since the whole document is built before any of it is written.
-- Arguments are read with `std::env::args`, which panics on an argument that
-  is not valid UTF-8. On a system where such a path can exist, that happens
-  before any argument validation runs, so the failure is a panic rather than
-  the usual message and exit status 1.
-- `--json` builds the whole document in memory before writing any of it, while
-  the text output is streamed as the walk proceeds. So peak memory grows with
-  the number of nodes in the tree, and an error part-way through a walk
-  produces no JSON at all rather than a partial document.
 - `--validate` is a structural check over the metadata this tool already reads,
-  and nothing more. It validates no document against a schema, knows no rule
-  the seven listed under [Validation](#validation) do not cover, cannot be
-  limited to one rule or one severity, and holds the whole node map in memory
-  because a table's region may name an element anywhere in the store. It walks
-  the store whole and so cannot be combined with `--depth`.
+  and nothing more: it validates no document against a schema and knows no rule
+  beyond the seven it ships with.
+- Command-line limitations — no configuration file, no filtering or colour, no
+  per-rule or per-severity validation filter, `--json` built whole in memory,
+  and the `-`-prefixed and non-UTF-8 argument cases — are listed in
+  [docs/cli.md](docs/cli.md#current-limitations).
 
 ## Roadmap
 

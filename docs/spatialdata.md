@@ -636,7 +636,7 @@ Three of the seven rules concern SpatialData, and only those three are
 documented here. The Zarr and OME-Zarr rules are in
 [zarr.md](zarr.md#validation-checks) and
 [ome-zarr.md](ome-zarr.md#validation); the CLI behaviour, exit status and
-output forms are in [Getting started](getting-started.md#validation).
+output forms are in the [Command-line reference](cli.md#structural-validation).
 
 **Table regions.** Every name in a table's `region` must resolve to a
 recognised image, labels, points or shapes element somewhere in the store,

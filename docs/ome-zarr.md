@@ -386,7 +386,7 @@ For conformance use the
 
 Three of the seven rules concern OME-Zarr. The others are Zarr
 ([Zarr reference](zarr.md#validation-checks)) and SpatialData
-([README](../README.md#validation)).
+([SpatialData reference](spatialdata.md#validation)).
 
 **Dataset paths exist.** Each `multiscales[0].datasets[].path` is resolved
 against the node map the walk built. Nothing is opened, and no chunk is
@@ -468,7 +468,7 @@ truncated download looks like, and what `--validate` exists to say out loud.
 
 `WARN` always means "could not be checked", never "broken". Exit status is 0
 when nothing worse than a warning was found and 2 when at least one `ERROR`
-was — see [Validation](getting-started.md#validation).
+was — see [Structural validation](cli.md#structural-validation).
 
 ## Current limitations
 

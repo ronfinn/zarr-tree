@@ -90,7 +90,7 @@ not be read prints as `?` rather than stopping the walk.
 
 Groups recognised as OME-Zarr or SpatialData pick up an extra tag and a few
 metadata rows: `[group, OME-Zarr 0.4]`, `[group, SpatialData points]`. The
-README covers those in full.
+[Command-line reference](cli.md#tree-output) lists every tag and row.
 
 ## Common commands
 
@@ -137,7 +137,7 @@ because the walk already stops there, and an array's chunk objects are never
 listed or fetched.
 
 `--depth` cannot be combined with `--validate`. See
-[Validation](../README.md#validation) for why.
+[Command-line reference](cli.md#option-combinations) for why.
 
 ## JSON
 
@@ -154,8 +154,9 @@ Every node has `name`, `kind` and `children`, plus one section per kind of
 metadata that applies to it — `array`, `ome`, `spatialdata`, `parquet`,
 `anndata`. A section is absent when that metadata does not apply, and a field
 inside a section is `null` when the file gave no readable value, which is the
-same rule the tree follows when it prints `?`. The full field table is in the
-README's [JSON](../README.md#json) section.
+same rule the tree follows when it prints `?`. The full field table, and the
+difference between an omitted key and a `null` one, are in the
+[Command-line reference](cli.md#json-output).
 
 ## Validation
 
@@ -198,10 +199,13 @@ Exit status:
 | 1 | The store could not be read, or the command line made no sense. |
 | 2 | `--validate` ran and reported at least one `ERROR`. |
 
-The seven rules are listed under [Validation](../README.md#validation).
+The seven rules, their severities and the `jq` recipes for the JSON form are in
+the [Command-line reference](cli.md#the-seven-rules).
 
 ## Next steps
 
+- [Command-line reference](cli.md) — every option in detail, the JSON fields,
+  the validation rules, exit statuses, and shell and CI patterns.
 - [Remote stores](remote-stores.md) — S3, HTTP, WebDAV, and static HTTP via
   consolidated metadata.
 - [Zarr reference](zarr.md) — V2 and V3 layouts, arrays, sharding, consolidated
@@ -213,5 +217,5 @@ The seven rules are listed under [Validation](../README.md#validation).
 - [Project status](status.md) — the capability matrix, and what is deliberately
   absent.
 - [Roadmap](roadmap.md) — direction, with nothing promised.
-- [README](../README.md) — the full reference, including SpatialData and the
+- [README](../README.md) — the project overview, the storage backends and the
   complete list of limitations.

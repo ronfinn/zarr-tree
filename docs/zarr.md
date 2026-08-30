@@ -406,7 +406,7 @@ Besides stopping at arrays, the walk observes four rules:
   directory is not read at all, which is what makes `--depth 0` cheap on a
   store with a million chunk files. A node that is shown keeps its own metadata
   rows, because those describe the node itself rather than anything below it.
-  See [Depth](getting-started.md#depth).
+  See [Depth](cli.md#depth).
 
 ## JSON representation
 
@@ -417,8 +417,8 @@ contains.
 Every node carries `name`, `kind` and `children`; an array additionally carries
 an `array` object. (Nodes also carry `ome`, `spatialdata`, `parquet` and
 `anndata` sections where those apply — see
-[OME-Zarr reference](ome-zarr.md#json-representation) and the SpatialData
-material in the [README](../README.md#json).)
+[OME-Zarr reference](ome-zarr.md#json-representation), and the whole-document
+shape in the [Command-line reference](cli.md#json-output).)
 
 | Field | Meaning |
 | --- | --- |
@@ -463,7 +463,7 @@ It prints findings instead of the tree, over the same metadata the tree reads.
 Two of the seven rules are about plain Zarr; the rest are OME-Zarr and
 SpatialData and are documented in
 [OME-Zarr reference](ome-zarr.md#validation) and the
-[README](../README.md#validation).
+[Command-line reference](cli.md#the-seven-rules).
 
 **Node identification.** Every node the walk entered could be identified.
 
@@ -515,7 +515,7 @@ Zarr conformance pass.
 
 `--validate` walks the store whole, so it is refused together with `--depth`.
 Exit status is 0 when nothing worse than a warning was found and 2 when at
-least one `ERROR` was — see [Validation](getting-started.md#validation).
+least one `ERROR` was — see [Exit statuses](cli.md#exit-statuses).
 
 ## Deliberately not implemented
 

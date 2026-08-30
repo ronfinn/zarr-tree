@@ -153,6 +153,9 @@ mechanism for adding an eighth from outside the source.
 | Quiet `BrokenPipe` handling for `\| head`, `\| less` | Supported |
 | Filtering, colour, or any other output option | Not implemented |
 
+Every option is documented in full in the
+[Command-line reference](cli.md).
+
 ## Explicit non-goals
 
 These are not gaps waiting to be filled. They are boundaries the design depends
@@ -175,6 +178,8 @@ on:
 ## See also
 
 - [Getting started](getting-started.md) — building it, and a first store.
+- [Command-line reference](cli.md) — every option, the JSON fields, the
+  validation rules, exit statuses, and shell and CI patterns.
 - [Remote stores](remote-stores.md) — S3, HTTP, WebDAV and static HTTP.
 - [Architecture](architecture.md) — how the storage, classification and
   validation layers fit together.
@@ -185,5 +190,5 @@ on:
 - [SpatialData reference](spatialdata.md) — store and element recognition, the
   Parquet and AnnData payload summaries, and region linkage.
 - [Roadmap](roadmap.md) — direction, with nothing promised.
-- [README](../README.md) — the current detailed documentation, being split into
-  this directory one subject at a time.
+- [README](../README.md) — the project overview, being split into this
+  directory one subject at a time.
