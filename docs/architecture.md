@@ -5,8 +5,7 @@ ends and metadata interpretation begins, why a local directory, an S3 prefix
 and an HTTP path are walked by the same code, and why an array is where the
 walk stops.
 
-It describes the implementation as it stands on `master` (post-v0.3.0, with
-`--validate`). Everything named here — every type, function and constant — is
+It describes the implementation as it stands at v0.4.0. Everything named here — every type, function and constant — is
 in `src/main.rs`, which holds the whole program. There are no modules; the
 [source map](#source-map) at the end is how to navigate it.
 

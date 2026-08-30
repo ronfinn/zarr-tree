@@ -629,8 +629,7 @@ lists are whole however long, where the tree shows only their counts.
 
 ## Validation
 
-`--validate` was added **after v0.3.0** and is currently on `master` only —
-build from source to use it. Everything else in this guide is in v0.3.0.
+`--validate` was added in **v0.4.0**.
 
 Three of the seven rules concern SpatialData, and only those three are
 documented here. The Zarr and OME-Zarr rules are in

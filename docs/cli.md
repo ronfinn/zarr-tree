@@ -11,10 +11,6 @@ a working binary.
 Every example below was run against a small local fixture store. Nothing here
 is transcribed from an older version of the output.
 
-**Release note.** `--validate` was merged after **v0.3.0** and is available by
-building `master`; it is not in any tagged release yet. Everything else on this
-page is in v0.3.0. See [Help and version](#help-and-version).
-
 ## Synopsis
 
 ```sh
@@ -747,7 +743,7 @@ USAGE:
 
 ```
 $ zarr-tree --version
-zarr-tree 0.3.0
+zarr-tree 0.4.0
 ```
 
 Both are answered on sight, wherever they appear on the command line, and
@@ -755,8 +751,9 @@ neither touches the store: `zarr-tree --help some.zarr` prints the help.
 
 The version comes from the package manifest at compile time, so it is the
 version of the most recently prepared release — not a description of what the
-binary can do. A binary built from `master` after v0.3.0 reports `0.3.0` and
-still has `--validate`. To find out whether a binary has it, ask it:
+binary can do. A build from `master` between releases reports the last
+release's version while carrying work that is not in it. To find out whether a
+binary has a given option, ask it:
 
 ```sh
 zarr-tree --help | grep -q -- --validate && echo present

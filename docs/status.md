@@ -2,8 +2,8 @@
 
 | | |
 | --- | --- |
-| Latest release | [v0.3.0](https://github.com/ronfinn/zarr-tree/releases/tag/v0.3.0) |
-| Development status | post-v0.3.0, on `master` |
+| Latest release | [v0.4.0](https://github.com/ronfinn/zarr-tree/releases/tag/v0.4.0) |
+| Development status | at v0.4.0, on `master` |
 | Minimum supported Rust version | 1.88 |
 | Tests | 94 unit, 18 integration |
 | License | MIT |
@@ -12,12 +12,11 @@ This document records what `zarr-tree` implements today. It is a capability
 matrix, not a specification-conformance claim: `zarr-tree` reads metadata and
 prints what it finds, and unfamiliar values are shown as stored.
 
-Two release states appear in the tables below:
+Two states appear in the tables below:
 
 | Status | Meaning |
 | --- | --- |
-| Supported | Released in v0.3.0. |
-| Supported (master) | Merged after v0.3.0. Available by building `master`, not in any release yet. |
+| Supported | Implemented and released, as of v0.4.0. |
 | Not implemented | Absent, and listed here because it is a reasonable thing to expect. |
 
 ## Storage
@@ -117,22 +116,21 @@ The [SpatialData reference](spatialdata.md) documents all of this in detail.
 
 ## Validation
 
-`--validate` is a metadata-only structural check. It was merged after v0.3.0 and
-is available by building `master`.
+`--validate` is a metadata-only structural check, released in v0.4.0.
 
 | Capability | Status |
 | --- | --- |
-| `--validate` | Supported (master) |
-| `PASS` / `WARN` / `ERROR` findings and a summary line | Supported (master) |
-| Text output | Supported (master) |
-| JSON output (`--validate --json`) | Supported (master) |
-| Exit status 2 when at least one `ERROR` is found | Supported (master) |
-| Array shape / chunk / shard dimensionality agreement | Supported (master) |
-| OME dataset paths exist and agree on dimensionality | Supported (master) |
-| Declared HCS well paths exist | Supported (master) |
-| A table's `region` names an existing element | Supported (master) |
-| AnnData `X` matches the `obs` / `var` index lengths | Supported (master) |
-| Points/shapes Parquet payload is readable | Supported (master) |
+| `--validate` | Supported |
+| `PASS` / `WARN` / `ERROR` findings and a summary line | Supported |
+| Text output | Supported |
+| JSON output (`--validate --json`) | Supported |
+| Exit status 2 when at least one `ERROR` is found | Supported |
+| Array shape / chunk / shard dimensionality agreement | Supported |
+| OME dataset paths exist and agree on dimensionality | Supported |
+| Declared HCS well paths exist | Supported |
+| A table's `region` names an existing element | Supported |
+| AnnData `X` matches the `obs` / `var` index lengths | Supported |
+| Points/shapes Parquet payload is readable | Supported |
 | Combining `--validate` with `--depth` | Refused by design |
 | Schema or specification conformance checking | Not implemented, and out of scope |
 | A rule registry, policy engine, or per-rule/per-severity filtering | Not implemented, and out of scope |
@@ -147,7 +145,7 @@ mechanism for adding an eighth from outside the source.
 | --- | --- |
 | `--depth N` | Supported |
 | `--json` | Supported |
-| `--validate` | Supported (master) |
+| `--validate` | Supported |
 | `-h` / `--help`, `-V` / `--version` | Supported |
 | Exit status 0 walked, 1 failure, 2 validation error | Supported (2 on master) |
 | Quiet `BrokenPipe` handling for `\| head`, `\| less` | Supported |
@@ -191,8 +189,7 @@ on:
   Parquet and AnnData payload summaries, and region linkage.
 - [Roadmap](roadmap.md) — direction, with nothing promised.
 - [Changelog](../CHANGELOG.md) — which release each capability above arrived
-  in, and what is still only on `master`.
+  in.
 - [Contributing](../CONTRIBUTING.md) — building it, the quality gate, and the
   design constraints behind the non-goals above.
-- [README](../README.md) — the project overview, being split into this
-  directory one subject at a time.
+- [README](../README.md) — the project overview.

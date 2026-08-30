@@ -375,8 +375,7 @@ to every kind.
 
 ## Validation
 
-`--validate` was merged **after v0.3.0** and is available by building `master`.
-It is not in any release yet.
+`--validate` was added in **v0.4.0**.
 
 These are **metadata-only structural checks**: what an OME-Zarr group's own
 metadata declares, resolved against the nodes the walk found. This is not

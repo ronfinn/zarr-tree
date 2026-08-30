@@ -10,7 +10,7 @@ Security fixes are made against the current development branch (`master`) and,
 where appropriate, included in the next release. Older releases are not
 patched, and there are no long-term support branches.
 
-The latest release is v0.3.0. See
+The latest release is v0.4.0. See
 [Releases](https://github.com/ronfinn/zarr-tree/releases) for the current one at
 any time.
 

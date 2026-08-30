@@ -34,7 +34,7 @@ The binary lands at `target/release/zarr-tree`:
 
 ```
 $ ./target/release/zarr-tree --version
-zarr-tree 0.3.0
+zarr-tree 0.4.0
 ```
 
 To put it on your `PATH`, install it into Cargo's bin directory
@@ -48,14 +48,12 @@ The examples below assume `zarr-tree` is on your `PATH`.
 
 ### Release versus master
 
-The latest tagged release is **v0.3.0**; `master` may contain unreleased
-features. The manifest version stays at `0.3.0` until the next release is cut,
-so a build from `master` also reports `zarr-tree 0.3.0` while carrying work that
-is not in the v0.3.0 release. The one user-visible difference today is
-`--validate`, which was merged after v0.3.0.
+The latest tagged release is **v0.4.0**, and `master` is at that release. The
+manifest version stays at `0.4.0` until the next release is cut, so a later
+build from `master` also reports `zarr-tree 0.4.0` while possibly carrying work
+that is not in the v0.4.0 release.
 
-[Project status](status.md) records which capabilities are released and which
-are `master`-only.
+[Project status](status.md) records what is implemented today.
 
 ## Your first store
 
@@ -103,9 +101,6 @@ metadata rows: `[group, OME-Zarr 0.4]`, `[group, SpatialData points]`. The
 | Validation as JSON | `zarr-tree --validate --json STORE` |
 | Help | `zarr-tree --help` |
 | Version | `zarr-tree --version` |
-
-`--validate` is available on development `master` after v0.3.0. Everything else
-above is in the v0.3.0 release.
 
 `STORE` is a directory on this machine, an `s3://` URI or an `http(s)://` URL.
 All three take the same walk and accept the same options — see

@@ -94,9 +94,6 @@ Check what the metadata declares against what the store has:
 zarr-tree --validate example.zarr
 ```
 
-`--validate` was added after v0.3.0 and is currently on `master` only — build
-from source to use it. Everything else above is in v0.3.0.
-
 [docs/getting-started.md](docs/getting-started.md) covers this at more length,
 [docs/cli.md](docs/cli.md) is the full command-line reference, and
 [docs/remote-stores.md](docs/remote-stores.md) covers the S3 and HTTP cases.
@@ -111,21 +108,19 @@ from source to use it. Everything else above is in v0.3.0.
 | Parquet | footer summaries only — rows, columns, file count, schema |
 | AnnData | metadata summaries only — no value is read, nothing is counted |
 | Storage | local filesystem, S3, HTTP/WebDAV, static HTTP via consolidated metadata |
-| Validation | metadata-only structural checks, on `master` after v0.3.0 |
+| Validation | metadata-only structural checks |
 
 [docs/status.md](docs/status.md) carries the exact matrix, including what is
 deliberately not implemented.
 
 ## Project status
 
-The latest release is [v0.3.0](https://github.com/ronfinn/zarr-tree/releases).
-Development continues on `master`, which currently carries metadata structural
-validation (`--validate`) added after that release.
+The latest release is [v0.4.0](https://github.com/ronfinn/zarr-tree/releases),
+which added metadata-only structural validation (`--validate`).
 
 | | |
 | --- | --- |
-| Latest release | v0.3.0 |
-| Development HEAD | post-v0.3.0, `--validate` present |
+| Latest release | v0.4.0 |
 | Tests | 112 passing — 94 unit, 18 integration |
 | Minimum supported Rust version | 1.88 |
 
@@ -392,8 +387,7 @@ zarr-tree https://example.org/example.zarr
 | 1 | The store could not be read, or the command line made no sense. |
 | 2 | `--validate` ran and reported at least one `ERROR`. |
 
-`--validate`, and exit status 2 with it, were added after v0.3.0 and are on
-`master` only. `zarr-tree` sits quietly at the producing end of a pipe:
+`zarr-tree` sits quietly at the producing end of a pipe:
 `zarr-tree big.zarr | head` stops when the reader does, with nothing on stderr
 and exit status 0.
 

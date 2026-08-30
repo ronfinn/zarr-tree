@@ -10,7 +10,11 @@ with the pre-1.0 caveat that the output format is not yet stable.
 
 ## [Unreleased]
 
-Merged after v0.3.0 and available by building `master`.
+## [0.4.0] - 2026-08-30
+
+Metadata-only structural validation, and a documentation set to match. The
+read-only, metadata-only inspection model is unchanged: nothing here reads a
+chunk, an expression value or a Parquet record.
 
 ### Added
 
@@ -52,6 +56,8 @@ Merged after v0.3.0 and available by building `master`.
   the detail lives in `docs/`: getting started, a command-line reference,
   remote stores, architecture, and format references for Zarr, OME-Zarr and
   SpatialData, alongside a capability matrix and a roadmap.
+- A degenerate HCS plate whose `wells` list is empty now omits the `wells`
+  row rather than printing `wells: 0`. A plate with wells is unaffected.
 
 ## [0.3.0] - 2026-08-29
 
@@ -136,7 +142,8 @@ First release: local Zarr metadata inspection.
 - Graceful degradation throughout: an unreadable field prints `?`, an
   unreadable node prints `[unknown]`, and the rest of the walk continues.
 
-[Unreleased]: https://github.com/ronfinn/zarr-tree/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ronfinn/zarr-tree/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ronfinn/zarr-tree/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ronfinn/zarr-tree/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ronfinn/zarr-tree/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ronfinn/zarr-tree/releases/tag/v0.1.0

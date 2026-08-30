@@ -456,8 +456,7 @@ rather than fought.
 
 ## Validation checks
 
-`--validate` was merged **after v0.3.0** and is available by building `master`.
-It is not in any release yet.
+`--validate` was added in **v0.4.0**.
 
 It prints findings instead of the tree, over the same metadata the tree reads.
 Two of the seven rules are about plain Zarr; the rest are OME-Zarr and
@@ -542,8 +541,7 @@ enough to run against a remote store at all.
 
 Storage backends are a separate boundary — local, S3 and HTTP(S) are the whole
 list, with no ZIP store, GCS or Azure, and no scraping of HTML directory-index
-pages. The full matrix, including what is supported in v0.3.0 versus on
-`master`, is in [Project status](status.md#zarr).
+pages. The full matrix is in [Project status](status.md#zarr).
 
 ## See also
 

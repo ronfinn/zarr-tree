@@ -15,9 +15,9 @@ against throwaway fixture stores.
 
 ## Development status
 
-- Latest release: **v0.3.0** (tag `v0.3.0`).
-- Current manifest version: `0.3.0`.
-- Development HEAD: post-v0.3.0, validation mode present.
+- Latest release: **v0.4.0** (tag `v0.4.0`).
+- Current manifest version: `0.4.0`.
+- Development HEAD: at v0.4.0; validation mode released.
 
 In summary -- the section below is the authoritative detail:
 
