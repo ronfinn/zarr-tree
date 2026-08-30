@@ -1,0 +1,88 @@
+name: Bug report
+description: Something zarr-tree does that it should not, or does not do that it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not include credentials, signed URLs, tokens or private
+        dataset content. A few lines of the metadata document is what is
+        needed — never the data itself.
+
+        Security vulnerabilities do not belong here. See
+        [SECURITY.md](https://github.com/ronfinn/zarr-tree/blob/master/SECURITY.md).
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Output of `zarr-tree --version`, or the commit you built.
+      placeholder: "0.3.0, or de65d94"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "macOS 15.6, Ubuntu 24.04, Windows 11"
+    validations:
+      required: true
+
+  - type: input
+    id: rust
+    attributes:
+      label: Rust version
+      description: Output of `rustc --version`, if you built from source.
+      placeholder: "rustc 1.98.0"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: store
+    attributes:
+      label: Store type
+      options:
+        - Local directory
+        - S3 (s3://)
+        - HTTP or HTTPS
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact command you ran, with any private path or bucket name replaced.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: The output or error, copied rather than described.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: |
+        If you can, the smallest store structure and metadata that reproduces
+        it — a directory listing and the contents of the relevant `zarr.json`,
+        `.zarray`, `.zgroup` or attribute block. This is usually what makes a
+        bug fixable.
+    validations:
+      required: false

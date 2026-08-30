@@ -190,5 +190,9 @@ on:
 - [SpatialData reference](spatialdata.md) — store and element recognition, the
   Parquet and AnnData payload summaries, and region linkage.
 - [Roadmap](roadmap.md) — direction, with nothing promised.
+- [Changelog](../CHANGELOG.md) — which release each capability above arrived
+  in, and what is still only on `master`.
+- [Contributing](../CONTRIBUTING.md) — building it, the quality gate, and the
+  design constraints behind the non-goals above.
 - [README](../README.md) — the project overview, being split into this
   directory one subject at a time.

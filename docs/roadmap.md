@@ -11,8 +11,9 @@ out to be a bad idea and simply be dropped.
 
 Work that is intended, small, and consistent with the current design.
 
-- Repository and documentation professionalisation: splitting the current
-  README into focused guides under `docs/`.
+- Final repository and release polish. The README has been split into focused
+  guides under `docs/`, and contributor and maintenance documents are in place;
+  what remains is tidying up around a release.
 - Expanding metadata-only structural validation, within the existing model —
   findings over metadata already read, no schema and no rule engine.
 - Improving how OME-Zarr metadata is presented.

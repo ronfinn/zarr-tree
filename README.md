@@ -155,6 +155,13 @@ are as much a part of the design as the features.
 - [Roadmap](docs/roadmap.md) — direction, with nothing promised.
 - [Releases](https://github.com/ronfinn/zarr-tree/releases)
 
+Contributing and maintenance:
+
+- [Changelog](CHANGELOG.md) — user-visible changes, per release.
+- [Contributing](CONTRIBUTING.md) — setup, the quality gate, and the design
+  constraints a change is expected to preserve.
+- [Security policy](SECURITY.md) — scope, and how to report a vulnerability.
+
 The storage-backend and format sections below are being split out of this file
 one subject at a time.
 
@@ -683,6 +690,15 @@ Near term it is documentation work, more structural validation within the
 existing model, and better OME-Zarr presentation. GCS and Azure backends, and
 anything beyond lightweight OME-Zarr and SpatialData recognition, remain out of
 scope.
+
+## Contributing
+
+Issues and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers
+the development setup, the quality gate CI runs, and the design constraints —
+read-only, metadata-only, arrays are leaves — that a change is expected to
+preserve. [CHANGELOG.md](CHANGELOG.md) records what has changed between
+releases, and [SECURITY.md](SECURITY.md) covers vulnerability reporting, which
+does not go through public issues.
 
 ## Why this project exists
 

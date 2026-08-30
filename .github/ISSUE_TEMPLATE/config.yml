@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://github.com/ronfinn/zarr-tree/tree/master/docs
+    about: Command-line reference, remote stores, and the Zarr, OME-Zarr and SpatialData guides.
+  - name: Security vulnerability
+    url: https://github.com/ronfinn/zarr-tree/blob/master/SECURITY.md
+    about: Do not report vulnerabilities in a public issue — read the security policy first.
