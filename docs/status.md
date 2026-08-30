@@ -51,10 +51,12 @@ credentials` is not read. HTTP access is anonymous.
 | Other consolidation forms | Not implemented |
 | Checking consolidated metadata against the store it describes | Not implemented |
 | Compressors, fill values, dimension names, user attributes | Not implemented |
-| V3 dtypes given in object (extension) form | Not implemented |
+| V3 dtypes given in object (extension) form, reported by name | Supported |
 
 V2 `dtype` strings are printed exactly as stored, in NumPy notation, and are not
-translated into V3 names. A directory carrying both V2 and V3 metadata is
+translated into V3 names. A V3 extension dtype shows the `name` its object
+declares; the `configuration` beside it is not displayed or interpreted, and a
+`data_type` with no usable name shows as `?`. A directory carrying both V2 and V3 metadata is
 reported as V2. The [Zarr reference](zarr.md) documents each of these in
 detail.
 

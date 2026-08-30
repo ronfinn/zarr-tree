@@ -48,6 +48,10 @@ Nothing here is a commitment or a date.
 - Zarr V2 (`.zgroup` / `.zarray`) and V3 (`zarr.json`) metadata layouts.
 - Nodes labelled `[group]`, `[array]` or `[unknown]`; arrays are leaves.
 - `shape`, `chunks` and `dtype` shown under every array.
+- Zarr V3 `data_type` in either form: a core type's string, or the `name` an
+  extension's object form declares (`numpy.datetime64`). Only the name is
+  shown -- a `configuration` is what a reader would need to decode values, and
+  nothing here decodes -- and a `data_type` with no usable name shows as `?`.
 - Zarr V3 sharded arrays report `chunks` (inner chunk shape) and `shards`
   (chunk-grid shape) separately.
 - OME-Zarr image detection, with the version as stored.

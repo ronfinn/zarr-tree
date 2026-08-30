@@ -10,6 +10,13 @@ with the pre-1.0 caveat that the output format is not yet stable.
 
 ## [Unreleased]
 
+### Added
+
+- Zarr V3 data types written in the object (extension) form are reported by
+  the `name` they declare — `dtype: numpy.datetime64` — instead of showing as
+  missing. String data types are unchanged, and a `data_type` with no usable
+  name still shows as `?`.
+
 ## [0.4.0] - 2026-08-30
 
 Metadata-only structural validation, and a documentation set to match. The

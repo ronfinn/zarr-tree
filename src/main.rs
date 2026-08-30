@@ -3024,11 +3024,44 @@ fn array_meta_v3(value: &Value) -> ArrayMeta {
         shape: dims(value.get("shape")),
         chunks,
         shards,
-        // The object form used by dtype extensions is not interpreted.
-        dtype: value
-            .get("data_type")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        dtype: data_type_v3(value.get("data_type")),
+    }
+}
+
+/// Read a Zarr V3 `data_type` as the name to display, or `None` when there is
+/// no name to be had.
+///
+/// V3 spells a data type in two ways. A core type is a bare string --
+/// `"uint16"`, `"float32"` -- and comes back as itself. An extension type is
+/// an object naming the extension and, usually, configuring it:
+///
+/// ```json
+/// "data_type": {"name": "numpy.datetime64", "configuration": {"unit": "s"}}
+/// ```
+///
+/// Only the `name` is taken. The configuration is what a *reader* needs to
+/// decode the values, and this tool decodes nothing; showing it would put a
+/// variable-width blob of JSON in a column three characters wide. So an
+/// extension array reports `dtype: numpy.datetime64` -- the identity of the
+/// type, which is the question a tree can honestly answer -- and the full
+/// object stays in the file for anyone who needs it.
+///
+/// The name is passed through exactly as stored, unchecked against any
+/// registry: an unknown extension is displayed, not judged, for the same
+/// reason a V2 dtype is printed in whatever NumPy notation it was written in.
+///
+/// Anything else -- an object with no `name`, a `name` that is not a string, a
+/// number, a list -- is a dtype we cannot name, and comes back `None` so the
+/// row shows `?`. That is the same degradation an unreadable `shape` gets, and
+/// it is deliberately not an error: a malformed dtype costs the reader that
+/// one row, never the node or the walk.
+fn data_type_v3(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+
+    match value {
+        Value::String(name) => Some(name.clone()),
+        Value::Object(_) => value.get("name")?.as_str().map(String::from),
+        _ => None,
     }
 }
 
@@ -5616,6 +5649,78 @@ mod tests {
         // walk. `matches!` checks the variant without making NodeKind derive
         // PartialEq and Debug that nothing outside this test would use.
         assert!(matches!(kind, NodeKind::Unknown));
+    }
+
+    #[test]
+    fn a_v3_object_data_type_is_reported_by_its_extension_name() {
+        // The extension form: an object naming the data type, and configuring
+        // it. Only the name is displayed -- the configuration is what a reader
+        // would need to decode values, and nothing here decodes.
+        let value = json!({
+            "node_type": "array",
+            "shape": [8],
+            "chunk_grid": {
+                "name": "regular",
+                "configuration": { "chunk_shape": [8] }
+            },
+            "data_type": {
+                "name": "numpy.datetime64",
+                "configuration": { "unit": "s", "scale_factor": 1 }
+            }
+        });
+
+        let meta = array_meta_v3(&value);
+
+        assert_eq!(meta.dtype, Some(String::from("numpy.datetime64")));
+        // The rest of the array is read exactly as it would have been with a
+        // string dtype: the object form costs nothing else.
+        assert_eq!(shown(&meta.shape), Some(String::from("[8]")));
+        assert_eq!(shown(&meta.chunks), Some(String::from("[8]")));
+    }
+
+    #[test]
+    fn an_unknown_v3_object_data_type_is_shown_as_stored() {
+        // The name is not checked against any registry, and fields beside it
+        // are ignored rather than being a reason to give up. An extension we
+        // have never heard of is displayed, not judged.
+        let value = json!({
+            "node_type": "array",
+            "data_type": {
+                "name": "example.packed_bits",
+                "configuration": { "bits": 3 },
+                "must_understand": true,
+                "notes": "not a real extension"
+            }
+        });
+
+        assert_eq!(
+            array_meta_v3(&value).dtype,
+            Some(String::from("example.packed_bits"))
+        );
+    }
+
+    #[test]
+    fn a_v3_data_type_with_no_usable_name_is_missing_rather_than_fatal() {
+        // Three ways to be unnameable: an object with no `name`, a `name` that
+        // is not a string, and a value that is neither string nor object. Each
+        // costs the dtype row a `?` and nothing else -- the array is still an
+        // array, and the shape it did declare still shows.
+        for data_type in [
+            json!({ "configuration": { "unit": "s" } }),
+            json!({ "name": 7 }),
+            json!(["uint16"]),
+        ] {
+            let value = json!({
+                "node_type": "array",
+                "shape": [4],
+                "data_type": data_type
+            });
+
+            let meta = array_meta_v3(&value);
+
+            assert_eq!(meta.dtype, None);
+            assert_eq!(shown(&meta.shape), Some(String::from("[4]")));
+        }
     }
 
     #[test]

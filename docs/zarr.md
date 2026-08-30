@@ -101,7 +101,7 @@ classified.
 | `shape` | An array's shape, copied as stored. |
 | `chunk_grid.configuration.chunk_shape` | The chunk grid's shape. Only a `regular` grid records one; any other grid leaves `chunks` unreadable. |
 | `codecs` | Scanned for a codec named exactly `sharding_indexed`, and for nothing else — see [Sharding](#sharding). |
-| `data_type` | The dtype, when it is a string. |
+| `data_type` | The dtype: the string itself, or the `name` of an extension's object form. |
 | `attributes` | User attributes, read only on a group, and only for the OME-Zarr (`attributes.ome`) and SpatialData markers. |
 | `consolidated_metadata` | Consolidated metadata at the store root — see [Consolidated metadata](#consolidated-metadata). |
 
@@ -109,10 +109,33 @@ Nothing else in a V3 document is read: not `chunk_key_encoding`, not
 `fill_value`, not `dimension_names`, not `storage_transformers`, and not the
 codec chain beyond the one name above.
 
-A `data_type` given in the **object form** used by dtype extensions is not
-interpreted. `data_type` is read as a string or not at all, so an extension
-dtype shows as `?`. That is a
-[roadmap item](roadmap.md#near-term), not a decision.
+### Object-form data types
+
+V3 spells a data type in two ways, and both are read. A core type is a bare
+string:
+
+```json
+"data_type": "uint16"
+```
+
+An extension type is an object naming the extension, usually with a
+configuration beside it:
+
+```json
+"data_type": {"name": "numpy.datetime64", "configuration": {"unit": "s"}}
+```
+
+Only the `name` is displayed, so that array shows `dtype: numpy.datetime64`.
+The configuration is what a *reader* needs in order to decode values, and this
+tool decodes nothing; the full object stays in the file. The name is passed
+through exactly as stored and is not checked against any registry, so an
+extension this tool has never heard of is displayed rather than judged — the
+same treatment a V2 dtype in NumPy notation gets.
+
+A `data_type` with no name to show — an object without a `name`, a `name` that
+is not a string, or a value that is neither string nor object — leaves the
+dtype unread and the row shows `?`. That costs the reader one row and nothing
+else: the node is still an array, and the walk continues.
 
 ### V2 is checked first
 
@@ -148,7 +171,7 @@ Only rows this program actually reads:
 | Shape | `shape` | `shape` |
 | Chunk shape | `chunks` | `chunk_grid.configuration.chunk_shape`, or the sharding codec's `configuration.chunk_shape` when sharded |
 | Shard shape | not applicable | `chunk_grid.configuration.chunk_shape` when sharded |
-| dtype | `dtype`, NumPy notation | `data_type`, string form only |
+| dtype | `dtype`, NumPy notation | `data_type`, string form or an extension object's `name` |
 | Consolidation | `.zmetadata` at the root | inline `consolidated_metadata` in the root `zarr.json` |
 | OME-Zarr metadata | keys at the top level of `.zattrs` | `attributes.ome` |
 
@@ -532,10 +555,11 @@ enough to run against a remote store at all.
 - **Compressors, fill values, dimension names and user attributes.** Attributes
   are read only for the OME-Zarr and SpatialData markers, and are never
   displayed as attributes.
-- **dtype translation.** V2 dtypes are passed through in NumPy notation and are
-  never mapped onto V3 names. V3 dtypes in object (extension) form are not
-  interpreted and show as `?` — that one is on the
-  [roadmap](roadmap.md#near-term).
+- **dtype translation and interpretation.** V2 dtypes are passed through in
+  NumPy notation and are never mapped onto V3 names. A V3 extension dtype is
+  reported by its name alone: its `configuration` is not shown, not checked and
+  not interpreted, and no dtype of either version is validated against a
+  registry or a specification.
 - **Consolidation forms beyond the two above**, and checking a consolidated
   document against the store it describes.
 

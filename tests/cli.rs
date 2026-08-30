@@ -1344,6 +1344,83 @@ fn a_sharded_array_reports_its_chunks_and_its_shards_separately() {
 }
 
 #[test]
+fn a_v3_object_data_type_prints_its_name_and_a_nameless_one_prints_a_question_mark() {
+    let dir = fixture_dir("object-dtype");
+    let root = dir.join("dataset.zarr");
+
+    write_file(
+        &root.join("zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group"}"#,
+    );
+
+    // Three arrays identical but for their `data_type`: the string form that
+    // has always worked, the extension object form, and an object with no
+    // name in it at all.
+    let array = |data_type: &str| -> String {
+        format!(
+            r#"{{
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [8],
+                "chunk_grid": {{"name": "regular", "configuration": {{"chunk_shape": [8]}}}},
+                "codecs": [{{"name": "bytes"}}],
+                "data_type": {data_type}
+            }}"#
+        )
+    };
+
+    write_file(&root.join("plain/zarr.json"), &array(r#""uint16""#));
+    write_file(
+        &root.join("timestamps/zarr.json"),
+        &array(
+            r#"{"name": "numpy.datetime64", "configuration": {"unit": "s", "scale_factor": 1}}"#,
+        ),
+    );
+    write_file(
+        &root.join("nameless/zarr.json"),
+        &array(r#"{"configuration": {"unit": "s"}}"#),
+    );
+
+    let path = root.to_str().unwrap().to_string();
+    let text = String::from_utf8_lossy(&run(&[&path]).stdout).into_owned();
+    let output = run(&["--json", &path]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    let rows = lines(&text);
+    // The string form is untouched, the object form shows the extension's
+    // name, and the one we cannot name degrades to `?` like any unread field.
+    for expected in ["dtype: uint16", "dtype: numpy.datetime64", "dtype: ?"] {
+        assert!(has(&rows, expected), "expected {expected:?} in:\n{text}");
+    }
+    // The configuration is not part of the answer.
+    assert!(!text.contains("scale_factor"), "{text}");
+    // All three are still arrays, and the walk finished.
+    assert_eq!(text.matches("[array]").count(), 3, "{text}");
+    assert!(output.status.success(), "{stdout}");
+
+    let tree: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("--json should print valid JSON: {error}\n{stdout}"));
+    let dtype = |name: &str| -> Value {
+        tree["children"]
+            .as_array()
+            .expect("the root should have children")
+            .iter()
+            .find(|child| child["name"] == json!(name))
+            .unwrap_or_else(|| panic!("no child named {name:?} in {stdout}"))["array"]["dtype"]
+            .clone()
+    };
+
+    // `dtype` stays a string in `--json` -- an extension names itself, and a
+    // dtype with no name is null, the same as any field looked for and not
+    // read.
+    assert_eq!(dtype("plain"), json!("uint16"));
+    assert_eq!(dtype("timestamps"), json!("numpy.datetime64"));
+    assert_eq!(dtype("nameless"), Value::Null);
+}
+
+#[test]
 fn an_hcs_plate_and_its_wells_are_tagged_from_metadata_not_from_their_names() {
     let dir = fixture_dir("hcs");
     let root = dir.join("plate.ome.zarr");
