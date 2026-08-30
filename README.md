@@ -138,13 +138,15 @@ are as much a part of the design as the features.
   and the whole option set in one page.
 - [Remote stores](docs/remote-stores.md) — S3, AWS credentials and endpoints,
   HTTP and WebDAV, static HTTP via consolidated metadata, troubleshooting.
+- [Architecture](docs/architecture.md) — the `Store` trait, the consolidated
+  overlay, how metadata is classified, and how validation reuses the walk.
 - [Project status](docs/status.md) — the capability matrix, and what is
   deliberately absent.
 - [Roadmap](docs/roadmap.md) — direction, with nothing promised.
 - [Releases](https://github.com/ronfinn/zarr-tree/releases)
 
-More focused guides for architecture, OME-Zarr, SpatialData and validation are
-being split out of the reference material below.
+More focused guides for OME-Zarr, SpatialData and validation are being split
+out of the reference material below.
 
 ## Features
 

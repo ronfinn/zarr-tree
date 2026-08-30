@@ -171,6 +171,8 @@ on:
 
 - [Getting started](getting-started.md) — building it, and a first store.
 - [Remote stores](remote-stores.md) — S3, HTTP, WebDAV and static HTTP.
+- [Architecture](architecture.md) — how the storage, classification and
+  validation layers fit together.
 - [Roadmap](roadmap.md) — direction, with nothing promised.
 - [README](../README.md) — the current detailed documentation, being split into
   this directory one subject at a time.
