@@ -2880,6 +2880,153 @@ fn codec_chains_are_summarised_for_both_zarr_versions() {
     assert_eq!(tree.get("codecs"), None, "{stdout}");
 }
 
+#[test]
+fn array_layout_is_summarised_for_both_zarr_versions() {
+    let dir = fixture_dir("layout");
+    let root = dir.join("dataset.zarr");
+
+    // A root group carrying layout keys of both vocabularies, to prove the row
+    // belongs to arrays and to nothing else.
+    write_file(
+        &root.join("zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group",
+            "order": "F", "chunk_key_encoding": {"name": "default"}}"#,
+    );
+
+    let v3 = |encoding: &str| -> String {
+        format!(
+            r#"{{
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [1024],
+                "chunk_grid": {{"name": "regular", "configuration": {{"chunk_shape": [64]}}}},
+                "chunk_key_encoding": {encoding},
+                "data_type": "uint16"
+            }}"#
+        )
+    };
+
+    // The default encoding, an extension name, an encoding whose separator
+    // cannot be read, one whose name cannot, and one with nothing readable.
+    write_file(
+        &root.join("v3-default/zarr.json"),
+        &v3(r#"{"name": "default",
+        "configuration": {"separator": "/"}}"#),
+    );
+    write_file(
+        &root.join("v3-extension/zarr.json"),
+        &v3(r#"{"name": "my.chunk.encoding",
+        "configuration": {"separator": "-", "base": 16}}"#),
+    );
+    write_file(&root.join("v3-named/zarr.json"), &v3(r#"{"name": "v2"}"#));
+    write_file(
+        &root.join("v3-nameless/zarr.json"),
+        &v3(r#"{"configuration":
+        {"separator": "/"}}"#),
+    );
+    write_file(&root.join("v3-useless/zarr.json"), &v3(r#""default""#));
+
+    // And the V2 side: both keys, each alone, and neither.
+    write_file(
+        &root.join("v2-both/.zarray"),
+        r#"{"zarr_format": 2, "shape": [1024], "chunks": [64], "dtype": "<i4",
+            "order": "C", "dimension_separator": "."}"#,
+    );
+    write_file(
+        &root.join("v2-order/.zarray"),
+        r#"{"zarr_format": 2, "shape": [1024], "chunks": [64], "dtype": "<i4",
+            "order": "F"}"#,
+    );
+    write_file(
+        &root.join("v2-separator/.zarray"),
+        r#"{"zarr_format": 2, "shape": [1024], "chunks": [64], "dtype": "<i4",
+            "dimension_separator": "/"}"#,
+    );
+    write_file(
+        &root.join("v2-neither/.zarray"),
+        r#"{"zarr_format": 2, "shape": [1024], "chunks": [64], "dtype": "<i4"}"#,
+    );
+
+    let path = root.to_str().unwrap().to_string();
+    let text = String::from_utf8_lossy(&run(&[&path]).stdout).into_owned();
+    let output = run(&["--json", &path]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    let rows = lines(&text);
+    // One label for both versions, each half named so the two are grouped
+    // without being equated.
+    assert!(
+        has(&rows, r#"layout: encoding=default, separator="/""#),
+        "{text}"
+    );
+    assert!(
+        has(
+            &rows,
+            r#"layout: encoding=my.chunk.encoding, separator="-""#
+        ),
+        "{text}"
+    );
+    assert!(has(&rows, "layout: encoding=v2"), "{text}");
+    assert!(has(&rows, r#"layout: separator="/""#), "{text}");
+    assert!(has(&rows, r#"layout: order=C, separator=".""#), "{text}");
+    assert!(has(&rows, "layout: order=F"), "{text}");
+    // Configuration beyond the separator is never shown.
+    assert!(!text.contains("base"), "{text}");
+    // Two arrays have nothing readable to report and print no row, and the
+    // group's stray keys bought it nothing.
+    assert_eq!(text.matches("layout:").count(), 7, "{text}");
+    assert_eq!(text.matches("[array]").count(), 9, "{text}");
+    assert!(output.status.success(), "{stdout}");
+
+    let tree: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("--json should print valid JSON: {error}\n{stdout}"));
+    let array_of = |name: &str| -> Value {
+        tree["children"]
+            .as_array()
+            .expect("the root should have children")
+            .iter()
+            .find(|child| child["name"] == json!(name))
+            .unwrap_or_else(|| panic!("no child named {name:?} in {stdout}"))["array"]
+            .clone()
+    };
+
+    // Structured data, not the row's text -- and never a mixture of the two
+    // vocabularies.
+    assert_eq!(
+        array_of("v3-default")["layout"],
+        json!({"encoding": "default", "separator": "/"})
+    );
+    assert_eq!(array_of("v3-named")["layout"], json!({"encoding": "v2"}));
+    assert_eq!(array_of("v3-nameless")["layout"], json!({"separator": "/"}));
+    assert_eq!(
+        array_of("v2-both")["layout"],
+        json!({"order": "C", "separator": "."})
+    );
+    assert_eq!(array_of("v2-order")["layout"], json!({"order": "F"}));
+    assert_eq!(
+        array_of("v2-separator")["layout"],
+        json!({"separator": "/"})
+    );
+    // Nothing to report is no key, the rule `shards` and `codecs` follow.
+    assert_eq!(array_of("v2-neither").get("layout"), None, "{stdout}");
+    assert_eq!(array_of("v3-useless").get("layout"), None, "{stdout}");
+    // Every other array field is exactly what it was.
+    assert_eq!(
+        array_of("v2-both"),
+        json!({
+            "shape": [1024],
+            "chunks": [64],
+            "dtype": "<i4",
+            "layout": {"order": "C", "separator": "."}
+        })
+    );
+    // A group has no array section for a layout to appear in.
+    assert_eq!(tree.get("array"), None, "{stdout}");
+    assert_eq!(tree.get("layout"), None, "{stdout}");
+}
+
 /// A small store touching everything `--attributes` has to get right: a V3
 /// root with values of every JSON kind, a V2 group whose attributes are also
 /// OME-Zarr metadata, a V2 array, an empty attributes object, and a `.zattrs`

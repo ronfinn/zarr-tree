@@ -131,7 +131,8 @@ depends on what the node is:
 | `shards:` | A Zarr V3 sharded array, between `chunks:` and `dtype:` |
 | `fill:` | An array whose metadata declares a `fill_value`, after `dtype:`. Drawn as compact JSON, so `0`, `"NaN"` and `null` are each visibly the type they are, and never interpreted or checked against the dtype. See [Fill values](zarr.md#fill-values). |
 | `dimensions:` | A Zarr V3 array declaring `dimension_names`, after `fill:`. An unnamed dimension shows as `?` in its own position. |
-| `codecs:` | An array declaring a codec chain, last. Names only, in declaration order — V2 `filters` then `compressor`, V3 `codecs` — with `?` for a codec that could not be named. See [Codecs](zarr.md#codecs). |
+| `codecs:` | An array declaring a codec chain, after `dimensions:`. Names only, in declaration order — V2 `filters` then `compressor`, V3 `codecs` — with `?` for a codec that could not be named. See [Codecs](zarr.md#codecs). |
+| `layout:` | An array whose document says anything about chunk order or chunk naming, last. `order=C, separator="."` for a V2 array, `encoding=default, separator="/"` for a V3 one, with either half left out where the document did not give it. See [Chunk layout](zarr.md#chunk-layout). |
 | `axes:`, `pyramid levels:`, `datasets:` | An OME-Zarr image |
 | `rows:`, `columns:`, `wells:` | An OME-Zarr HCS plate |
 | `rows:`, `columns:`, `parquet files:`, `schema:` | A SpatialData points or shapes element with a payload |
@@ -320,7 +321,7 @@ and then one section per kind of metadata that applies to it:
 | `kind` | every node | `group`, `array` or `unknown` |
 | `zarr_format` | recognised groups and arrays | `2` or `3`, the Zarr metadata version the node was read as. Absent on `unknown` |
 | `children` | every node | The child nodes, in the order the tree lists them |
-| `array` | arrays | `shape`, `chunks`, `dtype`, `shards` when sharded, `fill_value` when declared, `dimension_names` when declared, and `codecs` when a chain is declared |
+| `array` | arrays | `shape`, `chunks`, `dtype`, `shards` when sharded, `fill_value` when declared, `dimension_names` when declared, `codecs` when a chain is declared, and `layout` when the document says anything about chunk order or naming |
 | `ome` | OME-Zarr groups | `tag`, `kind`, `version`, `axes`, `pyramid_levels`, `datasets`, and `rows`/`columns`/`wells` on a plate |
 | `spatialdata` | SpatialData nodes | `kind`, `version`, and `regions`/`region_key`/`instance_key` on a table |
 | `parquet` | points and shapes elements with a payload | `rows`, `columns`, `files`, `schema` |
@@ -363,12 +364,18 @@ $ zarr-tree --json partial.zarr | jq '.children[0].array'
 
 Every array has a shape, chunks and a dtype to be missing, so all three keys
 are always present and `null` means unreadable. `shards`, `fill_value`,
-`dimension_names` and `codecs` are the exceptions and are omitted rather than
-`null`, because an unsharded array has no shards to miss. A `fill_value` that
-*is* `null` is therefore the value the document wrote, not a missing one — see
-[Fill values](zarr.md#fill-values); a `null` inside `codecs` is a codec
-declared at that position whose name could not be read — see
+`dimension_names`, `codecs` and `layout` are the exceptions and are omitted
+rather than `null`, because an unsharded array has no shards to miss. A
+`fill_value` that *is* `null` is therefore the value the document wrote, not a
+missing one — see [Fill values](zarr.md#fill-values); a `null` inside `codecs`
+is a codec declared at that position whose name could not be read — see
 [Codecs](zarr.md#codecs).
+
+Inside `layout` the same omission rule applies one level down: a key the
+document did not give is left out rather than written as `null`, and the two
+Zarr versions never share a spelling — `order` and `separator` for V2,
+`encoding` and `separator` for V3. See
+[Chunk layout](zarr.md#chunk-layout).
 
 **A payload that exists but could not be inspected is `"parquet": null`.** A
 points element whose `points.parquet/` directory could not be listed, or whose

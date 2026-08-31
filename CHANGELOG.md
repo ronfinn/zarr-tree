@@ -22,6 +22,30 @@ with the pre-1.0 caveat that the output format is not yet stable.
 
 ### Added
 
+- Arrays report how their chunks are ordered and named: a `layout:` row last
+  under the array, and a `layout` object in `--json`. One row for both Zarr
+  versions, so the question — *how is this array laid out, and how are its
+  chunks keyed?* — can be asked without knowing which version wrote the store.
+  A V2 array shows its `order` and `dimension_separator` as
+  `layout: order=C, separator="."`; a V3 array shows its `chunk_key_encoding`
+  as `layout: encoding=default, separator="/"`. Each half is labelled because
+  the two are unrelated facts sharing a row for brevity — how a chunk's values
+  run is not what its name looks like — and the row groups them without
+  equating them. Values are shown exactly as stored and checked against
+  nothing, so an extension encoding prints as `my.chunk.encoding` and an
+  out-of-specification value prints as itself. **No default is invented for a
+  missing key**: an array declaring only an `order` shows only that, and one
+  declaring neither shows no row. Malformed metadata keeps whatever half is
+  readable — an encoding whose `configuration` cannot be read still shows its
+  name — and an array with nothing readable simply has no row and no JSON key.
+  Beyond a V3 `separator`, no `configuration` is read or shown, and no chunk
+  key is ever built, guessed or looked for. In `--json` the layout is
+  structured data, never the row's text, and the two versions never share a
+  spelling: `{"order": ..., "separator": ...}` for V2,
+  `{"encoding": ..., "separator": ...}` for V3. Additive presentation only: no
+  classification, hierarchy, ordering, existing field, finding or exit status
+  changes, the `chunks`/`shards`/`codecs` rows are untouched, `--validate` is
+  unchanged, and nothing extra is read from the store.
 - Arrays report the codec chain they declare: a `codecs:` row last under the
   array, and a `codecs` list in `--json`. One row for both Zarr versions,
   because it answers one question — what happens to a chunk between the stored

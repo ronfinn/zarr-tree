@@ -495,6 +495,13 @@ struct ArrayMeta {
     /// deduplicates it -- unlike child names, which are ordered for reading,
     /// this order *is* the metadata.
     codecs: Option<Vec<Option<String>>>,
+    /// How the array's chunks are ordered and keyed, as far as its own
+    /// document says -- `None` where it says nothing readable at all.
+    ///
+    /// One field and one row for two genuinely different metadata models. It
+    /// is an enum rather than a struct of loose `Option`s precisely so a V3
+    /// array can never acquire a V2 `order`; see `ArrayLayout`.
+    layout: Option<ArrayLayout>,
     /// The array's user attributes, kept as stored, and only when
     /// `--attributes` asked for them. `Absent` otherwise.
     ///
@@ -504,6 +511,100 @@ struct ArrayMeta {
     /// the flag is set, and neither of those functions has a store to read it
     /// from.
     attributes: Attributes,
+}
+
+/// How an array's chunks are ordered and named on the way to storage.
+///
+/// The two Zarr versions answer that with different keys, and the tree draws
+/// both under one `layout:` row -- but one row is not one model, so this is
+/// not one struct. V2's `.zarray` has an `order` (whether a chunk's values run
+/// C- or Fortran-first) and a `dimension_separator` (what goes between the
+/// indices in a chunk's name). V3 has neither key: it has a
+/// `chunk_key_encoding`, an object naming the scheme that turns a chunk's grid
+/// position into an object key, whose `configuration` usually carries that
+/// scheme's `separator`.
+///
+/// An enum rather than a struct of four `Option`s, because the two states are
+/// mutually exclusive: no document has both, and a struct would happily let a
+/// V3 array be built holding an `order` that no V3 metadata can express.
+/// Making the impossible combination unrepresentable costs less than
+/// remembering never to write it, and the variants are told apart in exactly
+/// one place -- `parts` -- rather than at every use.
+///
+/// Each field is still an `Option`, because either half may be missing or
+/// unreadable on its own and neither is ever invented: a specification default
+/// is not something the file said. A variant is only ever built with at least
+/// one of its two fields present -- see `layout_v2` and `layout_v3` -- so a
+/// `Some(layout)` always has something to print.
+///
+/// A V3 `configuration` is not kept beyond its `separator`, for the reason
+/// `data_type_v3` and `codecs_v3` give for dropping theirs: the rest is what a
+/// *reader* needs in order to build a chunk key, and nothing here builds keys
+/// or looks for chunks. An extension encoding is named and its configuration
+/// is left in the file.
+#[derive(Debug, PartialEq)]
+enum ArrayLayout {
+    V2 {
+        order: Option<String>,
+        separator: Option<String>,
+    },
+    V3 {
+        encoding: Option<String>,
+        separator: Option<String>,
+    },
+}
+
+impl ArrayLayout {
+    /// The variant's own field -- under the name that field goes by -- and the
+    /// separator both variants happen to share.
+    ///
+    /// The one place the two variants are told apart. The tree row and the
+    /// JSON object want the same three things in the same shape, so matching
+    /// once here stops them drifting into two spellings of one fact. Pattern
+    /// matching is what makes that safe: adding a third variant would fail to
+    /// compile here rather than quietly rendering nothing.
+    fn parts(&self) -> (&'static str, Option<&str>, Option<&str>) {
+        match self {
+            ArrayLayout::V2 { order, separator } => {
+                ("order", order.as_deref(), separator.as_deref())
+            }
+            ArrayLayout::V3 {
+                encoding,
+                separator,
+            } => ("encoding", encoding.as_deref(), separator.as_deref()),
+        }
+    }
+
+    /// The row's text: `order=C, separator="."`, or `encoding=default,
+    /// separator="/"`.
+    ///
+    /// Each half is labelled because the two are unrelated facts sharing a row
+    /// for brevity -- how a chunk's values are ordered is not what its name
+    /// looks like -- and a bare `C, "."` would read as though they were one
+    /// thing. The separator keeps its quotes for the same kind of reason:
+    /// `separator=.` ends a row in what looks like a full stop, and a
+    /// `separator=""` would otherwise show nothing at all.
+    ///
+    /// A half that was not readable is left out, not drawn as `?`. Unlike a
+    /// codec's position in a chain, these two are independent named facts, so
+    /// dropping one overstates nothing -- and a row that would be empty is
+    /// never built in the first place.
+    fn row(&self) -> String {
+        let (name, value, separator) = self.parts();
+
+        let parts = [
+            value.map(|value| format!("{name}={value}")),
+            // `{:?}` on a `&str` is its quoted, escaped spelling, which is
+            // exactly what a punctuation-shaped value wants.
+            separator.map(|separator| format!("separator={separator:?}")),
+        ];
+
+        parts
+            .into_iter()
+            .flatten()
+            .collect::<Vec<String>>()
+            .join(", ")
+    }
 }
 
 /// Which kind of OME-Zarr group this is.
@@ -3454,6 +3555,7 @@ fn array_meta_v2(text: &str) -> ArrayMeta {
             dimension_names: None,
             fill_value: None,
             codecs: None,
+            layout: None,
             attributes: Attributes::Absent,
         };
     };
@@ -3477,6 +3579,9 @@ fn array_meta_v2(text: &str) -> ArrayMeta {
         fill_value: value.get("fill_value").cloned(),
         // V2's two keys, read as the one chain they describe.
         codecs: codecs_v2(value.get("filters"), value.get("compressor")),
+        // V2's own two layout keys. The whole document is passed because they
+        // are two separate top-level keys rather than one nested object.
+        layout: layout_v2(&value),
         // Filled in by `classify` when `--attributes` asked for it: V2 keeps
         // an array's attributes in a `.zattrs` beside this file, which is not
         // in hand here.
@@ -3536,6 +3641,10 @@ fn array_meta_v3(value: &Value) -> ArrayMeta {
         // The same list the sharding search above walked, read for its names
         // this time. One parse of the document serves both.
         codecs: codecs_v3(value.get("codecs")),
+        // V3's single layout key. It describes how a chunk's grid position
+        // becomes an object key, and says nothing about the grid itself --
+        // `chunks` and `shards` above are already that.
+        layout: layout_v3(value.get("chunk_key_encoding")),
         // Filled in by `classify`, which knows whether they were asked for.
         attributes: Attributes::Absent,
     }
@@ -3637,6 +3746,104 @@ fn codecs_v3(value: Option<&Value>) -> Option<Vec<Option<String>>> {
 /// unreadable field takes.
 fn codec_id(codec: &Value, key: &str) -> Option<String> {
     codec.get(key)?.as_str().map(String::from)
+}
+
+/// Read a Zarr V2 `.zarray`'s two layout keys, or `None` where it declares
+/// neither.
+///
+/// ```json
+/// "order": "C",
+/// "dimension_separator": "/"
+/// ```
+///
+/// which reads as `layout: order=C, separator="/"`. `order` says whether a
+/// chunk's values run C-first or Fortran-first; `dimension_separator` says
+/// what goes between the indices in a chunk's name, so that chunk `(0, 1)` is
+/// `0.1` or `0/1`. They are unrelated facts and the row labels them
+/// separately -- it groups them, it does not equate them.
+///
+/// Both are taken exactly as stored and checked against nothing: `order` is
+/// not required to be `C` or `F` here, and a separator is not required to be
+/// `.` or `/`. This is inspection, so a value outside what the specification
+/// allows is a fact about the file worth seeing rather than an error worth
+/// raising -- the rule a V2 dtype and an extension codec name already follow.
+///
+/// **No default is supplied for a missing key.** V2 says an absent
+/// `dimension_separator` means `.`; that is still not something this document
+/// said, and printing it would be synthesising a normalised metadata document
+/// rather than reporting the one on disk. A `.zarray` with an `order` and no
+/// separator prints `layout: order=C`, and one with neither prints no row at
+/// all.
+///
+/// A value that is not a string is not a value we can show, and takes the same
+/// silence a missing key takes; there is no half-row to hold its place.
+fn layout_v2(value: &Value) -> Option<ArrayLayout> {
+    let order = value
+        .get("order")
+        .and_then(|order| order.as_str())
+        .map(String::from);
+
+    let separator = value
+        .get("dimension_separator")
+        .and_then(|separator| separator.as_str())
+        .map(String::from);
+
+    if order.is_none() && separator.is_none() {
+        return None;
+    }
+
+    Some(ArrayLayout::V2 { order, separator })
+}
+
+/// Read a Zarr V3 `chunk_key_encoding`, or `None` where there is nothing to
+/// show.
+///
+/// The key is an object naming the scheme that turns a chunk's position in the
+/// grid into an object key, and configuring it:
+///
+/// ```json
+/// "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}}
+/// ```
+///
+/// which reads as `layout: encoding=default, separator="/"`. The name is taken
+/// exactly as stored and checked against no registry, so an extension shows as
+/// `my.chunk.encoding` -- the rule an extension dtype and an extension codec
+/// name already follow.
+///
+/// Only the `separator` is read out of the `configuration`; see `ArrayLayout`
+/// for why the rest is left where it is.
+///
+/// Every part degrades on its own, and preserving the readable half is the
+/// point. An encoding whose `configuration` is missing, is not an object, or
+/// holds a non-string `separator` still shows its name; an object with no
+/// readable `name` still shows a separator that could be read. Only an array
+/// with neither -- no key, a key that is not an object, an object nothing
+/// could be read from -- gets no row and no JSON key. None of it reclassifies
+/// the array, and none of it stops the walk.
+fn layout_v3(value: Option<&Value>) -> Option<ArrayLayout> {
+    let value = value?;
+
+    let encoding = value
+        .get("name")
+        .and_then(|name| name.as_str())
+        .map(String::from);
+
+    // `get` on anything that is not an object is `None`, so a `configuration`
+    // that is a string, a list or missing altogether all land here alike.
+    let separator = value
+        .get("configuration")
+        .and_then(|configuration| configuration.get("separator"))
+        .and_then(|separator| separator.as_str())
+        .map(String::from);
+
+    if encoding.is_none() && separator.is_none() {
+        return None;
+    }
+
+    Some(ArrayLayout::V3 {
+        encoding,
+        separator,
+    })
 }
 
 /// Read a Zarr V3 `dimension_names` as the names to display, or `None` when
@@ -3822,8 +4029,10 @@ fn dataset_paths(value: Option<&Value>) -> Option<Vec<String>> {
 /// `zarr`, `shape`, `chunks` and `dtype` are always printed, in that order. A sharded
 /// array gains a `shards` row between `chunks` and `dtype`; an array whose
 /// metadata declares a fill value gains a `fill` row after `dtype`; an array
-/// that names its dimensions gains a `dimensions` row after that; and an array
-/// declaring a codec chain gains a `codecs` row last. Every other array prints
+/// that names its dimensions gains a `dimensions` row after that; an array
+/// declaring a codec chain gains a `codecs` row; and an array whose document
+/// says anything about chunk order or chunk naming gains a `layout` row last.
+/// Every other array prints
 /// exactly the rows it always has. Whichever row ends up last carries the
 /// closing connector. A field we could not read shows as `?`.
 fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::Result<()> {
@@ -3841,6 +4050,10 @@ fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::
     // order the file declared them, with `?` holding any position we could not
     // name.
     let codecs = meta.codecs.as_deref().map(format_names);
+    // Drawn from whichever variant it is, which is the whole point of its
+    // being an enum: there is no way to reach here holding a V3 array's
+    // `order`.
+    let layout = meta.layout.as_ref().map(ArrayLayout::row);
     // `Value`'s `Display` is compact JSON, which is exactly the rendering this
     // row wants: a string keeps its quotes (`"NaN"`), a JSON null reads as
     // `null` rather than as an empty cell, and a number is the text the file
@@ -3878,13 +4091,21 @@ fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::
         rows.push(("dimensions:", Some(names)));
     }
 
-    // Last of the array's own rows, and only for an array that declares a
-    // chain. It sits here rather than beside `chunks` because it is the other
-    // variable-length list, and two of those read better at the end of the
-    // block than in the middle of the fixed-width rows. "codecs:" is the same
-    // width as "chunks:", so it never widens the block by itself.
+    // Only for an array that declares a chain. It sits here rather than
+    // beside `chunks` because it is the other variable-length list, and two of
+    // those read better at the end of the block than in the middle of the
+    // fixed-width rows. "codecs:" is the same width as "chunks:", so it never
+    // widens the block by itself.
     if let Some(codecs) = codecs.as_deref() {
         rows.push(("codecs:", Some(codecs)));
+    }
+
+    // Last of the array's own rows, after `codecs` because the two answer
+    // neighbouring questions in the order a chunk meets them: what happens to
+    // its bytes, and then where those bytes are keyed. "layout:" is another
+    // seven-character name, so it widens nothing either.
+    if let Some(layout) = layout.as_deref() {
+        rows.push(("layout:", Some(layout)));
     }
 
     // `row` hands back exactly the shape this loop wants: no row at all, or a
@@ -4032,13 +4253,16 @@ fn node_attributes(kind: &NodeKind) -> Option<&Attributes> {
 
 /// An array's fields, with `null` where the tree would print `?`.
 ///
-/// `shards`, `dimension_names`, `fill_value` and `codecs` are the exceptions to
-/// that rule, and are left out altogether rather than written as `null`. The
+/// `shards`, `dimension_names`, `fill_value`, `codecs` and `layout` are the
+/// exceptions to that rule, and are left out altogether rather than written as
+/// `null`. The
 /// two say different things: `null` means the field was looked for and could
 /// not be read, which every array has a shape, chunks and a dtype to be. An
 /// unsharded array has no shards to miss, an array that names no dimensions
-/// has no names to miss, and an array declaring no codec chain has no chain to
-/// miss, so those keys are simply not applicable and do not appear. Inside
+/// has no names to miss, an array declaring no codec chain has no chain to
+/// miss, and an array whose document says nothing about chunk order or chunk
+/// naming has no layout to miss,
+/// so those keys are simply not applicable and do not appear. Inside
 /// `dimension_names` or `codecs` a `null` is a different thing again -- a
 /// position the file declared and we could not name -- and a `fill_value` of
 /// `null` is a third: the value the document itself wrote there.
@@ -4085,7 +4309,47 @@ fn json_array_meta(meta: &ArrayMeta) -> Value {
         value["codecs"] = json!(codecs);
     }
 
+    // An object rather than the row's text, because the row's text is a
+    // rendering and this is the same reading -- `--json` is a second renderer
+    // over one reading, never a second interpretation. Which keys it holds
+    // depends on the variant; see `json_array_layout`.
+    if let Some(layout) = &meta.layout {
+        value["layout"] = json_array_layout(layout);
+    }
+
     value
+}
+
+/// An array's layout as an object holding only the keys its document declared.
+///
+/// The tree's `layout:` row as structured data: `{"order": "C", "separator":
+/// "."}` for a V2 array, `{"encoding": "default", "separator": "/"}` for a V3
+/// one. Never a mixture, because the first key's *name* comes out of the
+/// variant -- a V2 array can no more grow an `encoding` here than it can in
+/// the tree. `separator` is spelled the same either way on purpose: the two
+/// versions call the key different things, but a reader asking
+/// `.array.layout.separator` is asking one question, which is the same reason
+/// the two share a row.
+///
+/// A key that was not readable is left out rather than written as `null`. This
+/// whole object is already the optional kind of field, and a missing
+/// `separator` says one level down exactly what a missing `layout` says one
+/// level up: the document did not say. No `configuration` is carried through
+/// and no specification default is filled in.
+fn json_array_layout(layout: &ArrayLayout) -> Value {
+    let (name, value, separator) = layout.parts();
+
+    let mut json = json!({});
+
+    if let Some(value) = value {
+        json[name] = json!(value);
+    }
+
+    if let Some(separator) = separator {
+        json["separator"] = json!(separator);
+    }
+
+    json
 }
 
 /// What a group is in SpatialData's vocabulary.
@@ -7393,6 +7657,299 @@ mod tests {
     /// An array's codec chain as the tree draws it.
     fn codecs(meta: &ArrayMeta) -> Option<String> {
         meta.codecs.as_deref().map(format_names)
+    }
+
+    /// An array's layout as the tree draws it, or `None` where it draws no
+    /// row at all.
+    fn layout(meta: &ArrayMeta) -> Option<String> {
+        meta.layout.as_ref().map(ArrayLayout::row)
+    }
+
+    /// A V2 `.zarray` carrying whatever layout keys the test wants.
+    fn v2_layout(keys: &str) -> ArrayMeta {
+        array_meta_v2(&format!(
+            r#"{{"zarr_format": 2, "shape": [8], "chunks": [4], "dtype": "<u2"{keys}}}"#
+        ))
+    }
+
+    /// A V3 `zarr.json` carrying whatever `chunk_key_encoding` the test wants.
+    fn v3_layout(encoding: Value) -> ArrayMeta {
+        array_meta_v3(&json!({
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [8],
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
+            "data_type": "uint16",
+            "chunk_key_encoding": encoding,
+        }))
+    }
+
+    #[test]
+    fn a_v2_array_shows_its_order_and_its_dimension_separator() {
+        let meta = v2_layout(r#", "order": "C", "dimension_separator": ".""#);
+
+        // Both halves labelled: how a chunk's values run and what its name
+        // looks like are two facts sharing a row, not one fact.
+        assert_eq!(
+            layout(&meta),
+            Some(String::from(r#"order=C, separator=".""#))
+        );
+        assert_eq!(
+            json_array_meta(&meta)["layout"],
+            json!({"order": "C", "separator": "."})
+        );
+    }
+
+    #[test]
+    fn v2_layout_values_are_passed_through_unchecked() {
+        // Fortran order and a `/` separator, and then values no V2 writer
+        // would produce. Nothing here validates: an out-of-specification value
+        // is a fact about the file, and hiding it would hide the problem.
+        for (keys, row) in [
+            (
+                r#", "order": "F", "dimension_separator": "/""#,
+                r#"order=F, separator="/""#,
+            ),
+            (
+                r#", "order": "diagonal", "dimension_separator": "-""#,
+                r#"order=diagonal, separator="-""#,
+            ),
+            // An empty separator is a value, and the quotes are what make it
+            // visible as one.
+            (r#", "dimension_separator": """#, r#"separator="""#),
+        ] {
+            assert_eq!(layout(&v2_layout(keys)), Some(String::from(row)), "{keys}");
+        }
+    }
+
+    #[test]
+    fn a_v2_array_shows_whichever_of_the_two_keys_it_has() {
+        // No default is invented for the missing half. V2 says an absent
+        // `dimension_separator` means `.`, and that is still not something
+        // this document said.
+        let order = v2_layout(r#", "order": "C""#);
+        assert_eq!(layout(&order), Some(String::from("order=C")));
+        assert_eq!(json_array_meta(&order)["layout"], json!({"order": "C"}));
+
+        let separator = v2_layout(r#", "dimension_separator": "/""#);
+        assert_eq!(layout(&separator), Some(String::from(r#"separator="/""#)));
+        assert_eq!(
+            json_array_meta(&separator)["layout"],
+            json!({"separator": "/"})
+        );
+    }
+
+    #[test]
+    fn a_v2_array_with_no_readable_layout_keys_draws_no_row() {
+        // No keys at all, and then keys whose values are not strings: a value
+        // we cannot show takes the same silence a missing key takes.
+        for keys in [
+            "",
+            r#", "order": 0, "dimension_separator": ["/"]"#,
+            r#", "order": null, "dimension_separator": null"#,
+            r#", "order": {"name": "C"}"#,
+        ] {
+            let meta = v2_layout(keys);
+
+            assert_eq!(meta.layout, None, "{keys}");
+            assert!(!row_text(&meta).contains("layout:"), "{keys}");
+            assert_eq!(json_array_meta(&meta).get("layout"), None, "{keys}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_v2_array_document_declares_no_layout() {
+        // The same degradation every other field takes: text that is not JSON
+        // costs the metadata and nothing else.
+        let meta = array_meta_v2("{not json");
+
+        assert_eq!(meta.layout, None);
+        assert!(!row_text(&meta).contains("layout:"));
+    }
+
+    #[test]
+    fn a_v3_array_shows_its_chunk_key_encoding_and_separator() {
+        let meta = v3_layout(json!({"name": "default",
+                                    "configuration": {"separator": "/"}}));
+
+        assert_eq!(
+            layout(&meta),
+            Some(String::from(r#"encoding=default, separator="/""#))
+        );
+        assert_eq!(
+            json_array_meta(&meta)["layout"],
+            json!({"encoding": "default", "separator": "/"})
+        );
+    }
+
+    #[test]
+    fn a_v3_extension_chunk_key_encoding_is_shown_as_stored() {
+        // Checked against no registry, exactly as an extension dtype and an
+        // extension codec name are not.
+        let meta = v3_layout(json!({"name": "my.chunk.encoding",
+                                    "configuration": {"separator": "-", "base": 16}}));
+
+        assert_eq!(
+            layout(&meta),
+            Some(String::from(r#"encoding=my.chunk.encoding, separator="-""#))
+        );
+        // And `base` -- configuration this tool does not interpret -- reaches
+        // neither renderer.
+        assert!(!row_text(&meta).contains("base"));
+        assert_eq!(
+            json_array_meta(&meta)["layout"],
+            json!({"encoding": "my.chunk.encoding", "separator": "-"})
+        );
+    }
+
+    #[test]
+    fn a_v3_encoding_keeps_whichever_half_it_could_read() {
+        // A name with no readable separator, however the configuration failed.
+        for encoding in [
+            json!({"name": "v2"}),
+            json!({"name": "v2", "configuration": {}}),
+            json!({"name": "v2", "configuration": "/"}),
+            json!({"name": "v2", "configuration": {"separator": 47}}),
+        ] {
+            let meta = v3_layout(encoding.clone());
+
+            assert_eq!(
+                layout(&meta),
+                Some(String::from("encoding=v2")),
+                "{encoding}"
+            );
+            assert_eq!(
+                json_array_meta(&meta)["layout"],
+                json!({"encoding": "v2"}),
+                "{encoding}"
+            );
+        }
+
+        // And a separator with no readable name. Discarding the whole row
+        // would throw away the half that was fine.
+        for encoding in [
+            json!({"configuration": {"separator": "/"}}),
+            json!({"name": 7, "configuration": {"separator": "/"}}),
+        ] {
+            let meta = v3_layout(encoding.clone());
+
+            assert_eq!(
+                layout(&meta),
+                Some(String::from(r#"separator="/""#)),
+                "{encoding}"
+            );
+            assert_eq!(
+                json_array_meta(&meta)["layout"],
+                json!({"separator": "/"}),
+                "{encoding}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_v3_array_with_no_readable_encoding_draws_no_row() {
+        // A missing key, a key that is not an object, and an object with
+        // nothing readable in it. None of them reclassifies the array: it
+        // still reports its shape, its chunks and its dtype.
+        for encoding in [
+            json!(null),
+            json!("default"),
+            json!(["default"]),
+            json!({}),
+            json!({"configuration": {"order": "C"}}),
+        ] {
+            let meta = v3_layout(encoding.clone());
+
+            assert_eq!(meta.layout, None, "{encoding}");
+            assert!(!row_text(&meta).contains("layout:"), "{encoding}");
+            assert_eq!(json_array_meta(&meta).get("layout"), None, "{encoding}");
+            assert_eq!(meta.dtype, Some(String::from("uint16")), "{encoding}");
+            assert_eq!(meta.chunks, dims(Some(&json!([4]))), "{encoding}");
+        }
+
+        // A V3 document with no `chunk_key_encoding` key at all.
+        let bare = array_meta_v3(&json!({"zarr_format": 3, "node_type": "array"}));
+        assert_eq!(bare.layout, None);
+    }
+
+    #[test]
+    fn the_two_versions_never_borrow_each_others_layout_fields() {
+        // The keys are not swappable, and the enum is what makes that true
+        // rather than remembered: a V2 array reading a V3 key, or the reverse,
+        // finds nothing.
+        let v2 = v2_layout(r#", "chunk_key_encoding": {"name": "default"}"#);
+        assert_eq!(v2.layout, None);
+
+        let v3 = v3_layout(json!({"order": "C", "dimension_separator": "."}));
+        assert_eq!(v3.layout, None);
+
+        // And a V2 array's row and JSON never say `encoding`, nor a V3 array's
+        // `order`, whatever the other document happens to hold.
+        let v2 = v2_layout(r#", "order": "C", "dimension_separator": ".""#);
+        assert!(matches!(v2.layout, Some(ArrayLayout::V2 { .. })));
+        assert!(!row_text(&v2).contains("encoding="));
+        assert_eq!(json_array_meta(&v2)["layout"].get("encoding"), None);
+
+        let v3 = v3_layout(json!({"name": "default",
+                                  "configuration": {"separator": ".", "order": "F"}}));
+        assert!(matches!(v3.layout, Some(ArrayLayout::V3 { .. })));
+        assert!(!row_text(&v3).contains("order="));
+        assert_eq!(json_array_meta(&v3)["layout"].get("order"), None);
+    }
+
+    #[test]
+    fn the_layout_row_comes_last_and_leaves_every_other_row_alone() {
+        // Placement against every other row an array can draw, and the whole
+        // block in one assertion so a row moving cannot pass unnoticed.
+        let meta = array_meta_v3(&json!({
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [4096, 4096],
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2048, 2048]}},
+            "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+            "data_type": "uint16",
+            "fill_value": 0,
+            "dimension_names": ["y", "x"],
+            "codecs": [{
+                "name": "sharding_indexed",
+                "configuration": {"chunk_shape": [512, 512], "codecs": [{"name": "bytes"}]}
+            }]
+        }));
+
+        let text = row_text(&meta);
+        let rows: Vec<&str> = text.lines().collect();
+
+        assert_eq!(
+            rows,
+            vec![
+                "├─ zarr:       V3",
+                "├─ shape:      [4096, 4096]",
+                "├─ chunks:     [512, 512]",
+                "├─ shards:     [2048, 2048]",
+                "├─ dtype:      uint16",
+                "├─ fill:       0",
+                "├─ dimensions: y, x",
+                "├─ codecs:     sharding_indexed",
+                r#"└─ layout:     encoding=default, separator="/""#,
+            ],
+            "{text}"
+        );
+
+        // The chunk-key encoding says how a chunk is named; the sharding says
+        // what a chunk is. Neither has moved the other's rows.
+        assert_eq!(
+            json_array_meta(&meta),
+            json!({
+                "shape": [4096, 4096],
+                "chunks": [512, 512],
+                "shards": [2048, 2048],
+                "dtype": "uint16",
+                "fill_value": 0,
+                "dimension_names": ["y", "x"],
+                "codecs": ["sharding_indexed"],
+                "layout": {"encoding": "default", "separator": "/"},
+            })
+        );
     }
 
     /// The rows one array draws, as the text a person would see.

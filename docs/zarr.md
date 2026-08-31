@@ -341,8 +341,9 @@ all V3 nodes cost nothing extra, their attributes being in a file already read.
 Every array prints its format and then three rows. A sharded V3 array prints a
 `shards` row after its chunks, an array that declares a fill value prints a
 `fill` row after its dtype, a V3 array that names its dimensions prints a
-`dimensions` row after that, and an array declaring a codec chain prints a
-`codecs` row last:
+`dimensions` row after that, an array declaring a codec chain prints a `codecs`
+row, and an array whose document says anything about chunk order or chunk
+naming prints a `layout` row last:
 
 ```
 ├─ zarr:       V3
@@ -352,7 +353,8 @@ Every array prints its format and then three rows. A sharded V3 array prints a
 ├─ dtype:      uint16
 ├─ fill:       0
 ├─ dimensions: c, y, x
-└─ codecs:     sharding_indexed
+├─ codecs:     sharding_indexed
+└─ layout:     encoding=default, separator="/"
 ```
 
 `shape`, `chunks` and `dtype` are always drawn, showing `?` when the field
@@ -361,9 +363,10 @@ absence is information. `shards` is drawn only for an array that named the
 sharding codec; an unsharded array has no shards to be missing. `fill` is drawn
 only for an array whose document has a `fill_value` key — see
 [Fill values](#fill-values). `dimensions` is drawn only for a V3 array that
-declared `dimension_names` — see [Dimension names](#dimension-names). `codecs`
-is drawn last, and only for an array declaring a chain — see
-[Codecs](#codecs). The row names are padded to the longest one actually
+declared `dimension_names` — see [Dimension names](#dimension-names). `codecs` is drawn only for an array
+declaring a chain — see [Codecs](#codecs). `layout` is drawn last, and only
+where the document said something about it — see
+[Chunk layout](#chunk-layout). The row names are padded to the longest one actually
 printed, so an array with no `dimensions` row is laid out exactly as it always
 was.
 
@@ -539,6 +542,126 @@ left with no chain at all gets no row and no JSON key.
 
 Both keys are in documents already parsed for `shape` and `dtype`, so the
 chain costs no extra request anywhere.
+
+## Chunk layout
+
+Both Zarr versions let an array say something about how its chunks are ordered
+and how they are named, and neither says it the same way. One row answers the
+question for both:
+
+```
+└─ layout: order=C, separator="."
+```
+```
+└─ layout: encoding=default, separator="/"
+```
+
+The first is a V2 array, the second a V3 one. **The label is shared; the model
+is not.** Each half is named because the two are unrelated facts sharing a row
+for brevity — how a chunk's values run in memory is not what a chunk's object
+key looks like — and a bare `C, "."` would read as though they were one thing.
+The row groups them so the question *how is this array laid out, and how are
+its chunks keyed?* can be asked without first knowing which version wrote the
+store; it does not claim the two versions model the same thing.
+
+The separator keeps its quotes for the same reason a fill value keeps its JSON
+spelling: `separator=.` ends a row in what looks like a full stop, and a
+`separator=""` — a value a document may really hold — would otherwise show
+nothing at all.
+
+**Nothing is checked and nothing is built.** An `order` is not required to be
+`C` or `F` here, a separator is not required to be `.` or `/`, and an encoding
+name is not looked up in any registry. No chunk key is ever constructed,
+guessed at or looked for — that would be a chunk read, which is the boundary
+[Arrays are leaves](#arrays-are-leaves) draws. This row reports what the
+document says about chunk naming; it never goes to see.
+
+### V2: order and dimension_separator
+
+V2 puts two independent keys in `.zarray`:
+
+```json
+"order": "C",
+"dimension_separator": "/"
+```
+
+`order` says whether a chunk's values run C-first or Fortran-first.
+`dimension_separator` says what goes between the indices in a chunk's name, so
+that chunk `(0, 1)` is stored as `0.1` or as `0/1`. Together they read as
+`layout: order=C, separator="/"`.
+
+### V3: chunk_key_encoding
+
+V3 has neither key. It has one object naming the scheme that turns a chunk's
+position in the grid into an object key, and configuring it:
+
+```json
+"chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}}
+```
+
+which reads as `layout: encoding=default, separator="/"`. The name is shown
+exactly as stored, so an extension encoding is displayed rather than judged —
+the rule an extension dtype and an extension codec name already follow:
+
+```
+└─ layout: encoding=my.chunk.encoding, separator="-"
+```
+
+**Only the `separator` is read out of the `configuration`.** Everything else in
+there is what a *reader* needs in order to build a key, and nothing here builds
+keys; that is the same boundary an extension dtype's and a codec's
+configuration sit behind.
+
+V3's `chunk_key_encoding` says how a chunk is *named*. Sharding says what a
+chunk *is*. They are different questions and are reported separately: a sharded
+array's grid is already described by its `chunks` and `shards` rows, and no
+attempt is made to derive the names of the chunks inside a shard — see
+[Sharding](#sharding).
+
+### No default is invented
+
+**A key the document does not carry contributes nothing.** V2 says an absent
+`dimension_separator` means `.`; that is still not something this document
+said, and printing it would be synthesising a normalised metadata document
+rather than reporting the one on disk. So an array declaring only an `order`
+shows only that:
+
+```
+└─ layout: order=F
+```
+
+and an array declaring neither key prints no row at all and carries no JSON
+key. This is the rule `shards`, `dimension_names` and `codecs` already follow —
+a field with nothing to report does not report, and no `layout: default` is
+invented.
+
+### Malformed metadata keeps the readable half
+
+The two halves degrade independently, and whichever survives is shown. A V3
+encoding whose `configuration` is missing, is not an object, or holds a
+non-string `separator` still shows its name:
+
+```
+└─ layout: encoding=v2
+```
+
+and an encoding object with no readable `name` still shows a separator that
+could be read:
+
+```
+└─ layout: separator="/"
+```
+
+There is no `?` here, unlike a codec chain: a codec's position has to be held
+because dropping it would claim a shorter chain than the file declares, whereas
+these are two independent named facts and leaving one out overstates nothing.
+An array with *nothing* readable — no key, a key that is not an object, an
+object nothing could be read from, a `.zarray` that is not JSON — gets no row
+and no JSON key. None of it reclassifies the array, and none of it stops the
+walk.
+
+Both versions' keys are in documents already parsed for `shape` and `dtype`, so
+the row costs no extra request anywhere.
 
 ## Arrays are leaves
 
@@ -808,7 +931,7 @@ shape in the [Command-line reference](cli.md#json-output).)
 | `kind` | `"group"`, `"array"` or `"unknown"` |
 | `zarr_format` | `2` or `3`, the number Zarr itself stamps into its metadata files. Absent on an `[unknown]` node — see [Format version](#format-version). |
 | `children` | The child nodes, in the order the tree lists them. Empty for an array, and empty at the depth limit. |
-| `array` | `shape`, `chunks`, `dtype`, `shards` on a sharded V3 array, `fill_value` where the document declares one, `dimension_names` on a V3 array that declares them, and `codecs` where a chain is declared. |
+| `array` | `shape`, `chunks`, `dtype`, `shards` on a sharded V3 array, `fill_value` where the document declares one, `dimension_names` on a V3 array that declares them, `codecs` where a chain is declared, and `layout` where the document says anything about chunk order or naming. |
 | `attributes` | The node's user attributes, with `--attributes` only. Values keep their JSON types; `null` where the document could not be read. Absent where there are none. |
 
 ```
@@ -832,9 +955,9 @@ Two rules govern the `array` object:
 - A field that was looked for and could not be read is `null`, the same thing
   the tree draws as `?`. `shape`, `chunks` and `dtype` are therefore always
   present.
-- `shards`, `fill_value`, `dimension_names` and `codecs` are **omitted
-  entirely** where they do not apply, rather than written as `null`. The two
-  say different things: `null` means "looked for, not readable", and an
+- `shards`, `fill_value`, `dimension_names`, `codecs` and `layout` are
+  **omitted entirely** where they do not apply, rather than written as `null`.
+  The two say different things: `null` means "looked for, not readable", and an
   unsharded array has no shards to miss, just as an array naming no dimensions
   has no names to miss and an array declaring no processing has no chain to
   miss.
@@ -861,6 +984,23 @@ in order followed by `compressor`:
 ```json
 "codecs": ["delta", "blosc"]
 ```
+
+`layout` is an object, never the row's text, and its keys are the ones the
+document gave — the same omission rule one level down. The two versions never
+share a spelling, so which keys are present also says which model was read:
+
+```json
+"layout": {"order": "C", "separator": "."}
+```
+```json
+"layout": {"encoding": "default", "separator": "/"}
+```
+
+`separator` is spelled the same in both on purpose: the two versions call the
+key different things, but a reader asking `.array.layout.separator` is asking
+one question — which is the same reason the two share a row. No
+`configuration` is carried through and no specification default is filled in;
+see [Chunk layout](#chunk-layout).
 
 Object keys come out in alphabetical order — `serde_json`'s default, kept
 rather than fought.
@@ -962,6 +1102,12 @@ enough to run against a remote store at all.
 - **Codec execution, instantiation and configuration.** A chain is listed by
   name; no codec is run, no `configuration` is read or shown, and no name is
   checked against a registry — see [Codecs](#codecs).
+- **Chunk-key construction.** The layout row reports what a document says
+  about chunk order and chunk naming; no chunk key is built from it, guessed
+  at, enumerated or looked for, and a V3 `configuration` is not read beyond its
+  `separator` — see [Chunk layout](#chunk-layout). Nothing about the layout is
+  checked either: an `order` outside `C`/`F`, an unusual separator and an
+  unknown encoding name are all displayed as stored.
 - **Fill-value interpretation.** The value is shown as the document wrote it
   and nothing more: `"NaN"` is a string, not a float; no value is decoded,
   normalised, or checked against the array's dtype — see
