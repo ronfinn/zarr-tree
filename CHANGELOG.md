@@ -12,6 +12,14 @@ with the pre-1.0 caveat that the output format is not yet stable.
 
 ### Added
 
+- `--attributes` shows each node's user attributes as stored — V2 `.zattrs`,
+  V3 `attributes` — as compact JSON on one row, and as a real `attributes`
+  object in `--json`. Nothing is interpreted or promoted to a field of its
+  own, and keys are sorted so output is stable. A node with no attributes, or
+  an empty `{}`, gains no row; a document that is there and unreadable shows
+  `?` and `null` rather than passing for an empty one. Off by default, so the
+  default output is unchanged; refused with `--validate`, which reports
+  findings rather than nodes.
 - Zarr V3 arrays that declare `dimension_names` show them on a `dimensions`
   row and in `--json`. A dimension the file left `null` keeps its position,
   printing as `?` and staying `null` in JSON; an array that names no

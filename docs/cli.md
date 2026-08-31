@@ -28,6 +28,7 @@ rather than being an error.
 | `--depth` | `<N>` | Descend at most `N` levels below the root. Omitted, the whole store is walked. |
 | `--json` | — | Print the same walk as one JSON document instead of a tree. |
 | `--validate` | — | Check the structure the metadata declares, instead of printing the tree. |
+| `--attributes` | — | Show each node's user attributes as stored, alongside the rows already printed. |
 | `-h`, `--help` | — | Print the help text and exit 0. |
 | `-V`, `--version` | — | Print the version and exit 0. |
 
@@ -189,6 +190,72 @@ Three properties are worth stating exactly:
 `--depth` combines with `--json`. It is refused with `--validate` — see
 [Option combinations](#option-combinations).
 
+## Attributes
+
+`--attributes` shows each node's user attributes as the store holds them. It is
+off by default, and the default output is exactly what it was without it.
+
+```
+$ zarr-tree --attributes experiment.zarr
+experiment.zarr [group]
+├─ attributes: {"batch":3,"experiment":"A","instrument":{"model":"X"}}
+└── image [group, OME-Zarr 0.4]
+    ├─ axes: y, x
+    ├─ pyramid levels: 1
+    ├─ datasets: 0
+    ├─ attributes: {"multiscales":[{"axes":[…],"datasets":[…],"version":"0.4"}]}
+    └── 0 [array]
+        ├─ shape:      [64, 64]
+        ├─ chunks:     [32, 32]
+        ├─ dtype:      |u1
+        └─ attributes: {"unit":"nm"}
+```
+
+One flag covers both Zarr versions: V2's `.zattrs` file and V3's `attributes`
+member arrive under the same `attributes:` row, and the same `attributes` key
+in `--json`. Groups and arrays both have them.
+
+**Nothing is interpreted.** The object is printed as compact JSON on one line,
+with keys sorted so a store prints the same thing on every run. Values keep
+their types in `--json` — numbers stay numbers, `null` stays `null`, nested
+objects and lists stay themselves — and no key is turned into a row of its own.
+`{"batch": 3}` is shown as it is written, never as a `batch: 3` field, because
+that would make an arbitrary user key look like something this tool understands.
+
+**Raw and interpreted are both shown.** A row like `axes:` is *this tool's
+reading* of the group's `multiscales` key; the `attributes:` row is the document
+that reading came out of. So `multiscales`, `ome`, `spatialdata_attrs` and
+`encoding-type` all appear in the raw object, directly beneath the rows derived
+from them. Nothing is filtered out — the flag means "show what the store
+actually contains" — and no semantic recognition changes when it is passed.
+
+| The node's attributes | Tree | `--json` |
+| --- | --- | --- |
+| Absent — no `.zattrs`, no `attributes` member | no row | no key |
+| An empty object, `{}` | no row | no key |
+| A non-empty object | `attributes: {…}` | the object, values intact |
+| Unreadable — a `.zattrs` that is not JSON, or an `attributes` member that is not an object | `attributes: ?` | `null` |
+
+An empty object earns no row because `{}` is what a great many nodes carry —
+zarr-python writes it into every group and array it creates — and a row on all
+of them would bury the few nodes that say something. An *unreadable* one is
+kept distinct from both: `?` and `null` say there is a document here that could
+not be read, which is not the same as there being nothing to show. This is the
+same rule the rest of the tool follows for malformed metadata, and a bad
+`.zattrs` never stops the walk or downgrades an otherwise recognisable node.
+
+`--attributes` combines with `--depth` and `--json`. It is refused with
+`--validate` — see [Option combinations](#option-combinations).
+
+### Cost
+
+Attributes come out of metadata the walk already reads, with one exception: a
+**Zarr V2 array** keeps its attributes in a `.zattrs` beside the `.zarray`,
+which a default walk never opens. Asking for attributes opens it, so
+`--attributes` costs one extra read per V2 array — and only per V2 array, only
+when the flag is passed. V2 groups and every V3 node cost nothing extra, because
+their attributes are in a file already parsed.
+
 ## JSON output
 
 `--json` prints the same walk as one JSON document.
@@ -237,6 +304,7 @@ applies to it:
 | `spatialdata` | SpatialData nodes | `kind`, `version`, and `regions`/`region_key`/`instance_key` on a table |
 | `parquet` | points and shapes elements with a payload | `rows`, `columns`, `files`, `schema` |
 | `anndata` | SpatialData tables | `encoding_version`, `observations`, `variables`, `obs_columns`, `var_columns`, `x` |
+| `attributes` | groups and arrays, with `--attributes` only | The node's user attributes as stored, values intact. `null` when unreadable; absent when there are none |
 
 The per-format field meanings live with the formats: [Zarr JSON](zarr.md#json-representation),
 [OME-Zarr JSON](ome-zarr.md#json-representation) and
@@ -447,7 +515,7 @@ no policy engine, and no way to add an eighth from outside the source.
 
 | # | Area | Check | Severities it can produce |
 | --- | --- | --- | --- |
-| 1 | Zarr | Every node walked into could be identified, and an array's `shape`, `chunks`, — when sharded — `shards` and — when declared — `dimension_names` agree on how many dimensions there are. Codecs, fill values and dtypes are not checked, and neither is what a dimension name says. | `PASS`, `WARN`, `ERROR` |
+| 1 | Zarr | Every node walked into could be identified, and an array's `shape`, `chunks` — when sharded, `shards` — and, when declared, `dimension_names` agree on how many dimensions there are. Codecs, fill values and dtypes are not checked, and neither is what a dimension name says. | `PASS`, `WARN`, `ERROR` |
 | 2 | OME-Zarr | Every `multiscales[0].datasets[].path` names a node that exists and is an array. | `PASS`, `WARN`, `ERROR` |
 | 3 | OME-Zarr | Every resolution level has the same number of dimensions, and the same number as the multiscale declares axes. No scale, resolution or downsampling factor is looked at. | `PASS`, `ERROR` |
 | 4 | HCS | Every path in a plate's `wells` list names a group that exists. Acquisitions and fields of view are not checked; a well itself is checked for nothing. | `PASS`, `WARN`, `ERROR` |
@@ -700,6 +768,7 @@ usage: zarr-tree [OPTIONS] <STORE>
 | `--depth` with nothing after it | `--depth needs a number, as in --depth 2` |
 | `--depth` given a non-number or a negative number | `--depth needs a whole number, not "two"` |
 | `--depth` with `--validate` | `--depth cannot be combined with --validate` |
+| `--attributes` with `--validate` | `--attributes cannot be combined with --validate` |
 
 Store errors print a message and exit 1, with **no** usage line — the command
 was well formed, the store was not:
@@ -768,21 +837,30 @@ zarr-tree --help | grep -q -- --validate && echo present
 | `--depth` + `--json` | Yes |
 | `--validate` + `--json` | Yes |
 | `--validate` + `--depth` | **No** — refused with a message |
+| `--attributes` + `--depth` | Yes |
+| `--attributes` + `--json` | Yes |
+| `--validate` + `--attributes` | **No** — refused with a message |
 | The same flag repeated | Yes — it asks for the same thing twice |
 | `--help` or `--version` with anything else | Yes — they answer and exit |
 | Options before or after the store | Yes |
 
-The one refusal:
+Both refusals involve `--validate`, for two different reasons:
 
 ```
 $ zarr-tree --validate --depth 1 example.zarr
 error: --depth cannot be combined with --validate
 usage: zarr-tree [OPTIONS] <STORE>
+
+$ zarr-tree --validate --attributes example.zarr
+error: --attributes cannot be combined with --validate
+usage: zarr-tree [OPTIONS] <STORE>
 ```
 
-It is refused rather than quietly ignored because the two options cannot both
-mean what they say at once. See
-[How a run is ordered](#how-a-run-is-ordered).
+`--depth` is refused because the two options cannot both mean what they say at
+once — see [How a run is ordered](#how-a-run-is-ordered). `--attributes` is
+refused because `--validate` does not print nodes at all: it prints findings
+about them, and an attributes row has nowhere to go in one. Neither is quietly
+ignored.
 
 ## What a run will never do
 

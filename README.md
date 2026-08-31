@@ -378,6 +378,7 @@ zarr-tree https://example.org/example.zarr
 | `--depth <N>` | Descend at most N levels below the root. Arrays are leaves at any depth. |
 | `--json` | Print the same walk as one JSON document. Combines with `--depth` and `--validate`. |
 | `--validate` | Check the structure the metadata declares against the store, and print findings instead of the tree. |
+| `--attributes` | Show each node's user attributes as stored, uninterpreted. Combines with `--depth` and `--json`; not with `--validate`. |
 | `-h`, `--help` | Print help. |
 | `-V`, `--version` | Print version. |
 
@@ -634,8 +635,9 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
   exists at all. On a prefix holding a very large number of loose objects that
   listing is paginated to the end.
 - Only `shape`, `chunks`/`chunk_shape`, `dtype`/`data_type`, the shard shape
-  and a V3 array's `dimension_names` are read. Compressors, fill values and
-  user attributes are not shown, `codecs` is read for the sharding codec alone,
+  and a V3 array's `dimension_names` are read. Compressors and fill values are
+  not shown, user attributes only on request and only as stored (see
+  `--attributes`), `codecs` is read for the sharding codec alone,
   V2 dtypes are passed through as stored, and a V3 dtype in object form is
   reported by its name alone — see
   [docs/zarr.md](docs/zarr.md#deliberately-not-implemented).

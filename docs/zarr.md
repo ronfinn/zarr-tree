@@ -217,6 +217,52 @@ Only rows this program actually reads:
 | Consolidation | `.zmetadata` at the root | inline `consolidated_metadata` in the root `zarr.json` |
 | OME-Zarr metadata | keys at the top level of `.zattrs` | `attributes.ome` |
 
+## User attributes
+
+Both versions let a node carry arbitrary user attributes, in the two places the
+table above names: a `.zattrs` file of its own in V2, an `attributes` member of
+`zarr.json` in V3. They are not shown by default. `--attributes` shows them,
+under one row name for both versions:
+
+```
+$ zarr-tree --attributes example.zarr
+example.zarr [group]
+├─ attributes: {"batch":3,"experiment":"A"}
+└── img [array]
+    ├─ shape:      [64, 64]
+    ├─ chunks:     [32, 32]
+    ├─ dtype:      |u1
+    └─ attributes: {"unit":"nm"}
+```
+
+The object is printed exactly as stored, as compact JSON on one line, with keys
+sorted so the same store always prints the same text. Nothing in it is
+interpreted: no key becomes a row of its own, because an arbitrary user key is
+not something this program understands and dressing it up as one would say
+otherwise. `--json` carries the same object with its values' types intact.
+
+Attributes this program *does* read — `multiscales`, `ome`,
+`spatialdata_attrs`, `encoding-type` — are not filtered out of the raw object.
+The semantic rows above it are this tool's reading; the attributes row is the
+document that reading came from, and seeing both is the point.
+
+| The node's attributes | Tree | `--json` |
+| --- | --- | --- |
+| Absent, or an empty object | no row | no key |
+| A non-empty object | `attributes: {…}` | the object, values intact |
+| Unreadable — a `.zattrs` that is not JSON, or an `attributes` member that is not an object | `attributes: ?` | `null` |
+
+An empty `{}` earns no row: zarr-python writes one into every node it creates,
+so a row on all of them would bury the nodes that say something. An unreadable
+document is kept distinct from an absent one — the `?`/`null` rule the rest of
+this reference describes for [malformed
+metadata](#unknown-and-malformed-nodes) — so a bad `.zattrs` is never passed
+off as a node with nothing to say, and never stops the walk.
+
+One note on cost: a **V2 array** keeps its attributes in a file a default walk
+never opens, so `--attributes` costs one extra read per V2 array. V2 groups and
+all V3 nodes cost nothing extra, their attributes being in a file already read.
+
 ## Arrays and their metadata
 
 Every array prints three rows. A sharded V3 array prints a `shards` row after
@@ -498,6 +544,7 @@ shape in the [Command-line reference](cli.md#json-output).)
 | `kind` | `"group"`, `"array"` or `"unknown"` |
 | `children` | The child nodes, in the order the tree lists them. Empty for an array, and empty at the depth limit. |
 | `array` | `shape`, `chunks`, `dtype`, `shards` on a sharded V3 array, and `dimension_names` on a V3 array that declares them. |
+| `attributes` | The node's user attributes, with `--attributes` only. Values keep their JSON types; `null` where the document could not be read. Absent where there are none. |
 
 ```
 $ zarr-tree --json sharded.zarr | jq '.children[0]'
@@ -628,11 +675,14 @@ enough to run against a remote store at all.
 - **Complete Zarr specification validation.** `--validate` checks a store
   against its own declarations, never a document against a schema.
 - **Store repair, rewriting or writing of any kind.**
-- **Compressors, fill values and user attributes.** Attributes are read only
-  for the OME-Zarr and SpatialData markers, and are never displayed as
-  attributes. A V3 array's `dimension_names` are shown, but only as stored —
-  they are not checked against the shape, matched against OME-Zarr axes, or
-  used to filter or reorder anything.
+- **Compressors and fill values.**
+- **Interpretation of user attributes.** They are shown on request, and only as
+  stored — see [User attributes](#user-attributes). Beyond the OME-Zarr and
+  SpatialData markers this program already reads, no attribute key is given a
+  meaning, promoted to a row of its own, checked, or used to filter or reorder
+  anything. A V3 array's `dimension_names` are shown on the same terms: as
+  stored, not matched against OME-Zarr axes, and checked only for how many
+  there are.
 - **dtype translation and interpretation.** V2 dtypes are passed through in
   NumPy notation and are never mapped onto V3 names. A V3 extension dtype is
   reported by its name alone: its `configuration` is not shown, not checked and

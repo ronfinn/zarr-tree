@@ -2574,3 +2574,205 @@ fn v3_dimension_names_are_shown_and_a_v2_array_is_unchanged() {
         json!({ "shape": [2, 3, 4], "chunks": [2, 3, 4], "dtype": "<u2" })
     );
 }
+
+/// A small store touching everything `--attributes` has to get right: a V3
+/// root with values of every JSON kind, a V2 group whose attributes are also
+/// OME-Zarr metadata, a V2 array, an empty attributes object, and a `.zattrs`
+/// that is not JSON.
+const ATTRIBUTED: &[(&str, &str)] = &[
+    (
+        "zarr.json",
+        r#"{"zarr_format": 3, "node_type": "group", "attributes": {
+            "experiment": "A", "batch": 3, "ok": true, "note": null,
+            "instrument": {"model": "X"}, "tags": ["a", "b"]}}"#,
+    ),
+    ("image/.zgroup", r#"{"zarr_format": 2}"#),
+    (
+        "image/.zattrs",
+        r#"{"multiscales": [{"version": "0.4",
+            "axes": [{"name": "y", "type": "space"}, {"name": "x", "type": "space"}],
+            "datasets": [{"path": "0"}]}]}"#,
+    ),
+    (
+        "image/0/.zarray",
+        r#"{"shape": [64, 64], "chunks": [32, 32], "dtype": "|u1", "zarr_format": 2}"#,
+    ),
+    ("image/0/.zattrs", r#"{"unit": "nm"}"#),
+    (
+        "empty/zarr.json",
+        r#"{"zarr_format": 3, "node_type": "group", "attributes": {}}"#,
+    ),
+    ("bad/.zgroup", r#"{"zarr_format": 2}"#),
+    ("bad/.zattrs", "{not json"),
+];
+
+#[test]
+fn the_default_output_is_unchanged_by_the_attributes_feature_existing() {
+    // The promise the whole flag rests on. Every node in this store carries
+    // attributes, and a plain walk mentions none of them -- while still
+    // reading the ones it always read, which is why the OME-Zarr tag and its
+    // axes row are asserted here too.
+    // The fixture directory deliberately avoids the word this test is looking
+    // for: the root's own line is its path, and a directory called
+    // `attributes-default` would satisfy the assertion below on its own.
+    let dir = fixture_dir("raw-meta-default");
+    write_store(&dir, ATTRIBUTED);
+
+    let output = run(&[dir.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert!(output.status.success(), "{stdout}");
+    assert!(!stdout.contains("attributes"), "{stdout}");
+    // What the walk did read out of those same files is untouched.
+    assert!(stdout.contains("[group, OME-Zarr 0.4]"), "{stdout}");
+    assert!(
+        lines(&stdout).iter().any(|line| line == "axes: y, x"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn attributes_are_shown_for_v2_and_v3_nodes_alike() {
+    // One flag, one row name, whichever version wrote the node: V3's
+    // `attributes` member and V2's `.zattrs` file both arrive as
+    // `attributes:`. Compact JSON on one line, with keys sorted so the output
+    // is the same on every run.
+    let dir = fixture_dir("raw-meta-tree");
+    write_store(&dir, ATTRIBUTED);
+
+    let output = run(&["--attributes", dir.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert!(output.status.success(), "{stdout}");
+    let lines = lines(&stdout);
+
+    for expected in [
+        // V3 group. Every value kept as it was written -- a nested object, a
+        // list, a number, a boolean and a null -- and nothing flattened into
+        // rows of its own.
+        r#"attributes: {"batch":3,"experiment":"A","instrument":{"model":"X"},"note":null,"ok":true,"tags":["a","b"]}"#,
+        // V2 array, out of a `.zattrs` only this flag opens.
+        r#"attributes: {"unit":"nm"}"#,
+        // A document that is there and is not readable. Not the same as a
+        // node with nothing to say, and not allowed to look like one.
+        "attributes: ?",
+    ] {
+        assert!(
+            lines.iter().any(|line| line == expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
+    }
+
+    // The V2 group's attributes are its OME-Zarr metadata, shown raw *and*
+    // interpreted: the semantic rows are this tool's reading, the attributes
+    // row is what it read. Neither replaces the other.
+    assert!(stdout.contains("[group, OME-Zarr 0.4]"), "{stdout}");
+    assert!(lines.iter().any(|line| line == "axes: y, x"), "{stdout}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with(r#"attributes: {"multiscales":"#)),
+        "{stdout}"
+    );
+
+    // An empty object earns no row: `{}` is what a great many nodes carry,
+    // and a row on every one of them would bury the nodes that say something.
+    assert!(!stdout.contains("attributes: {}"), "{stdout}");
+}
+
+#[test]
+fn attributes_json_keeps_native_values_and_only_appears_when_asked_for() {
+    // The JSON contract, both halves. Without the flag there is no such key
+    // anywhere; with it the values are real JSON -- a number is a number and a
+    // null is a null -- rather than the one-line text the tree draws.
+    let dir = fixture_dir("raw-meta-json");
+    write_store(&dir, ATTRIBUTED);
+
+    let plain = run(&["--json", dir.to_str().unwrap()]);
+    let plain_stdout = String::from_utf8_lossy(&plain.stdout);
+    let output = run(&["--attributes", "--json", dir.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert!(plain.status.success(), "{plain_stdout}");
+    assert!(!plain_stdout.contains("attributes"), "{plain_stdout}");
+
+    assert!(output.status.success(), "{stdout}");
+    let root: Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    assert_eq!(
+        root["attributes"],
+        json!({"experiment": "A", "batch": 3, "ok": true, "note": null,
+               "instrument": {"model": "X"}, "tags": ["a", "b"]}),
+        "{stdout}"
+    );
+
+    let child = |name: &str| {
+        root["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} child in {stdout}"))
+            .clone()
+    };
+
+    // An unreadable document is `null`, the rule every other section already
+    // follows -- and quite different from having no key at all.
+    assert_eq!(child("bad")["attributes"], Value::Null, "{stdout}");
+    // An empty one has no key, matching the tree's missing row.
+    assert!(child("empty").get("attributes").is_none(), "{stdout}");
+
+    // On an array the key sits on the node beside `array`, not inside it: a
+    // reader looks for a node's attributes, not its array's.
+    let level = &child("image")["children"][0];
+    assert_eq!(level["attributes"], json!({"unit": "nm"}), "{stdout}");
+    assert_eq!(level["array"]["dtype"], "|u1", "{stdout}");
+    assert!(level["array"].get("attributes").is_none(), "{stdout}");
+
+    // Raw and interpreted side by side, neither derived from the other.
+    let image = child("image");
+    assert_eq!(image["ome"]["version"], "0.4", "{stdout}");
+    assert!(image["attributes"]["multiscales"].is_array(), "{stdout}");
+}
+
+#[test]
+fn attributes_is_refused_alongside_validate_and_offered_in_the_help() {
+    // `--validate` prints findings about nodes rather than the nodes
+    // themselves, so an attributes row has nowhere to go. Refused in the same
+    // words `--depth` is, rather than half of what was typed being ignored.
+    let dir = fixture_dir("raw-meta-validate");
+    write_store(&dir, ATTRIBUTED);
+
+    let output = run(&["--validate", "--attributes", dir.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Refused on the command line, before the store is touched -- so status 1,
+    // the command-line failure, and never the 2 a validation error would give.
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("--attributes cannot be combined with --validate"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "nothing should be printed");
+
+    // It does compose with the other two, which is the difference.
+    for args in [
+        vec!["--attributes", "--depth", "0"],
+        vec!["--attributes", "--json", "--depth", "1"],
+    ] {
+        let mut args = args;
+        args.push(dir.to_str().unwrap());
+        let output = run(&args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{args:?}: {stdout}");
+        assert!(stdout.contains("experiment"), "{args:?}: {stdout}");
+    }
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    let help = run(&["--help"]);
+    let stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(stdout.contains("--attributes"), "{stdout}");
+}

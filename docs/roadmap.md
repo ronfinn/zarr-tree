@@ -17,7 +17,6 @@ Work that is intended, small, and consistent with the current design.
 - Expanding metadata-only structural validation, within the existing model —
   findings over metadata already read, no schema and no rule engine.
 - Improving how OME-Zarr metadata is presented.
-- Showing a node's user attributes on request.
 - Small usability fixes that come out of running the tool against real public
   stores.
 

@@ -14,7 +14,7 @@ use object_store::{ClientConfigKey, GetOptions, GetRange, ObjectStore, ObjectSto
 use parquet::basic::LogicalType;
 use parquet::file::metadata::{FooterTail, ParquetMetaData, ParquetMetaDataReader};
 use parquet::schema::types::Type as SchemaType;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::runtime::Runtime;
 use url::Url;
 
@@ -68,6 +68,15 @@ struct GroupMeta {
     /// rarest -- a store has one table and thousands of ordinary groups. The
     /// box keeps all of them small.
     anndata: Option<Box<AnnData>>,
+    /// The group's user attributes, kept as stored, and only when
+    /// `--attributes` asked for them. `Absent` otherwise, which is what every
+    /// group has by default.
+    ///
+    /// This is the raw document the four fields above are *read out of*, not a
+    /// fifth reading of it. They interpret selected keys and this interprets
+    /// nothing, so a group carrying `multiscales` shows it here as well as in
+    /// its OME rows -- see `Attributes`.
+    attributes: Attributes,
 }
 
 /// What the AnnData object inside a SpatialData table declares about itself.
@@ -172,6 +181,72 @@ struct ParquetSummary {
     /// columns are not expanded: a group column is one column here, as it is
     /// to a reader of the table.
     columns: Vec<ParquetColumn>,
+}
+
+/// A node's user attributes, as `--attributes` found them.
+///
+/// Three answers rather than an `Option<Map<..>>`, for the reason `Payload`
+/// has three: "this node has no attributes" and "this node has attributes and
+/// they could not be read" are different facts, and printing the same blank
+/// for both would quietly pass a broken `.zattrs` off as an empty one.
+///
+/// `Absent` is also what every node gets when `--attributes` was not asked
+/// for. That is what keeps the default output byte-for-byte what it was: the
+/// flag decides whether the field is ever filled in, and both renderers then
+/// simply draw what is there.
+///
+/// An attributes object that is present and *empty* is `Absent` too, decided
+/// here rather than in the renderers -- see `attributes_from`.
+enum Attributes {
+    /// No attributes to show: no `.zattrs`, no `attributes` member, an empty
+    /// object, or `--attributes` was not asked for.
+    Absent,
+    /// There is an attributes document and it is not a usable object -- a
+    /// `.zattrs` that is not JSON, or an `attributes` member that is not an
+    /// object. Shown as `?` and as `null`, never as no attributes at all.
+    Unreadable,
+    /// The attributes as stored, with nothing interpreted, renamed or
+    /// removed. A `Map` rather than a bare `Value` because this is the one
+    /// JSON shape attributes are allowed to have, and holding the map says so
+    /// without re-checking at every use.
+    Present(Map<String, Value>),
+}
+
+impl Attributes {
+    /// The text an `attributes:` row shows, in the shape both renderers want.
+    ///
+    /// The outer `Option` is whether there is a row at all; the inner one is
+    /// whether that row can say anything better than `?`. That is exactly the
+    /// `Option<&str>` shape `print_array_meta` already feeds its rows, so the
+    /// array side needs no rule of its own.
+    ///
+    /// Compact one-line JSON, because arbitrary attributes have to fit a tree
+    /// row. Keys come out sorted: `serde_json::Map` is a `BTreeMap` here (the
+    /// `preserve_order` feature is off), so the same store always prints the
+    /// same line -- file order is not preserved and is not promised.
+    fn row(&self) -> Option<Option<String>> {
+        match self {
+            Attributes::Absent => None,
+            Attributes::Unreadable => Some(None),
+            // A map that would not serialise degrades to the same `?` an
+            // unreadable one gets, rather than bringing the walk down.
+            Attributes::Present(map) => Some(serde_json::to_string(map).ok()),
+        }
+    }
+
+    /// The `attributes` field for a JSON node, or `None` for no field.
+    ///
+    /// The values are the ones the file held -- strings, numbers, booleans,
+    /// nulls, arrays and nested objects all survive as themselves, because
+    /// nothing here turns them into text. `Unreadable` is `null`, the same
+    /// way an unreadable Parquet payload is.
+    fn json(&self) -> Option<Value> {
+        match self {
+            Attributes::Absent => None,
+            Attributes::Unreadable => Some(Value::Null),
+            Attributes::Present(map) => Some(Value::Object(map.clone())),
+        }
+    }
 }
 
 /// What became of a SpatialData element's Parquet payload.
@@ -314,6 +389,15 @@ struct ArrayMeta {
     /// attributes; neither is derived from the other and an array may carry
     /// both -- see `axis_names`.
     dimension_names: Option<Vec<Option<String>>>,
+    /// The array's user attributes, kept as stored, and only when
+    /// `--attributes` asked for them. `Absent` otherwise.
+    ///
+    /// Filled in by `classify` rather than by the two `array_meta_*`
+    /// functions: a V3 array's attributes are in the file they already parsed,
+    /// but a V2 array's are in a `.zattrs` beside it that nothing reads unless
+    /// the flag is set, and neither of those functions has a store to read it
+    /// from.
+    attributes: Attributes,
 }
 
 /// Which kind of OME-Zarr group this is.
@@ -462,6 +546,11 @@ OPTIONS:
                      printing the tree. Reads metadata only, exactly as the
                      tree does. Cannot be combined with --depth: a partial
                      walk would report a node it never looked for as missing.
+        --attributes Show each node's user attributes as stored -- V2 .zattrs,
+                     V3 attributes -- uninterpreted, on one line of compact
+                     JSON. A node with no attributes gains no row. Combines
+                     with --depth and --json; cannot be combined with
+                     --validate, which reports findings rather than nodes.
     -h, --help       Print help
     -V, --version    Print version
 
@@ -489,6 +578,10 @@ struct Options {
     /// Report on the structure the metadata declares instead of printing it.
     /// Reads the same files the tree reads and nothing else -- see `validate`.
     validate: bool,
+    /// Show each node's user attributes as stored, in both renderers. Off by
+    /// default, and off is what keeps the default output what it was: nothing
+    /// below this line changes shape unless it was asked for.
+    attributes: bool,
 }
 
 /// What `parse_args` made of the command line.
@@ -644,7 +737,7 @@ fn run() -> io::Result<i32> {
     // Classified before the root is checked, because the check wants the
     // answer: a root whose metadata named it a Zarr node is plainly there, and
     // one that named nothing has to be looked for. See `Store::check_root`.
-    let root_kind = classify(store.as_ref(), "");
+    let root_kind = classify(store.as_ref(), "", options.attributes);
     store.check_root(!matches!(root_kind, NodeKind::Unknown))?;
 
     // The whole of what `--validate` changes, and it changes nothing above
@@ -665,7 +758,14 @@ fn run() -> io::Result<i32> {
     }
 
     if options.json {
-        let tree = json_tree(store.as_ref(), "", root_name, root_kind, options.depth)?;
+        let tree = json_tree(
+            store.as_ref(),
+            "",
+            root_name,
+            root_kind,
+            options.depth,
+            options.attributes,
+        )?;
         // Indented rather than compact: this is still a command a person runs
         // and reads, and `jq` does not mind either way.
         writeln!(out, "{}", serde_json::to_string_pretty(&tree)?)?;
@@ -678,6 +778,7 @@ fn run() -> io::Result<i32> {
         root_name,
         &root_kind,
         options.depth,
+        options.attributes,
     )?;
 
     // Stdout flushes itself when the process ends, but it swallows any error
@@ -713,6 +814,7 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
     let mut depth: Option<usize> = None;
     let mut json = false;
     let mut validate = false;
+    let mut attributes = false;
 
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -737,6 +839,7 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
             // Repeating it is not an error: it asks for the same thing twice.
             "--json" => json = true,
             "--validate" => validate = true,
+            "--attributes" => attributes = true,
             // A leading dash we do not know is a mistyped option rather than a
             // path. The cost of reading it that way is that a directory whose
             // name begins with `-` can no longer be inspected -- the same
@@ -759,12 +862,23 @@ fn parse_args(args: &[String]) -> Result<Request, String> {
         return Err(String::from("--depth cannot be combined with --validate"));
     }
 
+    // Refused for a different reason than `--depth` is, and a simpler one:
+    // `--validate` does not print nodes. It prints findings about them, and an
+    // attributes row has nowhere to go in one. Rather than silently ignoring
+    // half of what was typed, say that the two ask for different outputs.
+    if validate && attributes {
+        return Err(String::from(
+            "--attributes cannot be combined with --validate",
+        ));
+    }
+
     let path = path.ok_or_else(|| String::from("expected a store"))?;
     Ok(Request::Walk(Options {
         path: String::from(path),
         depth,
         json,
         validate,
+        attributes,
     }))
 }
 
@@ -1743,13 +1857,14 @@ fn print_store(
     name: &str,
     kind: &NodeKind,
     depth: Option<usize>,
+    attributes: bool,
 ) -> io::Result<()> {
     writeln!(out, "{name} {}", kind.label())?;
 
     // An array is a leaf here too: its metadata takes the place of the walk.
     match kind {
         NodeKind::Array(meta) => print_array_meta(out, meta, ""),
-        _ => print_tree(out, store, "", "", kind, depth),
+        _ => print_tree(out, store, "", "", kind, depth, attributes),
     }
 }
 
@@ -1780,6 +1895,7 @@ fn print_tree(
     prefix: &str,
     kind: &NodeKind,
     depth: Option<usize>,
+    attributes: bool,
 ) -> io::Result<()> {
     let rows = group_rows(kind);
     let children = child_dirs(store, path, kind, depth)?;
@@ -1798,7 +1914,7 @@ fn print_tree(
         let is_last = i == children.len() - 1;
         let connector = if is_last { "└── " } else { "├── " };
         let child = child_path(path, name);
-        let kind = classify(store, &child);
+        let kind = classify(store, &child, attributes);
         writeln!(out, "{prefix}{connector}{name} {}", kind.label())?;
 
         // Children of the last entry need no vertical bar above them.
@@ -1825,6 +1941,7 @@ fn print_tree(
                 &child_prefix,
                 &kind,
                 depth.map(|depth| depth - 1),
+                attributes,
             )?,
         }
     }
@@ -1887,16 +2004,30 @@ fn child_dirs(
 /// Every one of them is an HTTP GET on a remote store, which is what decided
 /// the shape of everything below: a file is read once and its text kept, and
 /// nothing is opened twice.
-fn classify(store: &dyn Store, path: &str) -> NodeKind {
+///
+/// `attributes` is whether `--attributes` asked for the raw attributes to be
+/// kept. It buys a node's attributes out of metadata already in hand
+/// everywhere but one: a V2 *array* keeps them in a `.zattrs` this function
+/// otherwise never opens, so asking for them there costs one extra read per V2
+/// array. That read happens only when the flag is set, which is what keeps a
+/// default walk exactly as cheap as it was.
+fn classify(store: &dyn Store, path: &str, attributes: bool) -> NodeKind {
     // Zarr V2 keeps the two node kinds in separate files, so which file is
     // there answers the question. Locally that used to be a stat and is now a
     // read of a very small file; remotely there is no cheaper way to ask.
     if store.read(&child_path(path, ".zgroup")).is_some() {
         // V2 keeps user attributes in a file of their own. It is read once
-        // here and handed to both readers below, which read different keys out
+        // here and handed to every reader below, which read different keys out
         // of it and know nothing about each other -- but which would otherwise
         // cost a second request for a file already in hand.
-        let attrs = read_json(store, &child_path(path, ".zattrs"));
+        //
+        // Kept as text as well as parsed, because `--attributes` has to tell a
+        // `.zattrs` that is missing from one that is there and is not JSON,
+        // and a parsed `Option<Value>` has thrown that difference away.
+        let text = store.read(&child_path(path, ".zattrs"));
+        let attrs = text
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok());
         let spatialdata = attrs.as_ref().and_then(spatialdata_info_v2);
         return NodeKind::Group(GroupMeta {
             ome: attrs.as_ref().and_then(ome_info_v2),
@@ -1908,17 +2039,30 @@ fn classify(store: &dyn Store, path: &str) -> NodeKind {
             // element, which the same answer licenses.
             anndata: anndata_summary(store, path, attrs.as_ref(), spatialdata.as_ref()),
             spatialdata,
+            // The same file over again, uninterpreted. No read is added here:
+            // the text is the one taken above.
+            attributes: match attributes {
+                true => attributes_v2(text.as_deref()),
+                false => Attributes::Absent,
+            },
         });
     }
 
     if let Some(zarray) = store.read(&child_path(path, ".zarray")) {
-        return NodeKind::Array(array_meta_v2(&zarray));
+        let mut meta = array_meta_v2(&zarray);
+        // The one place the flag costs a read. A V2 array's attributes are in
+        // a file of their own that nothing else here wants, so it is opened
+        // when they are asked for and not otherwise.
+        if attributes {
+            meta.attributes = attributes_v2(store.read(&child_path(path, ".zattrs")).as_deref());
+        }
+        return NodeKind::Array(meta);
     }
 
     // Zarr V3 uses one filename for both kinds and moves the distinction inside
     // the file, so here we do have to look inside it. Checked second, so a
     // store that carries both V2 and V3 metadata is reported as V2.
-    if let Some(kind) = classify_v3(store, path) {
+    if let Some(kind) = classify_v3(store, path, attributes) {
         return kind;
     }
 
@@ -1932,8 +2076,15 @@ fn classify(store: &dyn Store, path: &str) -> NodeKind {
 /// Takes the node rather than the file, unlike the V2 reads above, because a
 /// SpatialData element's Parquet payload sits beside the node's metadata file
 /// rather than inside it, and finding it means knowing where the node is.
-fn classify_v3(store: &dyn Store, path: &str) -> Option<NodeKind> {
+fn classify_v3(store: &dyn Store, path: &str, attributes: bool) -> Option<NodeKind> {
     let value = read_json(store, &child_path(path, "zarr.json"))?;
+
+    // V3 keeps attributes in the file both node kinds already parse, so
+    // neither branch below reads anything extra for them.
+    let raw = match attributes {
+        true => attributes_from(value.get("attributes")),
+        false => Attributes::Absent,
+    };
 
     match value.get("node_type")?.as_str()? {
         "group" => {
@@ -1948,9 +2099,14 @@ fn classify_v3(store: &dyn Store, path: &str) -> Option<NodeKind> {
                     spatialdata.as_ref(),
                 ),
                 spatialdata,
+                attributes: raw,
             }))
         }
-        "array" => Some(NodeKind::Array(array_meta_v3(&value))),
+        "array" => {
+            let mut meta = array_meta_v3(&value);
+            meta.attributes = raw;
+            Some(NodeKind::Array(meta))
+        }
         _ => None,
     }
 }
@@ -2779,6 +2935,16 @@ fn group_rows(kind: &NodeKind) -> Vec<String> {
     rows.extend(anndata_rows(meta.anndata.as_deref()));
     rows.extend(table_rows(meta.spatialdata.as_ref()));
     rows.extend(parquet_rows(&meta.parquet));
+
+    // Last, and deliberately so. Everything above is this program's reading of
+    // selected keys; this is the document those readings came out of, printed
+    // as it stands. Putting the interpretation first and the raw text under it
+    // is the order somebody checking one against the other would want, and a
+    // group that was not asked for its attributes adds nothing here at all.
+    if let Some(text) = meta.attributes.row() {
+        rows.push(format!("attributes: {}", text.as_deref().unwrap_or("?")));
+    }
+
     rows
 }
 
@@ -2964,6 +3130,64 @@ fn parquet_rows(payload: &Payload) -> Vec<String> {
 /// every caller does the same thing with them. `?` returns None early on the
 /// read, and `.ok()` drops the parse error: we care *that* this failed, not
 /// why.
+/// Read an attributes object out of an already-parsed metadata value.
+///
+/// `value` is whichever member holds them: the whole `.zattrs` document for
+/// V2, the `attributes` member of `zarr.json` for V3. One function for both is
+/// the point -- a reader should not need a different flag, or a different
+/// answer, depending on which Zarr version wrote the store.
+///
+/// Two judgements are made here and nowhere else, so that the renderers only
+/// ever draw what they are handed:
+///
+/// An attributes member that is present but is *not an object* is
+/// `Unreadable`, not empty. Zarr says attributes are an object; something else
+/// is a document this program cannot use, and reporting it as "no attributes"
+/// would be passing malformed metadata off as valid.
+///
+/// An object that is *empty* is `Absent`. `{}` is what a great many nodes
+/// carry -- zarr-python writes it into every group and array it creates -- and
+/// an `attributes: {}` row on all of them would bury the few nodes that
+/// actually say something. This mirrors `dimension_names_v3`, which folds an
+/// empty list into the same "nothing to show" the missing key gets.
+fn attributes_from(value: Option<&Value>) -> Attributes {
+    let Some(value) = value else {
+        return Attributes::Absent;
+    };
+
+    let Some(map) = value.as_object() else {
+        return Attributes::Unreadable;
+    };
+
+    match map.is_empty() {
+        true => Attributes::Absent,
+        // Cloned because the caller's value is dropped at the end of
+        // classification while this has to live as long as the node it
+        // describes. Attributes are read once per node and are small, so the
+        // copy costs less than threading a lifetime through `NodeKind` --
+        // which is passed around by value -- would.
+        false => Attributes::Present(map.clone()),
+    }
+}
+
+/// The same, for a Zarr V2 `.zattrs` that has not been parsed yet.
+///
+/// `text` is what the store handed back: `None` where there is no such file,
+/// which is the ordinary case and means `Absent`. Text that is not JSON is
+/// `Unreadable` -- the file is there and says something this program cannot
+/// read, which is exactly the distinction `Store::read` cannot make on its own
+/// and the reason this takes the text rather than a parsed value.
+fn attributes_v2(text: Option<&str>) -> Attributes {
+    let Some(text) = text else {
+        return Attributes::Absent;
+    };
+
+    match serde_json::from_str::<Value>(text) {
+        Ok(value) => attributes_from(Some(&value)),
+        Err(_) => Attributes::Unreadable,
+    }
+}
+
 fn read_json(store: &dyn Store, path: &str) -> Option<Value> {
     serde_json::from_str(&store.read(path)?).ok()
 }
@@ -2982,6 +3206,7 @@ fn array_meta_v2(text: &str) -> ArrayMeta {
             shards: None,
             dtype: None,
             dimension_names: None,
+            attributes: Attributes::Absent,
         };
     };
 
@@ -2997,6 +3222,10 @@ fn array_meta_v2(text: &str) -> ArrayMeta {
             .map(String::from),
         // V2 has no dimension-name key, and one is never invented for it.
         dimension_names: None,
+        // Filled in by `classify` when `--attributes` asked for it: V2 keeps
+        // an array's attributes in a `.zattrs` beside this file, which is not
+        // in hand here.
+        attributes: Attributes::Absent,
     }
 }
 
@@ -3045,6 +3274,8 @@ fn array_meta_v3(value: &Value) -> ArrayMeta {
         shards,
         dtype: data_type_v3(value.get("data_type")),
         dimension_names: dimension_names_v3(value.get("dimension_names")),
+        // Filled in by `classify`, which knows whether they were asked for.
+        attributes: Attributes::Absent,
     }
 }
 
@@ -3260,6 +3491,14 @@ fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::
         rows.push(("dimensions:", Some(names)));
     }
 
+    // `row` hands back exactly the shape this loop wants: no row at all, or a
+    // row whose value may be missing and print as `?`. "attributes:" is the
+    // same width as "dimensions:", so it widens the block no further.
+    let attributes = meta.attributes.row();
+    if let Some(text) = &attributes {
+        rows.push(("attributes:", text.as_deref()));
+    }
+
     // Taken before the rows are consumed below, so the closing connector lands
     // on whichever row turned out to be last.
     let last = rows.len() - 1;
@@ -3308,11 +3547,19 @@ fn json_tree(
     name: &str,
     kind: NodeKind,
     depth: Option<usize>,
+    attributes: bool,
 ) -> io::Result<Value> {
     let mut node = json!({
         "name": name,
         "kind": kind.kind(),
     });
+
+    // Above the per-kind sections and outside them, because attributes are the
+    // one piece of metadata both kinds have and both keep in the same place.
+    // A reader looks for `attributes` on a node, not on a node's `array`.
+    if let Some(raw) = node_attributes(&kind).and_then(Attributes::json) {
+        node["attributes"] = raw;
+    }
 
     match &kind {
         NodeKind::Array(meta) => node["array"] = json_array_meta(meta),
@@ -3345,19 +3592,35 @@ fn json_tree(
             // Classified here rather than inside the call, so that the root --
             // which `run` had to classify before it could check the store --
             // is not classified a second time.
-            let child_kind = classify(store, &child);
+            let child_kind = classify(store, &child, attributes);
             children.push(json_tree(
                 store,
                 &child,
                 &name,
                 child_kind,
                 depth.map(|depth| depth - 1),
+                attributes,
             )?);
         }
     }
     node["children"] = Value::Array(children);
 
     Ok(node)
+}
+
+/// A node's attributes, whichever kind of node it is.
+///
+/// Groups and arrays keep them in fields of their own rather than on
+/// `NodeKind`, because that enum holds one struct per kind and neither struct
+/// knows about the other. This is the one place that wants them without caring
+/// which it has. An `Unknown` node has none: nothing identified it, so there
+/// was no metadata document to take attributes out of.
+fn node_attributes(kind: &NodeKind) -> Option<&Attributes> {
+    match kind {
+        NodeKind::Group(meta) => Some(&meta.attributes),
+        NodeKind::Array(meta) => Some(&meta.attributes),
+        NodeKind::Unknown => None,
+    }
 }
 
 /// An array's fields, with `null` where the tree would print `?`.
@@ -3670,7 +3933,11 @@ fn collect(
 
     for name in children {
         let child = child_path(path, &name);
-        let child_kind = classify(store, &child);
+        // Never with attributes: `--attributes` is refused alongside
+        // `--validate`, and no rule here looks at a raw attributes document
+        // -- every one of them reads a key some semantic reader already
+        // interpreted.
+        let child_kind = classify(store, &child, false);
         collect(store, &child, child_kind, nodes)?;
     }
 
@@ -4336,7 +4603,7 @@ mod tests {
     /// them, so a test about V2's *file layout* has to come in this way round.
     /// It gets the whole path exercised for its trouble.
     fn classify_dir(dir: &Path) -> NodeKind {
-        classify(&LocalStore::new(&dir.to_string_lossy()), "")
+        classify(&LocalStore::new(&dir.to_string_lossy()), "", false)
     }
 
     /// The same, for the tests that go on to ask what the group's attributes
@@ -4888,10 +5155,29 @@ mod tests {
     }
 
     /// The tree a store draws, as the text a person would see.
+    ///
+    /// Without attributes, which is what almost every test here wants: they
+    /// are about the rows a store has always drawn. See `rendered_attributes`
+    /// for the other side.
     fn rendered(store: &dyn Store, name: &str, depth: Option<usize>) -> String {
-        let kind = classify(store, "");
+        rendered_with(store, name, depth, false)
+    }
+
+    /// The same tree, walked as `--attributes` walks it.
+    fn rendered_attributes(store: &dyn Store, name: &str) -> String {
+        rendered_with(store, name, None, true)
+    }
+
+    /// What both of those are: one walk, with the flag either way.
+    fn rendered_with(
+        store: &dyn Store,
+        name: &str,
+        depth: Option<usize>,
+        attributes: bool,
+    ) -> String {
+        let kind = classify(store, "", attributes);
         let mut out: Vec<u8> = Vec::new();
-        print_store(&mut out, store, name, &kind, depth).unwrap();
+        print_store(&mut out, store, name, &kind, depth, attributes).unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -5338,7 +5624,7 @@ mod tests {
 
         // The metadata reads succeed, so the root is identified and the root
         // check passes without a listing -- exactly as it would on S3.
-        let kind = classify(store.as_ref(), "");
+        let kind = classify(store.as_ref(), "", false);
         assert!(matches!(kind, NodeKind::Group(_)), "the root is readable");
         assert!(store.check_root(true).is_ok());
 
@@ -5488,13 +5774,27 @@ mod tests {
         let dir = fixture("neutral-json");
         write_fixture(&dir, FIXTURE);
         let local = LocalStore::new(&dir.to_string_lossy());
-        let local_json =
-            json_tree(&local, "", "store.zarr", classify(&local, ""), Some(2)).unwrap();
+        let local_json = json_tree(
+            &local,
+            "",
+            "store.zarr",
+            classify(&local, "", false),
+            Some(2),
+            false,
+        )
+        .unwrap();
         fs::remove_dir_all(&dir).unwrap();
 
         let remote = memory_store("s3://bucket/store.zarr", "store.zarr", FIXTURE);
-        let remote_json =
-            json_tree(&remote, "", "store.zarr", classify(&remote, ""), Some(2)).unwrap();
+        let remote_json = json_tree(
+            &remote,
+            "",
+            "store.zarr",
+            classify(&remote, "", false),
+            Some(2),
+            false,
+        )
+        .unwrap();
 
         assert_eq!(local_json, remote_json);
 
@@ -6124,6 +6424,7 @@ mod tests {
                 spatialdata: None,
                 parquet: Payload::Absent,
                 anndata: None,
+                attributes: Attributes::Absent,
             })),
             vec!["rows: 2", "columns: 3", "wells: 3"]
         );
@@ -6148,6 +6449,7 @@ mod tests {
                 spatialdata: None,
                 parquet: Payload::Absent,
                 anndata: None,
+                attributes: Attributes::Absent,
             }))
             .is_empty()
         );
@@ -6178,6 +6480,7 @@ mod tests {
                 spatialdata: None,
                 parquet: Payload::Absent,
                 anndata: None,
+                attributes: Attributes::Absent,
             }))
             .is_empty()
         );
@@ -6210,6 +6513,7 @@ mod tests {
                 spatialdata: None,
                 parquet: Payload::Absent,
                 anndata: None,
+                attributes: Attributes::Absent,
             })),
             vec!["rows: 1", "columns: 1"]
         );
@@ -7380,7 +7684,7 @@ mod tests {
     /// test asserting on a line is asserting on the line a reader sees --
     /// severity, path and message, in the order the report puts them.
     fn validated(store: &dyn Store) -> Vec<String> {
-        let root = classify(store, "");
+        let root = classify(store, "", false);
         let findings = validate(store, root).expect("a local store can list");
 
         let mut out: Vec<u8> = Vec::new();
@@ -7481,6 +7785,200 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    /// The three states `attributes_from` can reach, as a label and the text
+    /// a row would show.
+    fn state(attributes: &Attributes) -> (&'static str, Option<String>) {
+        match attributes.row() {
+            None => ("absent", None),
+            Some(text) => match text {
+                None => ("unreadable", None),
+                Some(text) => ("present", Some(text)),
+            },
+        }
+    }
+
+    #[test]
+    fn the_tree_draws_attributes_for_both_zarr_versions_and_both_node_kinds() {
+        // One store covering what the flag has to get right in the drawing: a
+        // V3 group, a V2 array (whose attributes live in a `.zattrs` nothing
+        // else here opens), an empty object that earns no row, and a `.zattrs`
+        // that is not JSON and can only say `?`.
+        let dir = fixture("attributes-tree");
+        for (path, body) in [
+            (
+                "zarr.json",
+                r#"{"zarr_format": 3, "node_type": "group", "attributes": {"experiment": "A"}}"#,
+            ),
+            (
+                "v2/.zarray",
+                r#"{"shape": [4], "chunks": [2], "dtype": "<u2"}"#,
+            ),
+            ("v2/.zattrs", r#"{"unit": "nm"}"#),
+            (
+                "empty/zarr.json",
+                r#"{"zarr_format": 3, "node_type": "group", "attributes": {}}"#,
+            ),
+            ("bad/.zgroup", r#"{"zarr_format": 2}"#),
+            ("bad/.zattrs", "{not json"),
+        ] {
+            let path = dir.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        }
+        let store = LocalStore::new(&dir.to_string_lossy());
+
+        let tree = rendered_attributes(&store, "store.zarr");
+        fs::remove_dir_all(&dir).unwrap();
+
+        for expected in [
+            // The root's own row, above its children.
+            r#"attributes: {"experiment":"A"}"#,
+            // A V2 array's, read out of the file the flag licenses opening.
+            r#"attributes: {"unit":"nm"}"#,
+            // There is a document and it is not readable, which is not the
+            // same as there being nothing to show.
+            "attributes: ?",
+            // The array's own rows are still there, and still first.
+            "shape:      [4]",
+        ] {
+            assert!(tree.contains(expected), "missing {expected:?} in:\n{tree}");
+        }
+
+        // `{}` earns no row, so the empty group's line is followed straight by
+        // the next child rather than by an `attributes: {}` nobody wants.
+        assert!(!tree.contains("attributes: {}"), "{tree}");
+        assert_eq!(tree.matches("attributes:").count(), 3, "{tree}");
+    }
+
+    #[test]
+    fn attributes_that_say_nothing_are_absent_and_ones_that_are_not_an_object_are_not() {
+        // The distinction the whole three-state type exists for. A missing
+        // member and an empty one are both "nothing to show"; anything that is
+        // not a usable object is a document we could not read, and saying
+        // "no attributes" for it would pass malformed metadata off as valid.
+        assert_eq!(state(&attributes_from(None)).0, "absent");
+        assert_eq!(state(&attributes_from(Some(&json!({})))).0, "absent");
+
+        for value in [json!(null), json!([1, 2]), json!("text"), json!(3)] {
+            assert_eq!(
+                state(&attributes_from(Some(&value))).0,
+                "unreadable",
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_attributes_tell_a_missing_file_from_an_unparseable_one() {
+        // `Store::read` deliberately conflates missing and unreadable, which
+        // is why this takes the text: no file is the ordinary case, and a file
+        // that is not JSON is a fault worth showing.
+        assert_eq!(state(&attributes_v2(None)).0, "absent");
+        assert_eq!(state(&attributes_v2(Some("{not json"))).0, "unreadable");
+        assert_eq!(state(&attributes_v2(Some("{}"))).0, "absent");
+        // Valid JSON that is not an object is unreadable for the same reason
+        // it is in V3 -- one rule, whichever version wrote the store.
+        assert_eq!(state(&attributes_v2(Some("[1, 2]"))).0, "unreadable");
+        assert_eq!(
+            state(&attributes_v2(Some(r#"{"note": "root"}"#))).1,
+            Some(String::from(r#"{"note":"root"}"#))
+        );
+    }
+
+    #[test]
+    fn an_attributes_row_is_compact_json_with_every_value_kept_as_it_was() {
+        // Nested objects, lists, numbers, booleans and nulls all survive as
+        // themselves: nothing here interprets, flattens or stringifies them.
+        let value = json!({
+            "instrument": {"model": "X"},
+            "tags": ["a", "b"],
+            "batch": 3,
+            "ok": true,
+            "note": null,
+        });
+
+        assert_eq!(
+            state(&attributes_from(Some(&value))).1,
+            Some(String::from(
+                r#"{"batch":3,"instrument":{"model":"X"},"note":null,"ok":true,"tags":["a","b"]}"#
+            ))
+        );
+    }
+
+    #[test]
+    fn attribute_keys_are_sorted_whatever_order_the_file_wrote_them_in() {
+        // The guard on this being a CLI: output has to be the same every run
+        // and on every machine. `serde_json::Map` is a `BTreeMap` here, so the
+        // two orderings below collapse to one line -- and if that ever stopped
+        // being true, this is the test that would say so.
+        let forwards: Value = serde_json::from_str(r#"{"a": 1, "b": 2, "c": 3}"#).unwrap();
+        let backwards: Value = serde_json::from_str(r#"{"c": 3, "b": 2, "a": 1}"#).unwrap();
+
+        assert_eq!(
+            state(&attributes_from(Some(&forwards))).1,
+            Some(String::from(r#"{"a":1,"b":2,"c":3}"#))
+        );
+        assert_eq!(
+            state(&attributes_from(Some(&forwards))),
+            state(&attributes_from(Some(&backwards)))
+        );
+    }
+
+    #[test]
+    fn attributes_are_only_read_when_they_were_asked_for() {
+        // The promise the default output rests on. The same store, classified
+        // both ways: without the flag every node is `Absent` and so draws
+        // exactly the rows it always drew.
+        let dir = fixture("attributes-off");
+        fs::write(
+            dir.join("zarr.json"),
+            r#"{"zarr_format": 3, "node_type": "group",
+                "attributes": {"experiment": "A"}}"#,
+        )
+        .unwrap();
+        let store = LocalStore::new(&dir.to_string_lossy());
+
+        assert!(group_rows(&classify(&store, "", false)).is_empty());
+        assert_eq!(
+            group_rows(&classify(&store, "", true)),
+            vec![r#"attributes: {"experiment":"A"}"#]
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn raw_attributes_sit_under_the_readings_taken_from_them() {
+        // The duplication is the point: the OME rows are this program's
+        // reading of `multiscales`, and the attributes row is the document
+        // that reading came out of. Both are shown, interpretation first.
+        let dir = fixture("attributes-ome");
+        fs::write(dir.join(".zgroup"), r#"{"zarr_format": 2}"#).unwrap();
+        fs::write(
+            dir.join(".zattrs"),
+            r#"{"multiscales": [{"version": "0.4",
+                "axes": [{"name": "y"}, {"name": "x"}],
+                "datasets": [{"path": "0"}]}]}"#,
+        )
+        .unwrap();
+        let store = LocalStore::new(&dir.to_string_lossy());
+
+        let kind = classify(&store, "", true);
+        // Recognition is untouched: the group is still an OME-Zarr image and
+        // still draws the rows it drew before.
+        assert_eq!(kind.label(), "[group, OME-Zarr 0.4]");
+
+        let rows = group_rows(&kind);
+        assert_eq!(rows.first().map(String::as_str), Some("axes: y, x"));
+        assert!(
+            rows.last()
+                .is_some_and(|row| row.starts_with("attributes: {\"multiscales\":")),
+            "{rows:?}"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -7811,8 +8309,8 @@ mod tests {
         assert!(!tree.contains("rows:"), "{tree}");
         assert!(!tree.contains("schema:"), "{tree}");
 
-        let root = classify(store.as_ref(), "");
-        let value = json_tree(store.as_ref(), "", "store.zarr", root, None).unwrap();
+        let root = classify(store.as_ref(), "", false);
+        let value = json_tree(store.as_ref(), "", "store.zarr", root, None, false).unwrap();
 
         // `null` says the section was there and could not be read, which is
         // the rule every field inside a section already follows. The ordinary
@@ -7891,8 +8389,8 @@ mod tests {
         );
 
         let store = LocalStore::new(&dir.to_string_lossy());
-        let root = classify(&store, "");
-        let value = json_tree(&store, "", "store.zarr", root, None).unwrap();
+        let root = classify(&store, "", false);
+        let value = json_tree(&store, "", "store.zarr", root, None, false).unwrap();
 
         let element = &value["children"][0];
         assert_eq!(element["spatialdata"]["kind"], "shapes");
@@ -8409,6 +8907,7 @@ mod tests {
             spatialdata: meta.spatialdata,
             parquet: meta.parquet,
             anndata: meta.anndata,
+            attributes: Attributes::Absent,
         }));
 
         fs::remove_dir_all(&dir).unwrap();
@@ -8532,8 +9031,8 @@ mod tests {
         write_table(&dir, json!("cell_circles"), &as_objects(&x));
 
         let store = LocalStore::new(&dir.to_string_lossy());
-        let kind = classify(&store, "");
-        let tree = json_tree(&store, "", "table", kind, Some(0)).unwrap();
+        let kind = classify(&store, "", false);
+        let tree = json_tree(&store, "", "table", kind, Some(0), false).unwrap();
 
         fs::remove_dir_all(&dir).unwrap();
 

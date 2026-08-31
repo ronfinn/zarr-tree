@@ -135,6 +135,7 @@ The [SpatialData reference](spatialdata.md) documents all of this in detail.
 | AnnData `X` matches the `obs` / `var` index lengths | Supported |
 | Points/shapes Parquet payload is readable | Supported |
 | Combining `--validate` with `--depth` | Refused by design |
+| Combining `--validate` with `--attributes` | Refused by design |
 | Schema or specification conformance checking | Not implemented, and out of scope |
 | A rule registry, policy engine, or per-rule/per-severity filtering | Not implemented, and out of scope |
 
@@ -149,6 +150,7 @@ mechanism for adding an eighth from outside the source.
 | `--depth N` | Supported |
 | `--json` | Supported |
 | `--validate` | Supported |
+| `--attributes` | Supported |
 | `-h` / `--help`, `-V` / `--version` | Supported |
 | Exit status 0 walked, 1 failure, 2 validation error | Supported (2 on master) |
 | Quiet `BrokenPipe` handling for `\| head`, `\| less` | Supported |
