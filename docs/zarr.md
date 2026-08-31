@@ -517,9 +517,13 @@ Besides stopping at arrays, the walk observes four rules:
   not children. Symlinks are not followed, and a symlinked directory is not
   listed at all — which is also what stops a link pointing back at an ancestor
   from looping.
-- **Children are sorted lexicographically**, so a run against the same store
-  prints the same tree. `10` therefore sorts before `9`; natural ordering for
-  numbered names is [under consideration](roadmap.md#under-consideration).
+- **Children are sorted naturally**, so a run against the same store prints the
+  same tree. A run of digits inside a name compares as the number it spells, so
+  `2` comes before `10` and `level9` before `level10`; everything else compares
+  by character, as it always did. Two names that spell the same number
+  differently — `1` and `01` — are ordered by how many leading zeroes they
+  carry, so the order is total and depends on nothing outside the names
+  themselves: no locale, no filesystem, no operating system.
 - **`--depth N` limits how far below the root the walk goes.** At the limit the
   directory is not read at all, which is what makes `--depth 0` cheap on a
   store with a million chunk files. A node that is shown keeps its own metadata

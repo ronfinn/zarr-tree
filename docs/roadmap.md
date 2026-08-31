@@ -29,7 +29,6 @@ rules in `CLAUDE.md` — metadata only, no chunk reads, a short dependency list.
 - Channel metadata and `omero` summaries.
 - Coordinate transformations and physical scales.
 - More detailed HCS metadata: acquisitions, fields of view.
-- Natural ordering for numbered hierarchy names, so `10` sorts after `9`.
 - Distribution through crates.io.
 - Pre-built release binaries.
 

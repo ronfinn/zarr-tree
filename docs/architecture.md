@@ -188,7 +188,11 @@ walk remotely: cost tracks the number of nodes, not the number of chunks.
 
 Both renderers and the validator get their children from one function,
 `child_dirs`, which is what keeps them agreeing about which children exist and
-in what order. It also enforces `--depth`: `Some(0)` returns an empty list
+in what order. That order is `natural_cmp`'s: a run of digits inside a name
+compares as the number it spells, so `2` comes before `10`. It is applied here
+and nowhere else, so no backend can produce a different one — the stores each
+sort their own listing, but only to make it deterministic, never to decide what
+a person sees. It also enforces `--depth`: `Some(0)` returns an empty list
 without asking the store at all, which remotely is one request saved per node.
 It has one further special case — a SpatialData points element's
 `points.parquet/` directory is dropped, because it is a payload rather than a

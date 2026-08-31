@@ -2776,3 +2776,51 @@ fn attributes_is_refused_alongside_validate_and_offered_in_the_help() {
     let stdout = String::from_utf8_lossy(&help.stdout);
     assert!(stdout.contains("--attributes"), "{stdout}");
 }
+
+#[test]
+fn numbered_children_are_listed_in_natural_order_in_both_renderers() {
+    let dir = fixture_dir("natural-order");
+    let root = dir.join("numbered.zarr");
+
+    let group = r#"{"zarr_format": 3, "node_type": "group"}"#;
+    write_file(&root.join("zarr.json"), group);
+    // Written out of order on purpose. The filesystem hands these back in an
+    // order of its own, and every store sorts them bytewise -- which is what
+    // used to put `10` between `1` and `2`.
+    for name in ["10", "2", "0", "1"] {
+        write_file(&root.join(name).join("zarr.json"), group);
+    }
+    // The shape an HCS plate has: a row group whose columns are numbered. The
+    // comparator is the general one, so nothing here is about plates.
+    for column in ["10", "2", "1"] {
+        write_file(&root.join("1").join(column).join("zarr.json"), group);
+    }
+
+    let path = root.to_str().unwrap().to_string();
+    let text = String::from_utf8_lossy(&run(&[&path]).stdout).into_owned();
+    let value = json_of(&["--json", &path]);
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    // The top level, read off the tree in the order it drew it.
+    let rows = lines(&text);
+    let top: Vec<&str> = rows
+        .iter()
+        .skip(1)
+        .filter_map(|row| row.split(' ').next())
+        .filter(|name| !name.contains('.'))
+        .collect();
+    assert_eq!(top, ["0", "1", "1", "2", "10", "2", "10"], "{text}");
+
+    // And the same order in JSON, at both levels.
+    let names = |node: &Value| -> Vec<String> {
+        node["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|child| child["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(names(&value), ["0", "1", "2", "10"]);
+    assert_eq!(names(&value["children"][1]), ["1", "2", "10"]);
+}

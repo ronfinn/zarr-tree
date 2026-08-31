@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
@@ -1955,6 +1956,10 @@ fn print_tree(
 /// last before it can draw a connector, and neither `read_dir` nor an S3
 /// listing promises an order.
 ///
+/// Sorted here, with `natural_cmp`, and nowhere else: every consumer of this
+/// function -- both renderers and the validation walk -- sees one order, and
+/// no backend can produce a different one.
+///
 /// `Some(0)` means this node is as deep as the output goes, and the store is
 /// then not asked at all. That is not only cheaper on a store full of chunk
 /// files -- remotely it is one HTTP request saved per node -- but an empty list
@@ -1990,7 +1995,107 @@ fn child_dirs(
         names.retain(|name| name != "points.parquet");
     }
 
+    // Every `Store::children` already returns its names sorted, but sorted
+    // bytewise -- which puts `10` between `1` and `2`. Re-sorting here rather
+    // than in each store keeps one comparator for the whole program, and keeps
+    // the stores' contract ("sorted", so the walk is deterministic) separate
+    // from this one ("sorted the way a person reads numbers").
+    names.sort_by(|a, b| natural_cmp(a, b));
+
     Ok(names)
+}
+
+/// Compare two names the way a person reads numbered ones: `2` before `10`.
+///
+/// A byte-by-byte comparison sorts `10` before `2`, because `'1'` comes before
+/// `'2'`. This walks the two names together instead, and whenever both sides
+/// are looking at a digit it compares the whole run of digits as a number.
+/// Everything else compares as bytes, which for UTF-8 is the same order as
+/// comparing characters.
+///
+/// `Ordering::Less` means "a sorts before b", `Greater` means "after", and
+/// `Equal` means the two are interchangeable. `Vec::sort_by` calls this for
+/// pairs of elements and arranges them so that every neighbouring pair is
+/// `Less` or `Equal`.
+///
+/// The ordering is total and depends on nothing outside the two strings: no
+/// locale, no filesystem, no operating system. `Equal` comes back only for
+/// names that are equal byte for byte, so sorting a list of distinct names has
+/// exactly one answer.
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+    // Bytes rather than chars because the two are only ever split apart at an
+    // ASCII digit, which in UTF-8 can never be part of a multi-byte character.
+    let mut a = a.as_bytes();
+    let mut b = b.as_bytes();
+
+    loop {
+        match (a.first(), b.first()) {
+            // A name that ran out is a prefix of the other, and a prefix
+            // sorts first.
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                if x.is_ascii_digit() && y.is_ascii_digit() {
+                    let (run_a, rest_a) = split_digits(a);
+                    let (run_b, rest_b) = split_digits(b);
+                    match digits_cmp(run_a, run_b) {
+                        Ordering::Equal => (a, b) = (rest_a, rest_b),
+                        other => return other,
+                    }
+                } else if x == y {
+                    (a, b) = (&a[1..], &b[1..]);
+                } else {
+                    return x.cmp(y);
+                }
+            }
+        }
+    }
+}
+
+/// Split a byte slice into its leading run of ASCII digits and the rest.
+fn split_digits(bytes: &[u8]) -> (&[u8], &[u8]) {
+    let end = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(bytes.len());
+    bytes.split_at(end)
+}
+
+/// Compare two runs of ASCII digits by the number they spell.
+///
+/// Nothing is parsed into an integer, so a name carrying a hundred-digit run
+/// cannot overflow one -- and a store is free to name a child anything at all.
+/// Written out, two numbers compare like this:
+///
+/// - Drop leading zeroes. What is left is the significant part.
+/// - A longer significant part is the larger number: `100` beats `99`.
+/// - Same length, so compare the digits left to right, which for digits is the
+///   same as comparing them as bytes: `123` beats `119`.
+///
+/// That leaves `1`, `01` and `001` equal as numbers. They are different names,
+/// though, and a sort has to put them somewhere, so the run with more leading
+/// zeroes sorts last -- an arbitrary but fixed rule, which is what makes the
+/// ordering total. Two runs compare `Equal` here only when they are identical.
+fn digits_cmp(a: &[u8], b: &[u8]) -> Ordering {
+    let significant_a = strip_leading_zeros(a);
+    let significant_b = strip_leading_zeros(b);
+
+    significant_a
+        .len()
+        .cmp(&significant_b.len())
+        .then_with(|| significant_a.cmp(significant_b))
+        .then_with(|| a.len().cmp(&b.len()))
+}
+
+/// A run of digits with its leading zeroes removed. All zeroes leaves nothing,
+/// which is the right answer: zero has no significant digits.
+fn strip_leading_zeros(digits: &[u8]) -> &[u8] {
+    let start = digits
+        .iter()
+        .position(|byte| *byte != b'0')
+        .unwrap_or(digits.len());
+    &digits[start..]
 }
 
 /// Decide what kind of Zarr node sits at `path` by reading the metadata files
@@ -9124,5 +9229,144 @@ mod tests {
                 String::from("/srv/store.zarr/zarr.json"),
             ]
         );
+    }
+
+    // -- Natural ordering ---------------------------------------------------
+
+    /// Sort a list of names the way `child_dirs` does, so a test can read as
+    /// the order it expects.
+    fn naturally_sorted(names: &[&str]) -> Vec<String> {
+        let mut names: Vec<String> = names.iter().map(|name| String::from(*name)).collect();
+        names.sort_by(|a, b| natural_cmp(a, b));
+        names
+    }
+
+    #[test]
+    fn plain_numbers_sort_by_value_not_by_first_digit() {
+        assert_eq!(
+            naturally_sorted(&["10", "2", "0", "11", "1"]),
+            ["0", "1", "2", "10", "11"]
+        );
+    }
+
+    #[test]
+    fn a_shared_prefix_does_not_stop_the_numbers_sorting() {
+        assert_eq!(
+            naturally_sorted(&["level10", "level1", "level2"]),
+            ["level1", "level2", "level10"]
+        );
+        // An HCS well name is the same shape with a letter in front.
+        assert_eq!(naturally_sorted(&["A10", "A2", "A1"]), ["A1", "A2", "A10"]);
+    }
+
+    #[test]
+    fn every_run_of_digits_in_a_name_compares_as_a_number() {
+        assert_eq!(
+            naturally_sorted(&["a2b1", "a1b10", "a1b2"]),
+            ["a1b2", "a1b10", "a2b1"]
+        );
+    }
+
+    #[test]
+    fn leading_zeroes_tie_break_by_how_many_there_are() {
+        // `1`, `01` and `001` spell the same number, so the rule that puts
+        // them in an order is the tie-breaker: fewer leading zeroes first.
+        // Arbitrary, but fixed -- what matters is that it is the same order
+        // every run, and that a sort of distinct names has one answer.
+        assert_eq!(naturally_sorted(&["001", "1", "01"]), ["1", "01", "001"]);
+        assert_eq!(naturally_sorted(&["a01", "a1"]), ["a1", "a01"]);
+        // A number still beats a padded smaller one, zeroes or no zeroes.
+        assert_eq!(naturally_sorted(&["02", "001"]), ["001", "02"]);
+    }
+
+    #[test]
+    fn digit_runs_too_long_for_any_integer_still_compare() {
+        // Well past `u64::MAX`, so anything that parsed these would overflow.
+        // Nothing parses them: the significant digits are compared as text.
+        let big = "999999999999999999999999999";
+        let bigger = "1000000000000000000000000000";
+        assert_eq!(natural_cmp(big, bigger), Ordering::Less);
+        assert_eq!(natural_cmp(bigger, big), Ordering::Greater);
+        assert_eq!(natural_cmp(big, big), Ordering::Equal);
+    }
+
+    #[test]
+    fn names_without_digits_keep_their_ordinary_order() {
+        assert_eq!(
+            naturally_sorted(&["labels", "images", "tables", "Images"]),
+            ["Images", "images", "labels", "tables"]
+        );
+        // Punctuation compares as its byte, as it always did.
+        assert_eq!(
+            naturally_sorted(&["a_b", "a-b", "a.b"]),
+            ["a-b", "a.b", "a_b"]
+        );
+    }
+
+    #[test]
+    fn the_ordering_is_total_and_calls_only_identical_names_equal() {
+        // A name that runs out is a prefix of the other and sorts first.
+        assert_eq!(natural_cmp("s", "s0"), Ordering::Less);
+        assert_eq!(natural_cmp("", "0"), Ordering::Less);
+        // A digit meeting a letter is an ordinary byte comparison.
+        assert_eq!(natural_cmp("1", "a"), Ordering::Less);
+        // And equality is byte equality, nothing looser.
+        assert_eq!(natural_cmp("01", "1"), Ordering::Greater);
+        assert_eq!(natural_cmp("0", "0"), Ordering::Equal);
+    }
+
+    /// A group whose children are numbered, written in the order a bytewise
+    /// sort would put them so that nothing but the comparator can produce the
+    /// order the tests expect.
+    const NUMBERED: &[(&str, &str)] = &[
+        ("zarr.json", r#"{"zarr_format": 3, "node_type": "group"}"#),
+        (
+            "0/zarr.json",
+            r#"{"zarr_format": 3, "node_type": "array", "shape": [4], "data_type": "uint8",
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}}}"#,
+        ),
+        (
+            "1/zarr.json",
+            r#"{"zarr_format": 3, "node_type": "array", "shape": [4], "data_type": "uint8",
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}}}"#,
+        ),
+        (
+            "10/zarr.json",
+            r#"{"zarr_format": 3, "node_type": "array", "shape": [4], "data_type": "uint8",
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}}}"#,
+        ),
+        (
+            "2/zarr.json",
+            r#"{"zarr_format": 3, "node_type": "array", "shape": [4], "data_type": "uint8",
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}}}"#,
+        ),
+    ];
+
+    #[test]
+    fn a_tree_lists_numbered_children_in_natural_order() {
+        let store = memory_store("s3://bucket/store.zarr", "store.zarr", NUMBERED);
+        let tree = rendered(&store, "store.zarr", None);
+
+        let names: Vec<&str> = tree
+            .lines()
+            .filter(|line| line.ends_with("[array]"))
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .collect();
+        assert_eq!(names, ["0", "1", "2", "10"], "{tree}");
+    }
+
+    #[test]
+    fn json_children_come_out_in_the_same_order_the_tree_lists_them() {
+        let store = memory_store("s3://bucket/store.zarr", "store.zarr", NUMBERED);
+        let root = classify(&store, "", false);
+        let value = json_tree(&store, "", "store.zarr", root, None, false).unwrap();
+
+        let names: Vec<&str> = value["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|child| child["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["0", "1", "2", "10"]);
     }
 }

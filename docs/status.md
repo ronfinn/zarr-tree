@@ -53,6 +53,7 @@ credentials` is not read. HTTP access is anonymous.
 | Compressors, fill values, user attributes | Not implemented |
 | V3 dtypes given in object (extension) form, reported by name | Supported |
 | V3 `dimension_names`, shown in order with unnamed dimensions kept in place | Supported |
+| Natural ordering of child names, so `2` sorts before `10` | Supported |
 
 V2 `dtype` strings are printed exactly as stored, in NumPy notation, and are not
 translated into V3 names. A V3 extension dtype shows the `name` its object

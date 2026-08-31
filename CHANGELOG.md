@@ -10,6 +10,16 @@ with the pre-1.0 caveat that the output format is not yet stable.
 
 ## [Unreleased]
 
+### Changed
+
+- Child names sort naturally rather than bytewise: a run of digits inside a
+  name compares as the number it spells, so a group's children print `0`, `1`,
+  `2`, `10` instead of `0`, `1`, `10`, `2`. Multiscale levels, HCS well paths
+  and any other numbered names read the way they are meant to. The tree, the
+  `--json` `children` arrays and the order `--validate` walks the store all use
+  the one order, on every backend. Presentation only — no node, field or
+  finding changes, and nothing extra is read from the store.
+
 ### Added
 
 - `--attributes` shows each node's user attributes as stored — V2 `.zattrs`,

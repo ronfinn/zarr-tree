@@ -276,10 +276,10 @@ for anything at all — so the row group `A` above is an ordinary `[group]`,
 because that is all its own metadata says it is. There is no naming convention
 being matched here, in either direction.
 
-Children sort lexicographically, as everywhere else in the tree, so a plate
-with more than nine columns lists `10` before `9`. Natural ordering for
-numbered names is [under consideration](roadmap.md#under-consideration); it is
-a presentation nicety, not a correctness problem.
+Children sort naturally, as everywhere else in the tree, so a plate with more
+than nine columns lists `9` before `10` rather than between `1` and `2`. That
+is presentation only: the order the wells are drawn in is not read from, nor
+checked against, the plate's declared `rows` and `columns`.
 
 Nothing inside `plate` or `well` beyond the three counts and the well paths is
 read. Acquisitions, field-of-view indices, the well's own `images` list, row
