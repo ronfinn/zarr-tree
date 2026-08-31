@@ -12,6 +12,11 @@ with the pre-1.0 caveat that the output format is not yet stable.
 
 ### Added
 
+- Zarr V3 arrays that declare `dimension_names` show them on a `dimensions`
+  row and in `--json`. A dimension the file left `null` keeps its position,
+  printing as `?` and staying `null` in JSON; an array that names no
+  dimensions prints no row. These are the array's own names, kept separate
+  from OME-Zarr `axes`.
 - Zarr V3 data types written in the object (extension) form are reported by
   the `name` they declare — `dtype: numpy.datetime64` — instead of showing as
   missing. String data types are unchanged, and a `data_type` with no usable

@@ -121,6 +121,7 @@ depends on what the node is:
 | --- | --- |
 | `shape:`, `chunks:`, `dtype:` | Every array |
 | `shards:` | A Zarr V3 sharded array, between `chunks:` and `dtype:` |
+| `dimensions:` | A Zarr V3 array declaring `dimension_names`, after `dtype:`. An unnamed dimension shows as `?` in its own position. |
 | `axes:`, `pyramid levels:`, `datasets:` | An OME-Zarr image |
 | `rows:`, `columns:`, `wells:` | An OME-Zarr HCS plate |
 | `rows:`, `columns:`, `parquet files:`, `schema:` | A SpatialData points or shapes element with a payload |
@@ -231,7 +232,7 @@ applies to it:
 | `name` | every node | The directory name. On the root, the path as it was typed. |
 | `kind` | every node | `group`, `array` or `unknown` |
 | `children` | every node | The child nodes, in the order the tree lists them |
-| `array` | arrays | `shape`, `chunks`, `dtype`, and `shards` when sharded |
+| `array` | arrays | `shape`, `chunks`, `dtype`, `shards` when sharded, and `dimension_names` when declared |
 | `ome` | OME-Zarr groups | `tag`, `kind`, `version`, `axes`, `pyramid_levels`, `datasets`, and `rows`/`columns`/`wells` on a plate |
 | `spatialdata` | SpatialData nodes | `kind`, `version`, and `regions`/`region_key`/`instance_key` on a table |
 | `parquet` | points and shapes elements with a payload | `rows`, `columns`, `files`, `schema` |
@@ -272,8 +273,9 @@ $ zarr-tree --json partial.zarr | jq '.children[0].array'
 ```
 
 Every array has a shape, chunks and a dtype to be missing, so all three keys
-are always present and `null` means unreadable. `shards` is the exception and
-is omitted rather than `null`, because an unsharded array has no shards to
+are always present and `null` means unreadable. `shards` and `dimension_names`
+are the exceptions and are omitted rather than `null`, because an unsharded
+array has no shards to
 miss.
 
 **A payload that exists but could not be inspected is `"parquet": null`.** A

@@ -54,6 +54,14 @@ Nothing here is a commitment or a date.
   nothing here decodes -- and a `data_type` with no usable name shows as `?`.
 - Zarr V3 sharded arrays report `chunks` (inner chunk shape) and `shards`
   (chunk-grid shape) separately.
+- Zarr V3 `dimension_names` shown as a `dimensions:` row after `dtype` and as
+  `dimension_names` in `--json`. Kept as `Option<Vec<Option<String>>>`: the
+  outer `None` is "no such key" (no row, no JSON key -- and a key that is not
+  a list, or is empty, is the same thing), the inner `None` is a dimension the
+  file left `null` or spelled unreadably, which prints `?` in place and stays
+  `null` in JSON. No name is ever invented, and nothing is derived from or
+  merged with OME-Zarr `axes` -- an array may show both rows. V2 has no such
+  key and none is invented for it.
 - OME-Zarr image detection, with the version as stored.
 - Axis names from the first `multiscales` entry (both the 0.3 list-of-names and
   the 0.4/0.5 list-of-objects forms).

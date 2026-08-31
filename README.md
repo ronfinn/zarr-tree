@@ -633,11 +633,11 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
 - Pointing at a prefix that is not a Zarr node lists it to find out whether it
   exists at all. On a prefix holding a very large number of loose objects that
   listing is paginated to the end.
-- Only `shape`, `chunks`/`chunk_shape`, `dtype`/`data_type` and the shard
-  shape are read. Compressors, fill values, dimension names and user
-  attributes are not shown, `codecs` is read for the sharding codec alone, V2
-  dtypes are passed through as stored, and a V3 dtype in object form is reported
-  by its name alone — see
+- Only `shape`, `chunks`/`chunk_shape`, `dtype`/`data_type`, the shard shape
+  and a V3 array's `dimension_names` are read. Compressors, fill values and
+  user attributes are not shown, `codecs` is read for the sharding codec alone,
+  V2 dtypes are passed through as stored, and a V3 dtype in object form is
+  reported by its name alone — see
   [docs/zarr.md](docs/zarr.md#deliberately-not-implemented).
 - OME-Zarr support goes no further than spotting image, plate and well groups
   and showing their version, and for an image its axis names, declared pyramid

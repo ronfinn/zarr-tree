@@ -50,8 +50,9 @@ credentials` is not read. HTTP access is anonymous.
 | V3 inline `consolidated_metadata` (`kind: inline`, `must_understand: false`) | Supported |
 | Other consolidation forms | Not implemented |
 | Checking consolidated metadata against the store it describes | Not implemented |
-| Compressors, fill values, dimension names, user attributes | Not implemented |
+| Compressors, fill values, user attributes | Not implemented |
 | V3 dtypes given in object (extension) form, reported by name | Supported |
+| V3 `dimension_names`, shown in order with unnamed dimensions kept in place | Supported |
 
 V2 `dtype` strings are printed exactly as stored, in NumPy notation, and are not
 translated into V3 names. A V3 extension dtype shows the `name` its object

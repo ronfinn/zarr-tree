@@ -2449,3 +2449,104 @@ fn validation_json_carries_the_same_findings_and_a_summary() {
         "{stdout}"
     );
 }
+
+#[test]
+fn v3_dimension_names_are_shown_and_a_v2_array_is_unchanged() {
+    let dir = fixture_dir("dimension-names");
+    let root = dir.join("dataset.zarr");
+
+    write_file(
+        &root.join("zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group"}"#,
+    );
+
+    // Four V3 arrays that differ only in their `dimension_names`: fully named,
+    // one dimension left null by the file itself, no such key at all, and a
+    // key that is not a list.
+    let array = |dimension_names: &str| -> String {
+        format!(
+            r#"{{
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [2, 3, 4],
+                "chunk_grid": {{"name": "regular", "configuration": {{"chunk_shape": [2, 3, 4]}}}},
+                "codecs": [{{"name": "bytes"}}],
+                "data_type": "uint16"{dimension_names}
+            }}"#
+        )
+    };
+
+    write_file(
+        &root.join("named/zarr.json"),
+        &array(r#", "dimension_names": ["z", "y", "x"]"#),
+    );
+    write_file(
+        &root.join("partly/zarr.json"),
+        &array(r#", "dimension_names": ["z", null, "x"]"#),
+    );
+    write_file(&root.join("unnamed/zarr.json"), &array(""));
+    write_file(
+        &root.join("broken/zarr.json"),
+        &array(r#", "dimension_names": "zyx""#),
+    );
+
+    // A V2 array beside them, carrying a key of that name that V2 does not
+    // have: its output must be exactly what it always was.
+    write_file(
+        &root.join("legacy/.zarray"),
+        r#"{"zarr_format": 2, "shape": [2, 3, 4], "chunks": [2, 3, 4], "dtype": "<u2",
+            "dimension_names": ["z", "y", "x"]}"#,
+    );
+
+    let path = root.to_str().unwrap().to_string();
+    let text = String::from_utf8_lossy(&run(&[&path]).stdout).into_owned();
+    let output = run(&["--json", &path]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    let rows = lines(&text);
+    assert!(has(&rows, "dimensions: z, y, x"), "{text}");
+    // The dimension the file left unnamed keeps its place as `?`, so `x` is
+    // still the last dimension rather than sliding onto the second.
+    assert!(has(&rows, "dimensions: z, ?, x"), "{text}");
+    // Three arrays have no names to show, and none of them prints a row.
+    assert_eq!(text.matches("dimensions:").count(), 2, "{text}");
+    // The row closes the block where it appears, and `dtype` still closes it
+    // everywhere else.
+    assert!(text.contains("└─ dimensions: z, y, x"), "{text}");
+    assert_eq!(text.matches("└─ dtype:").count(), 3, "{text}");
+    // Nothing was made unknown by the malformed key, and the walk finished.
+    assert_eq!(text.matches("[array]").count(), 5, "{text}");
+    assert!(output.status.success(), "{stdout}");
+
+    let tree: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("--json should print valid JSON: {error}\n{stdout}"));
+    let array_of = |name: &str| -> Value {
+        tree["children"]
+            .as_array()
+            .expect("the root should have children")
+            .iter()
+            .find(|child| child["name"] == json!(name))
+            .unwrap_or_else(|| panic!("no child named {name:?} in {stdout}"))["array"]
+            .clone()
+    };
+
+    assert_eq!(array_of("named")["dimension_names"], json!(["z", "y", "x"]));
+    // An unnamed dimension is a JSON null in its own position -- not a made-up
+    // name, and not a shorter list.
+    assert_eq!(
+        array_of("partly")["dimension_names"],
+        json!(["z", null, "x"])
+    );
+    // With no names to report the key is absent rather than null, the rule
+    // `shards` already follows.
+    assert_eq!(array_of("unnamed").get("dimension_names"), None);
+    assert_eq!(array_of("broken").get("dimension_names"), None);
+
+    // The V2 array is untouched: same three keys it has always had.
+    assert_eq!(
+        array_of("legacy"),
+        json!({ "shape": [2, 3, 4], "chunks": [2, 3, 4], "dtype": "<u2" })
+    );
+}

@@ -298,6 +298,22 @@ struct ArrayMeta {
     chunks: Option<Vec<Value>>,
     shards: Option<Vec<Value>>,
     dtype: Option<String>,
+    /// The names a Zarr V3 array gives its own dimensions, in order.
+    ///
+    /// Two layers of `Option`, because the format has two distinct absences.
+    /// The outer one is the field: V3 makes `dimension_names` optional and V2
+    /// has no such key at all, so `None` means "no row to print". The inner
+    /// one is a single name: V3 lets an entry be `null`, which says the
+    /// dimension exists and is deliberately unnamed. That is not the same as
+    /// the array naming nothing, and flattening the two would invent a name
+    /// or lose a dimension's position -- so a `null` stays a `None` here,
+    /// prints as `?`, and stays `null` in `--json`.
+    ///
+    /// These are the array's own dimension names, and nothing else. OME-Zarr
+    /// `axes` are a separate, higher layer of metadata read from a group's
+    /// attributes; neither is derived from the other and an array may carry
+    /// both -- see `axis_names`.
+    dimension_names: Option<Vec<Option<String>>>,
 }
 
 /// Which kind of OME-Zarr group this is.
@@ -2965,6 +2981,7 @@ fn array_meta_v2(text: &str) -> ArrayMeta {
             chunks: None,
             shards: None,
             dtype: None,
+            dimension_names: None,
         };
     };
 
@@ -2978,6 +2995,8 @@ fn array_meta_v2(text: &str) -> ArrayMeta {
             .get("dtype")
             .and_then(|v| v.as_str())
             .map(String::from),
+        // V2 has no dimension-name key, and one is never invented for it.
+        dimension_names: None,
     }
 }
 
@@ -3025,7 +3044,48 @@ fn array_meta_v3(value: &Value) -> ArrayMeta {
         chunks,
         shards,
         dtype: data_type_v3(value.get("data_type")),
+        dimension_names: dimension_names_v3(value.get("dimension_names")),
     }
+}
+
+/// Read a Zarr V3 `dimension_names` as the names to display, or `None` when
+/// there is nothing to show.
+///
+/// The key is optional, and where it appears it is a list as long as the
+/// shape whose entries are each a string or `null`:
+///
+/// ```json
+/// "dimension_names": ["c", null, "y", "x"]
+/// ```
+///
+/// A `null` entry means the dimension has no name. It is kept as an inner
+/// `None` and shown as `?`, in its own position, because the alternative --
+/// dropping it -- would silently shift every name after it onto the wrong
+/// dimension. Nothing is filled in from anywhere else: not from the shape, not
+/// from OME-Zarr axes, not from a convention about what four dimensions are
+/// usually called.
+///
+/// Anything that is not a list, and a list with nothing in it, comes back
+/// `None`: there is no row to print and the key is left out of `--json`
+/// altogether. An entry that is neither a string nor `null` -- a number, an
+/// object -- is unreadable rather than absent, and takes the same `?` a
+/// `null` does. Either way the array is still an array and the walk goes on;
+/// a malformed name costs the reader this one row and nothing more.
+fn dimension_names_v3(value: Option<&Value>) -> Option<Vec<Option<String>>> {
+    let items = value?.as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+
+    // `as_str` is `None` for a JSON null and for every non-string alike, which
+    // is exactly the distinction this row does not need to draw: both are a
+    // dimension we cannot name.
+    Some(
+        items
+            .iter()
+            .map(|item| item.as_str().map(String::from))
+            .collect(),
+    )
 }
 
 /// Read a Zarr V3 `data_type` as the name to display, or `None` when there is
@@ -3081,6 +3141,19 @@ fn dims(value: Option<&Value>) -> Option<Vec<Value>> {
 fn format_dims(dims: &[Value]) -> String {
     let items: Vec<String> = dims.iter().map(|item| item.to_string()).collect();
     format!("[{}]", items.join(", "))
+}
+
+/// Render dimension names as `c, ?, y, x`.
+///
+/// A name we do not have -- an explicit `null`, or an entry that was not a
+/// string -- becomes `?` in place, so the names that follow it stay on the
+/// dimensions they belong to.
+fn format_dimension_names(names: &[Option<String>]) -> String {
+    let items: Vec<&str> = names
+        .iter()
+        .map(|name| name.as_deref().unwrap_or("?"))
+        .collect();
+    items.join(", ")
 }
 
 /// Read a `multiscales` entry's `axes` as the list of names it declares, or
@@ -3155,9 +3228,10 @@ fn dataset_paths(value: Option<&Value>) -> Option<Vec<String>> {
 /// Print the metadata rows that sit underneath an array line.
 ///
 /// `shape`, `chunks` and `dtype` are always printed, in that order. A sharded
-/// array gains a `shards` row between `chunks` and `dtype`; every other array
-/// prints exactly the three rows it always has. Whichever row ends up last
-/// carries the closing connector. A field we could not read shows as `?`.
+/// array gains a `shards` row between `chunks` and `dtype`, and an array that
+/// names its dimensions gains a `dimensions` row after `dtype`; every other
+/// array prints exactly the three rows it always has. Whichever row ends up
+/// last carries the closing connector. A field we could not read shows as `?`.
 fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::Result<()> {
     // The dimension lists are drawn here rather than kept ready-made, because
     // `--json` wants the same facts as JSON arrays. Rendering late is what
@@ -3165,6 +3239,10 @@ fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::
     let shape = meta.shape.as_deref().map(format_dims);
     let chunks = meta.chunks.as_deref().map(format_dims);
     let shards = meta.shards.as_deref().map(format_dims);
+    // Joined the way OME axes are, and for the same reason: a list of names
+    // reads better bare than in brackets. An unnamed dimension keeps its
+    // place as `?` rather than being dropped.
+    let names = meta.dimension_names.as_deref().map(format_dimension_names);
 
     // A `Vec` rather than the fixed array this used to be, because the number
     // of rows is no longer fixed. Everything else about the drawing is the
@@ -3178,15 +3256,29 @@ fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::
 
     rows.push(("dtype:", meta.dtype.as_deref()));
 
+    if let Some(names) = names.as_deref() {
+        rows.push(("dimensions:", Some(names)));
+    }
+
     // Taken before the rows are consumed below, so the closing connector lands
     // on whichever row turned out to be last.
     let last = rows.len() - 1;
 
+    // The width of the longest name actually being printed. With the rows an
+    // array has always had that is "chunks:" and the output is unchanged; the
+    // longer "dimensions:" widens the block only for the arrays that carry
+    // one.
+    let width = rows
+        .iter()
+        .map(|(name, _)| name.len())
+        .max()
+        .unwrap_or_default();
+
     for (i, (name, value)) in rows.into_iter().enumerate() {
         let connector = if i == last { "└─ " } else { "├─ " };
         let value = value.unwrap_or("?");
-        // Pad to the width of the longest name, "chunks:", so values line up.
-        writeln!(out, "{prefix}{connector}{name:<7} {value}")?;
+        // Padded so the values line up under one another.
+        writeln!(out, "{prefix}{connector}{name:<width$} {value}")?;
     }
 
     Ok(())
@@ -3270,11 +3362,14 @@ fn json_tree(
 
 /// An array's fields, with `null` where the tree would print `?`.
 ///
-/// `shards` is the exception to that rule, and is left out altogether rather
-/// than written as `null`. The two say different things: `null` means the
-/// field was looked for and could not be read, which every array has a shape,
-/// chunks and a dtype to be. An unsharded array has no shards to miss, so the
-/// key is simply not applicable and does not appear.
+/// `shards` and `dimension_names` are the exceptions to that rule, and are
+/// left out altogether rather than written as `null`. The two say different
+/// things: `null` means the field was looked for and could not be read, which
+/// every array has a shape, chunks and a dtype to be. An unsharded array has
+/// no shards to miss, and an array that names no dimensions has no names to
+/// miss, so those keys are simply not applicable and do not appear. Inside
+/// `dimension_names` a `null` is a different thing again -- a dimension the
+/// file itself left unnamed.
 fn json_array_meta(meta: &ArrayMeta) -> Value {
     let mut value = json!({
         // Real JSON arrays rather than the `[4096, 4096]` text the tree draws,
@@ -3288,6 +3383,14 @@ fn json_array_meta(meta: &ArrayMeta) -> Value {
     // shortest way to add a field only sometimes.
     if let Some(shards) = &meta.shards {
         value["shards"] = json!(shards);
+    }
+
+    // `dimension_names` follows the same rule for the same reason: an array
+    // that names no dimensions has none to miss. Where it is there, it is the
+    // list as stored -- an unnamed dimension is a JSON `null`, keeping its
+    // position without being given a name it does not have.
+    if let Some(names) = &meta.dimension_names {
+        value["dimension_names"] = json!(names);
     }
 
     value
@@ -4171,6 +4274,11 @@ mod tests {
     /// The same idea for axis names, which the tree joins into one row.
     fn joined(names: &Option<Vec<String>>) -> Option<String> {
         names.as_ref().map(|names| names.join(", "))
+    }
+
+    /// And for dimension names, where an unnamed dimension keeps its place.
+    fn named(names: &Option<Vec<Option<String>>>) -> Option<String> {
+        names.as_deref().map(format_dimension_names)
     }
 
     /// An empty fixture directory inside the system temp directory, named for
@@ -5721,6 +5829,135 @@ mod tests {
             assert_eq!(meta.dtype, None);
             assert_eq!(shown(&meta.shape), Some(String::from("[4]")));
         }
+    }
+
+    #[test]
+    fn v3_dimension_names_are_read_in_order() {
+        let value = json!({
+            "node_type": "array",
+            "shape": [3, 4, 64, 64],
+            "chunk_grid": {
+                "name": "regular",
+                "configuration": { "chunk_shape": [1, 1, 64, 64] }
+            },
+            "data_type": "uint16",
+            "dimension_names": ["c", "z", "y", "x"]
+        });
+
+        let meta = array_meta_v3(&value);
+
+        assert_eq!(
+            named(&meta.dimension_names),
+            Some(String::from("c, z, y, x"))
+        );
+        // Reading them costs the rest of the array nothing.
+        assert_eq!(shown(&meta.shape), Some(String::from("[3, 4, 64, 64]")));
+        assert_eq!(meta.dtype, Some(String::from("uint16")));
+    }
+
+    #[test]
+    fn a_null_v3_dimension_name_keeps_its_place_without_being_invented() {
+        // V3 lets an entry be null: the dimension is there and is unnamed.
+        // Dropping it would move "y" and "x" onto the wrong dimensions, so it
+        // stays as an inner `None` and shows as `?`.
+        let value = json!({
+            "node_type": "array",
+            "shape": [3, 4, 64, 64],
+            "dimension_names": ["c", null, "y", "x"]
+        });
+
+        let names = array_meta_v3(&value)
+            .dimension_names
+            .expect("a list of dimension names");
+
+        assert_eq!(names.len(), 4);
+        assert_eq!(names[1], None);
+        assert_eq!(format_dimension_names(&names), "c, ?, y, x");
+    }
+
+    #[test]
+    fn a_v3_array_that_names_no_dimensions_has_no_names() {
+        // The key is optional, so its absence is not a missing value: there is
+        // simply no row and no JSON key.
+        let value = json!({
+            "node_type": "array",
+            "shape": [64, 64],
+            "data_type": "uint16"
+        });
+
+        assert_eq!(array_meta_v3(&value).dimension_names, None);
+    }
+
+    #[test]
+    fn malformed_v3_dimension_names_cost_the_row_and_nothing_else() {
+        // A field that is not a list at all, and an empty one, have nothing to
+        // show: no row, no key.
+        for dimension_names in [json!("cyx"), json!({ "0": "y" }), json!(7), json!([])] {
+            let value = json!({
+                "node_type": "array",
+                "shape": [64, 64],
+                "data_type": "uint16",
+                "dimension_names": dimension_names
+            });
+
+            let meta = array_meta_v3(&value);
+
+            assert_eq!(meta.dimension_names, None);
+            // The array is still an array with everything else intact.
+            assert_eq!(shown(&meta.shape), Some(String::from("[64, 64]")));
+            assert_eq!(meta.dtype, Some(String::from("uint16")));
+        }
+
+        // An entry inside a list that is not a string is a name we cannot
+        // read, which is the same `?` a null gets -- the list itself survives.
+        let value = json!({
+            "node_type": "array",
+            "shape": [2, 2],
+            "dimension_names": ["y", 7]
+        });
+
+        assert_eq!(
+            named(&array_meta_v3(&value).dimension_names),
+            Some(String::from("y, ?"))
+        );
+    }
+
+    #[test]
+    fn dimension_names_compose_with_an_object_data_type() {
+        // The two V3 features are read independently and neither disturbs the
+        // other.
+        let value = json!({
+            "node_type": "array",
+            "shape": [8],
+            "chunk_grid": {
+                "name": "regular",
+                "configuration": { "chunk_shape": [8] }
+            },
+            "data_type": {
+                "name": "numpy.datetime64",
+                "configuration": { "unit": "s" }
+            },
+            "dimension_names": ["t"]
+        });
+
+        let meta = array_meta_v3(&value);
+
+        assert_eq!(meta.dtype, Some(String::from("numpy.datetime64")));
+        assert_eq!(named(&meta.dimension_names), Some(String::from("t")));
+    }
+
+    #[test]
+    fn a_v2_array_never_names_its_dimensions() {
+        // V2 has no such key, and a key that looks like one is not read: this
+        // is a V3 field and inventing a V2 spelling for it would be inventing
+        // metadata.
+        let meta = array_meta_v2(
+            r#"{"zarr_format": 2, "shape": [10], "chunks": [10], "dtype": "<u2", "dimension_names": ["x"]}"#,
+        );
+
+        assert_eq!(meta.dimension_names, None);
+        assert_eq!(shown(&meta.shape), Some(String::from("[10]")));
+        assert_eq!(meta.dtype, Some(String::from("<u2")));
     }
 
     #[test]

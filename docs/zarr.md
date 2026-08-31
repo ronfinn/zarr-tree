@@ -35,7 +35,8 @@ It does not:
 - decode array data, or read a chunk of any kind;
 - execute or interpret codecs — the codec list is scanned for one name and
   otherwise left alone;
-- resolve fill values, dimension names, compressors or user attributes;
+- resolve fill values, compressors or user attributes — a V3 array's
+  `dimension_names` are displayed as stored, never resolved or filled in;
 - repair, rewrite or normalise a store;
 - check a document against the Zarr specification.
 
@@ -102,12 +103,53 @@ classified.
 | `chunk_grid.configuration.chunk_shape` | The chunk grid's shape. Only a `regular` grid records one; any other grid leaves `chunks` unreadable. |
 | `codecs` | Scanned for a codec named exactly `sharding_indexed`, and for nothing else — see [Sharding](#sharding). |
 | `data_type` | The dtype: the string itself, or the `name` of an extension's object form. |
+| `dimension_names` | The array's own dimension names — see [Dimension names](#dimension-names). |
 | `attributes` | User attributes, read only on a group, and only for the OME-Zarr (`attributes.ome`) and SpatialData markers. |
 | `consolidated_metadata` | Consolidated metadata at the store root — see [Consolidated metadata](#consolidated-metadata). |
 
 Nothing else in a V3 document is read: not `chunk_key_encoding`, not
-`fill_value`, not `dimension_names`, not `storage_transformers`, and not the
-codec chain beyond the one name above.
+`fill_value`, not `storage_transformers`, and not the codec chain beyond the one
+name above.
+
+### Dimension names
+
+A V3 array may name its own dimensions. The key is optional, and where it
+appears it is a list as long as the shape whose entries are each a string or
+`null`:
+
+```json
+"dimension_names": ["c", null, "y", "x"]
+```
+
+The names are shown in order on a `dimensions` row, after `dtype`:
+
+```
+└─ dimensions: c, ?, y, x
+```
+
+A `null` entry means the dimension is there and is deliberately unnamed. It
+keeps its position as `?` rather than being dropped, because dropping it would
+slide every later name onto the wrong dimension, and no name is invented to
+fill the gap — not from the shape, not from a convention about what four
+dimensions are usually called. An entry that is neither a string nor `null`
+gets the same `?`.
+
+An array that declares no `dimension_names`, or whose key is not a list, prints
+no row at all and carries no `dimension_names` in `--json`; where the key is
+there, `--json` gives back the list as stored, `null` entries included. A
+malformed key costs that one row and nothing else: the array is still an array
+and the walk goes on.
+
+Zarr V2 has no equivalent key, and none is invented for it. A V2 array's output
+is exactly what it has always been.
+
+These are the *array's* dimension names, and they are not the same thing as
+OME-Zarr `axes`. The axes are NGFF semantic metadata, read from a multiscale
+group's attributes and describing what the dimensions of that image *mean*; the
+dimension names are plain Zarr metadata belonging to one array. An array under
+an OME-Zarr image may carry both, in which case both are shown on their own
+rows — neither is derived from the other, and neither replaces the other. See
+[OME-Zarr](ome-zarr.md).
 
 ### Object-form data types
 
@@ -177,19 +219,26 @@ Only rows this program actually reads:
 
 ## Arrays and their metadata
 
-Every array prints three rows, and a sharded V3 array prints a fourth:
+Every array prints three rows. A sharded V3 array prints a `shards` row after
+its chunks, and a V3 array that names its dimensions prints a `dimensions` row
+after its dtype:
 
 ```
-├─ shape:  [4096, 4096]
-├─ chunks: [512, 512]
-├─ shards: [2048, 2048]
-└─ dtype:  uint16
+├─ shape:      [3, 4096, 4096]
+├─ chunks:     [1, 512, 512]
+├─ shards:     [1, 2048, 2048]
+├─ dtype:      uint16
+└─ dimensions: c, y, x
 ```
 
 `shape`, `chunks` and `dtype` are always drawn, showing `?` when the field
 could not be read — they are the three things every Zarr array has, so their
 absence is information. `shards` is drawn only for an array that named the
-sharding codec; an unsharded array has no shards to be missing.
+sharding codec; an unsharded array has no shards to be missing. `dimensions` is
+drawn only for a V3 array that declared `dimension_names` — see
+[Dimension names](#dimension-names). The row names are padded to the longest
+one actually printed, so an array with no `dimensions` row is laid out exactly
+as it always was.
 
 Dimension entries are copied out of the file rather than parsed into numbers.
 A malformed `"shape": [1, "x"]` prints as `[1, "x"]` rather than being dropped
@@ -448,7 +497,7 @@ shape in the [Command-line reference](cli.md#json-output).)
 | `name` | The directory name. On the root, the path as it was typed. |
 | `kind` | `"group"`, `"array"` or `"unknown"` |
 | `children` | The child nodes, in the order the tree lists them. Empty for an array, and empty at the depth limit. |
-| `array` | `shape`, `chunks`, `dtype`, and `shards` on a sharded V3 array. |
+| `array` | `shape`, `chunks`, `dtype`, `shards` on a sharded V3 array, and `dimension_names` on a V3 array that declares them. |
 
 ```
 $ zarr-tree --json sharded.zarr | jq '.children[0]'
@@ -470,9 +519,17 @@ Two rules govern the `array` object:
 - A field that was looked for and could not be read is `null`, the same thing
   the tree draws as `?`. `shape`, `chunks` and `dtype` are therefore always
   present.
-- `shards` is **omitted entirely** on an unsharded array rather than written as
-  `null`. The two say different things: `null` means "looked for, not
-  readable", and an unsharded array has no shards to miss.
+- `shards` and `dimension_names` are **omitted entirely** where they do not
+  apply, rather than written as `null`. The two say different things: `null`
+  means "looked for, not readable", and an unsharded array has no shards to
+  miss, just as an array naming no dimensions has no names to miss.
+
+Inside `dimension_names` a `null` means a third thing again — a dimension the
+file itself left unnamed, kept in its own position:
+
+```json
+"dimension_names": ["c", null, "y", "x"]
+```
 
 Object keys come out in alphabetical order — `serde_json`'s default, kept
 rather than fought.
@@ -552,9 +609,11 @@ enough to run against a remote store at all.
 - **Complete Zarr specification validation.** `--validate` checks a store
   against its own declarations, never a document against a schema.
 - **Store repair, rewriting or writing of any kind.**
-- **Compressors, fill values, dimension names and user attributes.** Attributes
-  are read only for the OME-Zarr and SpatialData markers, and are never
-  displayed as attributes.
+- **Compressors, fill values and user attributes.** Attributes are read only
+  for the OME-Zarr and SpatialData markers, and are never displayed as
+  attributes. A V3 array's `dimension_names` are shown, but only as stored —
+  they are not checked against the shape, matched against OME-Zarr axes, or
+  used to filter or reorder anything.
 - **dtype translation and interpretation.** V2 dtypes are passed through in
   NumPy notation and are never mapped onto V3 names. A V3 extension dtype is
   reported by its name alone: its `configuration` is not shown, not checked and
