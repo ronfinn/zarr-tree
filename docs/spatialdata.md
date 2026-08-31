@@ -55,10 +55,15 @@ on — and an ordinary Zarr store whose children happen to be called `points` an
 ```
 $ zarr-tree plain.zarr
 plain.zarr [group]
+├─ zarr: V3
 ├── images [group]
+│   └─ zarr: V3
 ├── points [group]
+│   └─ zarr: V3
 ├── shapes [group]
+│   └─ zarr: V3
 └── tables [group]
+    └─ zarr: V3
 ```
 
 **The scientific payload is never loaded to recognise anything.** An element is
@@ -96,11 +101,17 @@ The tag carries the *container* format version, read from
 ```
 $ zarr-tree --depth 1 experiment.zarr
 experiment.zarr [group, SpatialData 0.2]
+├─ zarr: V3
 ├── images [group]
+│   └─ zarr: V3
 ├── labels [group]
+│   └─ zarr: V3
 ├── points [group]
+│   └─ zarr: V3
 ├── shapes [group]
+│   └─ zarr: V3
 └── tables [group]
+    └─ zarr: V3
 ```
 
 A root whose marker is present but whose version is missing, null, or not a
@@ -199,11 +210,14 @@ found:
 ```
 $ zarr-tree --depth 2 experiment.zarr/images
 experiment.zarr/images [group]
+├─ zarr: V3
 └── morphology [group, OME-Zarr 0.5-dev-spatialdata, SpatialData image]
+    ├─ zarr: V3
     ├─ axes: c, y, x
     ├─ pyramid levels: 1
     ├─ datasets: s0
     └── s0 [array]
+        ├─ zarr:   V3
         ├─ shape:  [4, 2048, 2048]
         ├─ chunks: [1, 512, 512]
         └─ dtype:  uint16
@@ -240,7 +254,9 @@ already say what is in it:
 ```
 $ zarr-tree --depth 2 experiment.zarr/points
 experiment.zarr/points [group]
+├─ zarr: V3
 └── transcripts [group, SpatialData points]
+    ├─ zarr: V3
     ├─ rows: 3,714
     ├─ columns: 4
     ├─ parquet files: 2
@@ -272,7 +288,9 @@ between the two payload kinds — see
 ```
 $ zarr-tree --depth 2 experiment.zarr/shapes
 experiment.zarr/shapes [group]
+├─ zarr: V3
 └── cell_boundaries [group, SpatialData shapes]
+    ├─ zarr: V3
     ├─ rows: 1,200
     ├─ columns: 2
     ├─ parquet files: 1
@@ -385,8 +403,11 @@ directory looked exactly like one with no payload until they were told apart.
 ```
 $ zarr-tree --depth 1 https://static.example/data/xenium.zarr
 https://static.example/data/xenium.zarr [group, SpatialData 0.2]
+├─ zarr: V3
 └── points [group]
+    ├─ zarr: V3
     └── transcripts [group, SpatialData points]
+        ├─ zarr: V3
         └─ parquet files: ?
 ```
 
@@ -442,6 +463,7 @@ Zarr hierarchy of groups and arrays, walked and printed like any other:
 ```
 $ zarr-tree --depth 1 experiment.zarr/tables/table
 experiment.zarr/tables/table [group, SpatialData table]
+├─ zarr: V3
 ├─ observations: 1,200
 ├─ variables: 313
 ├─ X: dense [1200, 313] float32
@@ -451,11 +473,14 @@ experiment.zarr/tables/table [group, SpatialData table]
 ├─ region key: region
 ├─ instance key: cell_id
 ├── X [array]
+│   ├─ zarr:   V3
 │   ├─ shape:  [1200, 313]
 │   ├─ chunks: [1200, 313]
 │   └─ dtype:  float32
 ├── obs [group]
+│   └─ zarr: V3
 └── var [group]
+    └─ zarr: V3
 ```
 
 The summary is licensed by the table marker and by nothing else. A group that

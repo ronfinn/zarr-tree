@@ -19,6 +19,56 @@ use serde_json::{Map, Value, json};
 use tokio::runtime::Runtime;
 use url::Url;
 
+/// Which version of the Zarr metadata format a node was actually read as.
+///
+/// Not "which metadata files exist" -- which one `classify` believed. A node
+/// carrying both a `.zgroup` and a `zarr.json` is `V2`, because V2 is the
+/// branch that answered first and V2 is therefore what every other field on
+/// the node was read out of. Reporting anything else would describe a reading
+/// this program did not do.
+///
+/// An enum, rather than a `bool`, an integer or a `String`, because the set of
+/// states is closed and both of them have names. A `bool` would need a
+/// convention nobody can read off the call site -- `format: true` says
+/// nothing -- and an integer or a string can hold `4`, `0` or `"v3 "`, states
+/// that cannot arise here but that every reader would still have to handle. A
+/// two-variant enum makes those unrepresentable, and makes every `match` on it
+/// exhaustive: adding a third version later is a compile error at each place
+/// that must say something new, instead of a silent fall-through at run time.
+///
+/// `Copy` because it is two bits of information: passing one by value is
+/// cheaper than the reference that would borrow it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZarrFormat {
+    /// Read from `.zgroup` or `.zarray`.
+    V2,
+    /// Read from `zarr.json`.
+    V3,
+}
+
+impl ZarrFormat {
+    /// The short label the tree prints beside `zarr:`.
+    ///
+    /// A `match` over both variants rather than a lookup table or a cast: the
+    /// compiler checks that every state is answered, which is the whole reason
+    /// this is an enum.
+    fn label(self) -> &'static str {
+        match self {
+            ZarrFormat::V2 => "V2",
+            ZarrFormat::V3 => "V3",
+        }
+    }
+
+    /// The number Zarr itself stamps into `zarr_format`, which is what
+    /// `--json` carries so that a consumer sees the spelling the format uses.
+    fn number(self) -> u64 {
+        match self {
+            ZarrFormat::V2 => 2,
+            ZarrFormat::V3 => 3,
+        }
+    }
+}
+
 /// What kind of Zarr node a directory is, as far as its metadata files reveal.
 enum NodeKind {
     /// A Zarr group, together with whatever its attributes say about it.
@@ -37,6 +87,10 @@ enum NodeKind {
 /// The third is not independent of them, and is the one field here that does
 /// not come out of a metadata file at all -- see `parquet`.
 struct GroupMeta {
+    /// Which Zarr metadata version this group was read as. Decided by
+    /// `classify`, and by nothing else: it is which branch answered, not which
+    /// files happen to exist. See `ZarrFormat`.
+    format: ZarrFormat,
     /// Set when the group carries OME-Zarr image metadata. See `ome_info`.
     ome: Option<OmeInfo>,
     /// What this group is in SpatialData's own vocabulary, when it says
@@ -370,6 +424,10 @@ impl SpatialData {
 /// `None`: only a V3 array using the sharding codec has shards at all, so
 /// every other array simply has nothing to say here.
 struct ArrayMeta {
+    /// Which Zarr metadata version this array was read as. Set by whichever of
+    /// `array_meta_v2` and `array_meta_v3` built it, so it cannot drift from
+    /// the file the rest of these fields came out of. See `ZarrFormat`.
+    format: ZarrFormat,
     shape: Option<Vec<Value>>,
     chunks: Option<Vec<Value>>,
     shards: Option<Vec<Value>>,
@@ -636,6 +694,25 @@ impl NodeKind {
             NodeKind::Group(_) => "group",
             NodeKind::Array(_) => "array",
             NodeKind::Unknown => "unknown",
+        }
+    }
+
+    /// Which Zarr metadata version this node was read as, or `None` when it
+    /// was not read as any.
+    ///
+    /// The two kinds keep it in fields of their own -- one struct each, and
+    /// neither knows about the other -- so this is the one place that asks
+    /// without caring which it has, exactly as `node_attributes` does.
+    ///
+    /// `Unknown` has no format and is given none. Nothing classified the node,
+    /// so no metadata file was believed, and there is no version to report: a
+    /// guess from a filename that failed to parse would be the one thing this
+    /// row must never be.
+    fn format(&self) -> Option<ZarrFormat> {
+        match self {
+            NodeKind::Group(meta) => Some(meta.format),
+            NodeKind::Array(meta) => Some(meta.format),
+            NodeKind::Unknown => None,
         }
     }
 }
@@ -2135,6 +2212,9 @@ fn classify(store: &dyn Store, path: &str, attributes: bool) -> NodeKind {
             .and_then(|text| serde_json::from_str::<Value>(text).ok());
         let spatialdata = attrs.as_ref().and_then(spatialdata_info_v2);
         return NodeKind::Group(GroupMeta {
+            // The V2 branch answered, so V2 is what this node was read as --
+            // whether or not a `zarr.json` also sits beside these files.
+            format: ZarrFormat::V2,
             ome: attrs.as_ref().and_then(ome_info_v2),
             // Read after the attributes and only because of them: what the
             // metadata said this element is decides whether there is a payload
@@ -2195,6 +2275,7 @@ fn classify_v3(store: &dyn Store, path: &str, attributes: bool) -> Option<NodeKi
         "group" => {
             let spatialdata = spatialdata_info_v3(&value);
             Some(NodeKind::Group(GroupMeta {
+                format: ZarrFormat::V3,
                 ome: ome_info_v3(&value),
                 parquet: parquet_summary(store, path, spatialdata.as_ref()),
                 anndata: anndata_summary(
@@ -3019,11 +3100,15 @@ fn grouped(count: i64) -> String {
 
 /// The metadata rows to print underneath a node's own line, in display order.
 ///
-/// A group with neither OME-Zarr metadata nor a Parquet payload has nothing to
-/// say here and gets an empty list. Returning one list rather than one
-/// argument per row keeps `print_tree` from growing a parameter every time a
-/// row is added: all it needs to know is how many rows there are and what each
-/// one says.
+/// Every recognised group has at least the `zarr:` row saying which version of
+/// the metadata format it was read as; a group with neither OME-Zarr metadata
+/// nor a Parquet payload has nothing else to say and gets that row alone. An
+/// unrecognised node still gets an empty list -- nothing classified it, so
+/// there is no reading to report.
+///
+/// Returning one list rather than one argument per row keeps `print_tree` from
+/// growing a parameter every time a row is added: all it needs to know is how
+/// many rows there are and what each one says.
 fn group_rows(kind: &NodeKind) -> Vec<String> {
     // `let ... else` matches one pattern and takes an early exit when it does
     // not fit, which reads better here than a `match` whose other arm is just
@@ -3032,11 +3117,19 @@ fn group_rows(kind: &NodeKind) -> Vec<String> {
         return Vec::new();
     };
 
+    // First, and on every recognised group. This is the format the rows below
+    // it were read out of, so it belongs above them rather than among them:
+    // everything that follows is an interpretation made *within* this version
+    // of the metadata format. It is also the one row here that never depends
+    // on what the group happens to carry, which is what lets an array put it
+    // in the same place -- see `print_array_meta`.
+    let mut rows = vec![format!("zarr: {}", meta.format.label())];
+
     // Order is display order and nothing more. The four readers are
     // independent, and no group has anything to say to more than two of them:
     // a table has AnnData rows and annotation rows, a points element has
     // Parquet rows, and neither has the other's.
-    let mut rows = ome_rows(meta.ome.as_ref());
+    rows.extend(ome_rows(meta.ome.as_ref()));
     rows.extend(anndata_rows(meta.anndata.as_deref()));
     rows.extend(table_rows(meta.spatialdata.as_ref()));
     rows.extend(parquet_rows(&meta.parquet));
@@ -3306,6 +3399,7 @@ fn read_json(store: &dyn Store, path: &str) -> Option<Value> {
 fn array_meta_v2(text: &str) -> ArrayMeta {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return ArrayMeta {
+            format: ZarrFormat::V2,
             shape: None,
             chunks: None,
             shards: None,
@@ -3316,6 +3410,7 @@ fn array_meta_v2(text: &str) -> ArrayMeta {
     };
 
     ArrayMeta {
+        format: ZarrFormat::V2,
         shape: dims(value.get("shape")),
         chunks: dims(value.get("chunks")),
         // V2 has no sharding: there is one grid and `chunks` is it.
@@ -3374,6 +3469,7 @@ fn array_meta_v3(value: &Value) -> ArrayMeta {
     };
 
     ArrayMeta {
+        format: ZarrFormat::V3,
         shape: dims(value.get("shape")),
         chunks,
         shards,
@@ -3563,7 +3659,7 @@ fn dataset_paths(value: Option<&Value>) -> Option<Vec<String>> {
 
 /// Print the metadata rows that sit underneath an array line.
 ///
-/// `shape`, `chunks` and `dtype` are always printed, in that order. A sharded
+/// `zarr`, `shape`, `chunks` and `dtype` are always printed, in that order. A sharded
 /// array gains a `shards` row between `chunks` and `dtype`, and an array that
 /// names its dimensions gains a `dimensions` row after `dtype`; every other
 /// array prints exactly the three rows it always has. Whichever row ends up
@@ -3584,7 +3680,14 @@ fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::
     // of rows is no longer fixed. Everything else about the drawing is the
     // same, including which name the padding is sized to -- "shards:" is the
     // same width as "chunks:".
-    let mut rows = vec![("shape:", shape.as_deref()), ("chunks:", chunks.as_deref())];
+    let mut rows = vec![
+        // First, for the reason `group_rows` puts it first: it is the format
+        // the three rows below were read out of, and it is the one row every
+        // array has whatever else it declares.
+        ("zarr:", Some(meta.format.label())),
+        ("shape:", shape.as_deref()),
+        ("chunks:", chunks.as_deref()),
+    ];
 
     if let Some(shards) = shards.as_deref() {
         rows.push(("shards:", Some(shards)));
@@ -3641,7 +3744,8 @@ fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::
 /// soon as the reader does. JSON has no such option -- a document is a whole
 /// or it is nothing -- so only this side pays for being assembled in memory.
 ///
-/// Each node carries its `name`, its Zarr `kind`, and its `children`. The
+/// Each node carries its `name`, its Zarr `kind`, its `zarr_format` where it
+/// was recognised as one, and its `children`. The
 /// metadata sections -- `array`, `ome`, `spatialdata` -- appear only on the
 /// nodes they apply to, and a field inside one is `null` when the file did not
 /// give us a readable value. That is the same rule the tree follows when it
@@ -3658,6 +3762,16 @@ fn json_tree(
         "name": name,
         "kind": kind.kind(),
     });
+
+    // Beside `kind` and outside the per-kind sections, for the reason `kind`
+    // is: both kinds of recognised node have one, and a reader looks for a
+    // node's Zarr version on the node. Spelled as the number Zarr itself
+    // stamps into `zarr_format`, not as `"v3"`, so that it matches the files
+    // it was read from. An unrecognised node has no key at all rather than a
+    // `null` -- see `NodeKind::format`.
+    if let Some(format) = kind.format() {
+        node["zarr_format"] = json!(format.number());
+    }
 
     // Above the per-kind sections and outside them, because attributes are the
     // one piece of metadata both kinds have and both keep in the same place.
@@ -5702,7 +5816,9 @@ mod tests {
         // saving it makes on S3.
         assert_eq!(
             rendered(store.as_ref(), "store.zarr", Some(0)),
-            "store.zarr [group]\n"
+            // The node's own rows still print at the limit -- they describe
+            // this node, not anything below it.
+            "store.zarr [group]\n└─ zarr: V3\n"
         );
         assert!(
             !server.requests().iter().any(|request| request.is_empty()),
@@ -5854,7 +5970,7 @@ mod tests {
         // The root on its own. Nothing below it is listed, which remotely means
         // no listing request is made at all.
         let root_only = rendered(&store, "store.zarr", Some(0));
-        assert_eq!(root_only, "store.zarr [group]\n");
+        assert_eq!(root_only, "store.zarr [group]\n└─ zarr: V3\n");
 
         // One level, then two. `A/1/0` is the array at the bottom, and it
         // appears only once the limit reaches it.
@@ -6200,6 +6316,225 @@ mod tests {
         assert!(matches!(kind, NodeKind::Unknown));
     }
 
+    /// Which Zarr metadata version a directory of real files was read as.
+    ///
+    /// Through `classify_dir`, so what is under test is the branch that
+    /// actually answered rather than an assumption about which files exist.
+    fn format_of(dir: &Path) -> Option<ZarrFormat> {
+        classify_dir(dir).format()
+    }
+
+    #[test]
+    fn a_v2_group_and_a_v2_array_report_v2() {
+        let group = fixture("format-v2-group");
+        fs::write(group.join(".zgroup"), r#"{"zarr_format": 2}"#).unwrap();
+
+        let array = fixture("format-v2-array");
+        fs::write(
+            array.join(".zarray"),
+            r#"{"zarr_format": 2, "shape": [8], "chunks": [4], "dtype": "<u2"}"#,
+        )
+        .unwrap();
+
+        let group_format = format_of(&group);
+        let array_format = format_of(&array);
+        let group_row = group_rows(&classify_dir(&group));
+        let array_tree = rendered(
+            &LocalStore::new(&array.to_string_lossy()),
+            "image.zarr",
+            None,
+        );
+
+        fs::remove_dir_all(&group).unwrap();
+        fs::remove_dir_all(&array).unwrap();
+
+        assert_eq!(group_format, Some(ZarrFormat::V2));
+        assert_eq!(array_format, Some(ZarrFormat::V2));
+        assert_eq!(group_row, vec!["zarr: V2"]);
+        // First of the array's rows, and padded to the same width as the rows
+        // it has always had.
+        assert!(array_tree.contains("zarr:   V2"), "{array_tree}");
+    }
+
+    #[test]
+    fn a_v3_group_and_a_v3_array_report_v3() {
+        let group = fixture("format-v3-group");
+        fs::write(
+            group.join("zarr.json"),
+            r#"{"zarr_format": 3, "node_type": "group"}"#,
+        )
+        .unwrap();
+
+        let array = fixture("format-v3-array");
+        fs::write(
+            array.join("zarr.json"),
+            r#"{"zarr_format": 3, "node_type": "array", "shape": [8],
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
+                "data_type": "uint16"}"#,
+        )
+        .unwrap();
+
+        let group_format = format_of(&group);
+        let array_format = format_of(&array);
+        let group_row = group_rows(&classify_dir(&group));
+
+        fs::remove_dir_all(&group).unwrap();
+        fs::remove_dir_all(&array).unwrap();
+
+        assert_eq!(group_format, Some(ZarrFormat::V3));
+        assert_eq!(array_format, Some(ZarrFormat::V3));
+        assert_eq!(group_row, vec!["zarr: V3"]);
+    }
+
+    #[test]
+    fn a_node_carrying_both_v2_and_v3_metadata_reports_the_one_that_classified_it() {
+        // The regression this row exists to keep honest. `classify` checks V2
+        // first, so a node with both files is read as V2 -- every other field
+        // on it came out of `.zgroup`/`.zarray`, and the row has to describe
+        // that reading rather than the file it did not use.
+        let group = fixture("format-dual-group");
+        fs::write(group.join(".zgroup"), r#"{"zarr_format": 2}"#).unwrap();
+        fs::write(
+            group.join("zarr.json"),
+            r#"{"zarr_format": 3, "node_type": "group"}"#,
+        )
+        .unwrap();
+
+        let array = fixture("format-dual-array");
+        fs::write(
+            array.join(".zarray"),
+            r#"{"zarr_format": 2, "shape": [8], "chunks": [4], "dtype": "<u2"}"#,
+        )
+        .unwrap();
+        fs::write(
+            array.join("zarr.json"),
+            r#"{"zarr_format": 3, "node_type": "array", "shape": [99],
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [99]}},
+                "data_type": "uint16"}"#,
+        )
+        .unwrap();
+
+        let group_format = format_of(&group);
+        let array_tree = rendered(
+            &LocalStore::new(&array.to_string_lossy()),
+            "dual.zarr",
+            None,
+        );
+
+        fs::remove_dir_all(&group).unwrap();
+        fs::remove_dir_all(&array).unwrap();
+
+        assert_eq!(group_format, Some(ZarrFormat::V2));
+        // Not `V3`, and -- the proof that the row is not read from a second
+        // file of its own -- the shape beside it is V2's `[8]` too.
+        assert!(array_tree.contains("zarr:   V2"), "{array_tree}");
+        assert!(array_tree.contains("shape:  [8]"), "{array_tree}");
+    }
+
+    #[test]
+    fn an_unrecognised_node_is_given_no_format_at_all() {
+        let dir = fixture("format-unknown");
+        // Truncated mid-object, as `malformed_v3_metadata_classifies_as_unknown`
+        // writes it: nothing classified this node, so nothing knows what
+        // version it was going to be.
+        fs::write(dir.join("zarr.json"), r#"{"zarr_format": 3, "node_type":"#).unwrap();
+        let store = LocalStore::new(&dir.to_string_lossy());
+
+        let kind = classify_dir(&dir);
+        let rows = group_rows(&kind);
+        let json = json_tree(&store, "", "broken.zarr", kind, None, false).unwrap();
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(format_of_value(&json), None);
+        // A `zarr_format` of `3` sits in that file, unparseably. Guessing it
+        // from the bytes we could not read is the one thing this row must
+        // never do.
+        assert!(json.get("zarr_format").is_none(), "{json}");
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// The `zarr_format` of a `--json` node, or `None` when it carries none.
+    fn format_of_value(node: &Value) -> Option<u64> {
+        node.get("zarr_format").and_then(Value::as_u64)
+    }
+
+    #[test]
+    fn json_spells_the_format_as_the_number_the_metadata_files_use() {
+        let dir = fixture("format-json");
+        write_fixture(
+            &dir,
+            &[
+                ("zarr.json", r#"{"zarr_format": 3, "node_type": "group"}"#),
+                (".zgroup", r#"{"zarr_format": 2}"#),
+                (
+                    "v3/zarr.json",
+                    r#"{"zarr_format": 3, "node_type": "array", "shape": [8],
+                        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [4]}},
+                        "data_type": "uint16"}"#,
+                ),
+                (
+                    "v2/.zarray",
+                    r#"{"zarr_format": 2, "shape": [8], "chunks": [4], "dtype": "<u2"}"#,
+                ),
+            ],
+        );
+        let store = LocalStore::new(&dir.to_string_lossy());
+
+        let kind = classify(&store, "", false);
+        let json = json_tree(&store, "", "store.zarr", kind, None, false).unwrap();
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        // `2` and `3`, the spelling Zarr itself stamps into its files -- not
+        // `"v2"`, and not a `false`/`true` nobody could read.
+        assert_eq!(format_of_value(&json), Some(2), "{json}");
+
+        let children = json["children"].as_array().expect("two children");
+        let by_name = |name: &str| -> u64 {
+            let child = children
+                .iter()
+                .find(|child| child["name"] == json!(name))
+                .unwrap_or_else(|| panic!("a child called {name}"));
+            format_of_value(child).unwrap_or_else(|| panic!("{name} has a format"))
+        };
+        assert_eq!(by_name("v2"), 2);
+        assert_eq!(by_name("v3"), 3);
+
+        // And nothing else about a node's JSON moved: `kind` still says which
+        // of the two it is, and no `node_type` was added beside it.
+        assert_eq!(json["kind"], json!("group"));
+        assert!(json.get("node_type").is_none(), "{json}");
+    }
+
+    #[test]
+    fn an_ome_zarr_group_keeps_its_semantic_label_and_gains_the_zarr_format() {
+        // Two layers, reported separately: `OME-Zarr 0.5` is what the
+        // attributes mean, `V3` is the metadata format they were stored in.
+        // Neither is derived from the other.
+        let dir = fixture("format-ome");
+        fs::write(
+            dir.join("zarr.json"),
+            r#"{"zarr_format": 3, "node_type": "group", "attributes": {"ome": {
+                "version": "0.5",
+                "multiscales": [{"axes": [{"name": "y"}, {"name": "x"}],
+                                 "datasets": [{"path": "0"}]}]}}}"#,
+        )
+        .unwrap();
+
+        let kind = classify_dir(&dir);
+        let label = kind.label();
+        let rows = group_rows(&kind);
+
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(label, "[group, OME-Zarr 0.5]");
+        assert_eq!(
+            rows,
+            vec!["zarr: V3", "axes: y, x", "pyramid levels: 1", "datasets: 0"]
+        );
+    }
+
     #[test]
     fn a_v3_object_data_type_is_reported_by_its_extension_name() {
         // The extension form: an object naming the data type, and configuring
@@ -6525,13 +6860,17 @@ mod tests {
         // occupancy of a plate is not this tool's business.
         assert_eq!(
             group_rows(&NodeKind::Group(GroupMeta {
+                format: ZarrFormat::V3,
                 ome: Some(info),
                 spatialdata: None,
                 parquet: Payload::Absent,
                 anndata: None,
                 attributes: Attributes::Absent,
             })),
-            vec!["rows: 2", "columns: 3", "wells: 3"]
+            // The `zarr:` row every recognised group now carries sits above
+            // them. It is the format the plate metadata was read out of, and
+            // is no part of the plate's own vocabulary.
+            vec!["zarr: V3", "rows: 2", "columns: 3", "wells: 3"]
         );
     }
 
@@ -6548,15 +6887,17 @@ mod tests {
         let info = ome_info_v3(&value).expect("the marker alone makes this a plate");
 
         assert_eq!(info.tag(), "OME-Zarr 0.4 plate");
-        assert!(
+        assert_eq!(
             group_rows(&NodeKind::Group(GroupMeta {
+                format: ZarrFormat::V3,
                 ome: Some(info),
                 spatialdata: None,
                 parquet: Payload::Absent,
                 anndata: None,
                 attributes: Attributes::Absent,
-            }))
-            .is_empty()
+            })),
+            // Nothing but the `zarr:` row every recognised group carries.
+            vec!["zarr: V3"]
         );
     }
 
@@ -6579,15 +6920,17 @@ mod tests {
         assert_eq!(info.kind.name(), "well");
         // A well is tagged and nothing more: the images it lists are the child
         // groups the tree is already printing below it.
-        assert!(
+        assert_eq!(
             group_rows(&NodeKind::Group(GroupMeta {
+                format: ZarrFormat::V3,
                 ome: Some(info),
                 spatialdata: None,
                 parquet: Payload::Absent,
                 anndata: None,
                 attributes: Attributes::Absent,
-            }))
-            .is_empty()
+            })),
+            // Nothing but the `zarr:` row every recognised group carries.
+            vec!["zarr: V3"]
         );
     }
 
@@ -6614,13 +6957,14 @@ mod tests {
         // No `wells` list was declared, so no wells row -- the other two stand.
         assert_eq!(
             group_rows(&NodeKind::Group(GroupMeta {
+                format: ZarrFormat::V2,
                 ome: Some(info),
                 spatialdata: None,
                 parquet: Payload::Absent,
                 anndata: None,
                 attributes: Attributes::Absent,
             })),
-            vec!["rows: 1", "columns: 1"]
+            vec!["zarr: V2", "rows: 1", "columns: 1"]
         );
     }
 
@@ -7383,7 +7727,9 @@ mod tests {
 
         assert_eq!(
             rendered(store.as_ref(), "store.zarr", Some(0)),
-            "store.zarr [group]\n"
+            // The node's own rows still print at the limit -- they describe
+            // this node, not anything below it.
+            "store.zarr [group]\n└─ zarr: V3\n"
         );
 
         let one = rendered(store.as_ref(), "store.zarr", Some(1));
@@ -8045,10 +8391,12 @@ mod tests {
         .unwrap();
         let store = LocalStore::new(&dir.to_string_lossy());
 
-        assert!(group_rows(&classify(&store, "", false)).is_empty());
+        // The `zarr:` row is unconditional; the attributes row is the one the
+        // flag adds.
+        assert_eq!(group_rows(&classify(&store, "", false)), vec!["zarr: V3"]);
         assert_eq!(
             group_rows(&classify(&store, "", true)),
-            vec![r#"attributes: {"experiment":"A"}"#]
+            vec!["zarr: V3", r#"attributes: {"experiment":"A"}"#]
         );
 
         fs::remove_dir_all(&dir).unwrap();
@@ -8076,7 +8424,9 @@ mod tests {
         assert_eq!(kind.label(), "[group, OME-Zarr 0.4]");
 
         let rows = group_rows(&kind);
-        assert_eq!(rows.first().map(String::as_str), Some("axes: y, x"));
+        // `zarr:` first, then the reading, then the document it came out of.
+        assert_eq!(rows.first().map(String::as_str), Some("zarr: V2"));
+        assert_eq!(rows.get(1).map(String::as_str), Some("axes: y, x"));
         assert!(
             rows.last()
                 .is_some_and(|row| row.starts_with("attributes: {\"multiscales\":")),
@@ -8727,6 +9077,9 @@ mod tests {
         assert_eq!(
             rows,
             vec![
+                // The Zarr version the whole summary was read out of, above
+                // the summary itself.
+                "zarr: V3",
                 "observations: 167,780",
                 "variables: 313",
                 "X: csr [167780, 313]",
@@ -8850,6 +9203,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![
+                "zarr: V3",
                 "observations: 167,780",
                 "variables: 313",
                 "X: csr [167780, 313]"
@@ -8894,6 +9248,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![
+                "zarr: V3",
                 "observations: 3,309",
                 "X: csr",
                 "obs columns: 1",
@@ -9008,6 +9363,7 @@ mod tests {
 
         let meta = group_meta(&dir);
         let rows = group_rows(&NodeKind::Group(GroupMeta {
+            format: meta.format,
             ome: meta.ome,
             spatialdata: meta.spatialdata,
             parquet: meta.parquet,
@@ -9017,7 +9373,10 @@ mod tests {
 
         fs::remove_dir_all(&dir).unwrap();
 
-        assert!(rows.is_empty(), "{rows:?}");
+        // The `zarr:` row and nothing else: no reader here found anything to
+        // say, which is the point -- a group is not a table for holding three
+        // children with the right names.
+        assert_eq!(rows, vec!["zarr: V3"], "{rows:?}");
     }
 
     #[test]
@@ -9085,6 +9444,8 @@ mod tests {
         assert_eq!(
             rows,
             vec![
+                // A V2 table, and the row says so.
+                "zarr: V2",
                 "observations: 2,389",
                 "variables: 268",
                 "X: csr [2389, 268]",
@@ -9114,6 +9475,7 @@ mod tests {
             tree.lines().collect::<Vec<&str>>(),
             vec![
                 "table [group, SpatialData table]",
+                "├─ zarr: V3",
                 "├─ observations: 167,780",
                 "├─ variables: 313",
                 "├─ X: csr [167780, 313]",
@@ -9122,9 +9484,14 @@ mod tests {
                 "├─ annotates: cell_circles",
                 "├─ region key: region",
                 "├─ instance key: cell_id",
+                // Each child group carries its own `zarr:` row, which is
+                // also what stops the depth limit from hiding them.
                 "├── X [group]",
+                "│   └─ zarr: V3",
                 "├── obs [group]",
+                "│   └─ zarr: V3",
                 "└── var [group]",
+                "    └─ zarr: V3",
             ]
         );
     }

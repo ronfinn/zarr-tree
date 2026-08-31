@@ -106,11 +106,14 @@ otherwise:
 ```
 $ zarr-tree v2plate.zarr
 v2plate.zarr [group, OME-Zarr 0.4 plate]
+├─ zarr: V2
 ├─ rows: 1
 ├─ columns: 1
 ├─ wells: 1
 └── A [group]
+    ├─ zarr: V2
     └── 1 [group, OME-Zarr well]
+        └─ zarr: V2
 ```
 
 That plate declared `plate.version` of `0.4`; the well beside it declared no
@@ -190,6 +193,7 @@ renumbered or interpreted:
 ```
 $ zarr-tree named.zarr
 named.zarr [group, OME-Zarr 0.3]
+├─ zarr: V2
 ├─ axes: y, x
 ├─ pyramid levels: 2
 ├─ datasets: full, half
@@ -203,6 +207,7 @@ axes follow, so the count still matches what the file declares:
 ```
 $ zarr-tree partial.zarr
 partial.zarr [group, OME-Zarr]
+├─ zarr: V3
 ├─ axes: c, y, x
 ├─ pyramid levels: 2
 └─ datasets: 0, ?
@@ -243,12 +248,16 @@ groups name themselves the way an image does — with a key in their attributes,
 ```
 $ zarr-tree plate.zarr
 plate.zarr [group, OME-Zarr 0.5 plate]
+├─ zarr: V3
 ├─ rows: 2
 ├─ columns: 3
 ├─ wells: 6
 └── A [group]
+    ├─ zarr: V3
     └── 1 [group, OME-Zarr 0.5 well]
+        ├─ zarr: V3
         └── 0 [group, OME-Zarr 0.5]
+            ├─ zarr: V3
             ├─ axes: c, y, x
             ├─ pyramid levels: 1
             └─ datasets: 0
@@ -307,12 +316,16 @@ So:
 ```
 $ zarr-tree segmentation.zarr
 segmentation.zarr [group]
+├─ zarr: V2
 └── labels [group]
+    ├─ zarr: V2
     └── nuclei [group, OME-Zarr 0.4]
+        ├─ zarr: V2
         ├─ axes: y, x
         ├─ pyramid levels: 1
         ├─ datasets: 0
         └── 0 [array]
+            ├─ zarr:   V2
             ├─ shape:  [64, 64]
             ├─ chunks: [32, 32]
             └─ dtype:  <u4

@@ -11,6 +11,7 @@ reading of it. For the specification itself see
 - [Zarr V2](#zarr-v2)
 - [Zarr V3](#zarr-v3)
 - [V2 and V3 side by side](#v2-and-v3-side-by-side)
+- [Format version](#format-version)
 - [Arrays and their metadata](#arrays-and-their-metadata)
 - [Arrays are leaves](#arrays-are-leaves)
 - [Sharding](#sharding)
@@ -72,7 +73,9 @@ An array's fields come straight out of `.zarray`:
 ```
 $ zarr-tree v2.zarr
 v2.zarr [group]
+├─ zarr: V2
 └── measurements [array]
+    ├─ zarr:   V2
     ├─ shape:  [1024, 1024]
     ├─ chunks: [256, 256]
     └─ dtype:  <u2
@@ -217,6 +220,69 @@ Only rows this program actually reads:
 | Consolidation | `.zmetadata` at the root | inline `consolidated_metadata` in the root `zarr.json` |
 | OME-Zarr metadata | keys at the top level of `.zattrs` | `attributes.ome` |
 
+## Format version
+
+Every node `zarr-tree` recognised carries a `zarr` row saying which of the two
+metadata formats it was read as — the first row under the node's own line, on
+groups and arrays alike:
+
+```
+$ zarr-tree mixed.zarr
+mixed.zarr [group]
+├─ zarr: V3
+├── img [array]
+│   ├─ zarr:   V3
+│   ├─ shape:  [64, 64]
+│   ├─ chunks: [32, 32]
+│   └─ dtype:  uint16
+└── legacy [group]
+    ├─ zarr: V2
+    └── mask [array]
+        ├─ zarr:   V2
+        ├─ shape:  [8, 8]
+        ├─ chunks: [4, 4]
+        └─ dtype:  |u1
+```
+
+A store is not required to be all one version, which is why the row is per node
+rather than per store: a V3 root can hold a V2 subtree, and the tree above says
+so node by node.
+
+The row reports the format **this program actually read the node as**, not
+which metadata files happen to sit in its directory. Those are the same thing
+almost everywhere, and differ in exactly one case:
+
+> A node carrying both layouts — a `.zgroup`/`.zarray` *and* a `zarr.json` —
+> reports **V2**. Classification checks V2 first, so V2 is the document every
+> other field on that node was read out of, and the row has to describe that
+> reading. The `zarr.json` beside it was never opened.
+
+An `[unknown]` node gets **no row at all**. Nothing classified it, so no
+metadata document was believed and there is no version to report — and a
+version guessed from a filename that failed to parse is the one thing this row
+must never be. `--json` leaves the key out entirely for the same reason; see
+[JSON representation](#json-representation).
+
+The row costs no extra read anywhere. Which branch of the classification
+answered is already known by the time a node is drawn, so nothing is re-opened
+to render it.
+
+This is a layer below any semantic tag. An OME-Zarr image or a SpatialData
+element still carries its own label, and gains the `zarr` row beside it:
+
+```
+image.zarr [group, OME-Zarr 0.5]
+├─ zarr: V3
+├─ axes: c, y, x
+├─ pyramid levels: 3
+└─ datasets: 0, 1, 2
+```
+
+`OME-Zarr 0.5` is what the attributes mean; `V3` is the metadata format they
+were stored in. Neither is derived from the other, and the two version numbers
+move independently — OME-Zarr 0.4 stores are V2, OME-Zarr 0.5 stores are V3,
+but that is a fact about those specifications, not a rule this program applies.
+
 ## User attributes
 
 Both versions let a node carry arbitrary user attributes, in the two places the
@@ -227,8 +293,10 @@ under one row name for both versions:
 ```
 $ zarr-tree --attributes example.zarr
 example.zarr [group]
+├─ zarr: V3
 ├─ attributes: {"batch":3,"experiment":"A"}
 └── img [array]
+    ├─ zarr:       V3
     ├─ shape:      [64, 64]
     ├─ chunks:     [32, 32]
     ├─ dtype:      |u1
@@ -265,11 +333,12 @@ all V3 nodes cost nothing extra, their attributes being in a file already read.
 
 ## Arrays and their metadata
 
-Every array prints three rows. A sharded V3 array prints a `shards` row after
-its chunks, and a V3 array that names its dimensions prints a `dimensions` row
-after its dtype:
+Every array prints its format and then three rows. A sharded V3 array prints a
+`shards` row after its chunks, and a V3 array that names its dimensions prints
+a `dimensions` row after its dtype:
 
 ```
+├─ zarr:       V3
 ├─ shape:      [3, 4096, 4096]
 ├─ chunks:     [1, 512, 512]
 ├─ shards:     [1, 2048, 2048]
@@ -314,7 +383,9 @@ listing is made is reached only for a group or an unknown node. See
 ```
 $ zarr-tree big.zarr
 big.zarr [group]
+├─ zarr: V3
 └── volume [array]
+    ├─ zarr:   V3
     ├─ shape:  [8192, 8192, 8192]
     ├─ chunks: [64, 64, 64]
     └─ dtype:  uint8
@@ -340,7 +411,9 @@ are:
 ```
 $ zarr-tree sharded.zarr
 sharded.zarr [group]
+├─ zarr: V3
 └── img [array]
+    ├─ zarr:   V3
     ├─ shape:  [4096, 4096]
     ├─ chunks: [512, 512]
     ├─ shards: [2048, 2048]
@@ -361,7 +434,9 @@ its inner shape could be read.** A `sharding_indexed` codec whose
 ```
 $ zarr-tree badshard.zarr
 badshard.zarr [group]
+├─ zarr: V3
 └── img [array]
+    ├─ zarr:   V3
     ├─ shape:  [4096, 4096]
     ├─ chunks: ?
     ├─ shards: [2048, 2048]
@@ -477,11 +552,14 @@ or one field, and never the rest of the walk.
 ```
 $ zarr-tree broken.zarr
 broken.zarr [group]
+├─ zarr: V3
 ├── good [array]
+│   ├─ zarr:   V3
 │   ├─ shape:  [10]
 │   ├─ chunks: [10]
 │   └─ dtype:  float32
 ├── plain [array]
+│   ├─ zarr:   V2
 │   ├─ shape:  [10]
 │   ├─ chunks: ?
 │   └─ dtype:  ?
@@ -536,8 +614,9 @@ Besides stopping at arrays, the walk observes four rules:
 interpretation, so the tree and the document cannot disagree about what a store
 contains.
 
-Every node carries `name`, `kind` and `children`; an array additionally carries
-an `array` object. (Nodes also carry `ome`, `spatialdata`, `parquet` and
+Every node carries `name` and `children`, plus `kind` and — where it was
+recognised as one — `zarr_format`; an array additionally carries an `array`
+object. (Nodes also carry `ome`, `spatialdata`, `parquet` and
 `anndata` sections where those apply — see
 [OME-Zarr reference](ome-zarr.md#json-representation), and the whole-document
 shape in the [Command-line reference](cli.md#json-output).)
@@ -546,6 +625,7 @@ shape in the [Command-line reference](cli.md#json-output).)
 | --- | --- |
 | `name` | The directory name. On the root, the path as it was typed. |
 | `kind` | `"group"`, `"array"` or `"unknown"` |
+| `zarr_format` | `2` or `3`, the number Zarr itself stamps into its metadata files. Absent on an `[unknown]` node — see [Format version](#format-version). |
 | `children` | The child nodes, in the order the tree lists them. Empty for an array, and empty at the depth limit. |
 | `array` | `shape`, `chunks`, `dtype`, `shards` on a sharded V3 array, and `dimension_names` on a V3 array that declares them. |
 | `attributes` | The node's user attributes, with `--attributes` only. Values keep their JSON types; `null` where the document could not be read. Absent where there are none. |
@@ -561,7 +641,8 @@ $ zarr-tree --json sharded.zarr | jq '.children[0]'
   },
   "children": [],
   "kind": "array",
-  "name": "img"
+  "name": "img",
+  "zarr_format": 3
 }
 ```
 

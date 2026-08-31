@@ -5,7 +5,7 @@
 | Latest release | [v0.4.0](https://github.com/ronfinn/zarr-tree/releases/tag/v0.4.0) |
 | Development status | at v0.4.0, on `master` |
 | Minimum supported Rust version | 1.88 |
-| Tests | 94 unit, 18 integration |
+| Tests | 128 unit, 26 integration |
 | License | MIT |
 
 This document records what `zarr-tree` implements today. It is a capability
@@ -43,6 +43,7 @@ credentials` is not read. HTTP access is anonymous.
 | --- | --- |
 | Zarr V2 (`.zgroup`, `.zarray`) | Supported |
 | Zarr V3 (`zarr.json`) | Supported |
+| Effective format version reported per node (`zarr: V2`/`V3`, `zarr_format`) | Supported |
 | Array `shape`, `chunks`, `dtype` | Supported |
 | V3 sharding (`sharding_indexed`), chunks and shards reported separately | Supported |
 | Arrays treated as leaves — chunk objects never listed | Supported |

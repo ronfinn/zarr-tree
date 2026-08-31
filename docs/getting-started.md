@@ -62,12 +62,16 @@ Point it at a store directory:
 ```
 $ zarr-tree example.zarr
 example.zarr [group]
+├─ zarr: V3
 ├── labels [group]
+│   ├─ zarr: V3
 │   └── cells [array]
+│       ├─ zarr:   V3
 │       ├─ shape:  [1024, 1024]
 │       ├─ chunks: [512, 512]
 │       └─ dtype:  uint8
 └── measurements [array]
+    ├─ zarr:   V3
     ├─ shape:  [1024, 1024]
     ├─ chunks: [256, 256]
     └─ dtype:  uint16
@@ -81,10 +85,15 @@ Every node carries a label saying what its metadata identified it as:
 | `[array]` | A Zarr array. Arrays are leaves: the walk stops here. |
 | `[unknown]` | A directory whose metadata is missing or could not be parsed. It is still descended into. |
 
-An array prints the three fields read from its metadata — `shape`, `chunks` and
-`dtype` — and, on a sharded Zarr V3 array, a fourth `shards` row giving the
-chunk-grid shape while `chunks` gives the inner chunk shape. A field that could
-not be read prints as `?` rather than stopping the walk.
+Every recognised node also carries a `zarr:` row saying which metadata format
+it was read as — `V2` or `V3`. A store need not be all one version, so this is
+per node; an `[unknown]` node gets no such row, because nothing read it. See
+[Format version](zarr.md#format-version).
+
+An array then prints the three fields read from its metadata — `shape`,
+`chunks` and `dtype` — and, on a sharded Zarr V3 array, a fourth `shards` row
+giving the chunk-grid shape while `chunks` gives the inner chunk shape. A field
+that could not be read prints as `?` rather than stopping the walk.
 
 Groups recognised as OME-Zarr or SpatialData pick up an extra tag and a few
 metadata rows: `[group, OME-Zarr 0.4]`, `[group, SpatialData points]`. The
@@ -113,11 +122,15 @@ All three take the same walk and accept the same options — see
 ```
 $ zarr-tree --depth 0 example.zarr
 example.zarr [group]
+└─ zarr: V3
 
 $ zarr-tree --depth 1 example.zarr
 example.zarr [group]
+├─ zarr: V3
 ├── labels [group]
+│   └─ zarr: V3
 └── measurements [array]
+    ├─ zarr:   V3
     ├─ shape:  [1024, 1024]
     ├─ chunks: [256, 256]
     └─ dtype:  uint16

@@ -77,20 +77,26 @@ per metadata field.
 ```
 $ zarr-tree example.zarr
 example.zarr [group]
+├─ zarr: V3
 ├── image [group, OME-Zarr 0.5]
+│   ├─ zarr: V3
 │   ├─ axes: y, x
 │   ├─ pyramid levels: 2
 │   ├─ datasets: 0, 1
 │   ├── 0 [array]
+│   │   ├─ zarr:   V3
 │   │   ├─ shape:  [1024, 1024]
 │   │   ├─ chunks: [256, 256]
 │   │   └─ dtype:  uint16
 │   └── 1 [array]
+│       ├─ zarr:   V3
 │       ├─ shape:  [512, 512]
 │       ├─ chunks: [256, 256]
 │       └─ dtype:  uint16
 └── labels [group]
+    ├─ zarr: V3
     └── cells [array]
+        ├─ zarr:   V3
         ├─ shape:  [1024, 1024]
         ├─ chunks: [256, 256]
         └─ dtype:  uint8
@@ -120,6 +126,7 @@ depends on what the node is:
 
 | Rows | On |
 | --- | --- |
+| `zarr:` | Every recognised group and array, first — `V2` or `V3`, the metadata format the node was read as. See [Format version](zarr.md#format-version). |
 | `shape:`, `chunks:`, `dtype:` | Every array |
 | `shards:` | A Zarr V3 sharded array, between `chunks:` and `dtype:` |
 | `dimensions:` | A Zarr V3 array declaring `dimension_names`, after `dtype:`. An unnamed dimension shows as `?` in its own position. |
@@ -135,7 +142,9 @@ stopping the walk:
 ```
 $ zarr-tree partial.zarr
 partial.zarr [group]
+├─ zarr: V2
 └── plain [array]
+    ├─ zarr:   V2
     ├─ shape:  [1024, 1024]
     ├─ chunks: ?
     └─ dtype:  ?
@@ -155,16 +164,20 @@ large store starts printing immediately — see
 ```
 $ zarr-tree --depth 0 example.zarr
 example.zarr [group]
+└─ zarr: V3
 ```
 
 ```
 $ zarr-tree --depth 1 example.zarr
 example.zarr [group]
+├─ zarr: V3
 ├── image [group, OME-Zarr 0.5]
+│   ├─ zarr: V3
 │   ├─ axes: y, x
 │   ├─ pyramid levels: 2
 │   └─ datasets: 0, 1
 └── labels [group]
+    └─ zarr: V3
 ```
 
 `--depth 2` on this store reaches every node, so it prints the same tree the
@@ -198,13 +211,16 @@ off by default, and the default output is exactly what it was without it.
 ```
 $ zarr-tree --attributes experiment.zarr
 experiment.zarr [group]
+├─ zarr: V2
 ├─ attributes: {"batch":3,"experiment":"A","instrument":{"model":"X"}}
 └── image [group, OME-Zarr 0.4]
+    ├─ zarr: V2
     ├─ axes: y, x
     ├─ pyramid levels: 1
     ├─ datasets: 0
     ├─ attributes: {"multiscales":[{"axes":[…],"datasets":[…],"version":"0.4"}]}
     └── 0 [array]
+        ├─ zarr:       V2
         ├─ shape:      [64, 64]
         ├─ chunks:     [32, 32]
         ├─ dtype:      |u1
@@ -278,11 +294,13 @@ $ zarr-tree --json example.zarr/labels
       },
       "children": [],
       "kind": "array",
-      "name": "cells"
+      "name": "cells",
+      "zarr_format": 3
     }
   ],
   "kind": "group",
-  "name": "example.zarr/labels"
+  "name": "example.zarr/labels",
+  "zarr_format": 3
 }
 ```
 
@@ -291,13 +309,14 @@ This is the same walk and the same reading of the metadata — a second renderer
 not a second interpretation — so the two outputs cannot disagree about what a
 store contains.
 
-Every node carries three fields, and then one section per kind of metadata that
-applies to it:
+Every node carries three fields — four where it was recognised as a Zarr node —
+and then one section per kind of metadata that applies to it:
 
 | Field | Present on | Holds |
 | --- | --- | --- |
 | `name` | every node | The directory name. On the root, the path as it was typed. |
 | `kind` | every node | `group`, `array` or `unknown` |
+| `zarr_format` | recognised groups and arrays | `2` or `3`, the Zarr metadata version the node was read as. Absent on `unknown` |
 | `children` | every node | The child nodes, in the order the tree lists them |
 | `array` | arrays | `shape`, `chunks`, `dtype`, `shards` when sharded, and `dimension_names` when declared |
 | `ome` | OME-Zarr groups | `tag`, `kind`, `version`, `axes`, `pyramid_levels`, `datasets`, and `rows`/`columns`/`wells` on a plate |
@@ -669,7 +688,7 @@ message on stderr, exit status 0, and no partial-write panic.
 ```
 $ zarr-tree example.zarr | head -2
 example.zarr [group]
-├── image [group, OME-Zarr 0.5]
+├─ zarr: V3
 ```
 
 That run produces zero bytes on stderr and the producer's status is 0. Without

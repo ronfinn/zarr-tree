@@ -1121,13 +1121,16 @@ fn depth_limits_how_far_the_walk_descends() {
 
     fs::remove_dir_all(&dir).unwrap();
 
-    // The root on its own, and nothing below it.
+    // The root on its own, and nothing below it. Two lines rather than one:
+    // the root's own `zarr:` row describes the root, not anything under it, so
+    // the limit has nothing to say about it.
     assert_eq!(
         depth0.lines().count(),
-        1,
+        2,
         "--depth 0 should print the root alone:\n{depth0}"
     );
     assert!(has(&lines(&depth0), "deep.zarr [group]"));
+    assert!(has(&lines(&depth0), "zarr: V3"), "\n{depth0}");
 
     // One level: the direct child, and not its child.
     assert!(has(&lines(&depth1), "outer [group]"), "\n{depth1}");
@@ -2808,7 +2811,9 @@ fn numbered_children_are_listed_in_natural_order_in_both_renderers() {
         .iter()
         .skip(1)
         .filter_map(|row| row.split(' ').next())
-        .filter(|name| !name.contains('.'))
+        // Node lines only: a metadata row -- every group now draws a `zarr:`
+        // one -- names a field, not a child.
+        .filter(|name| !name.contains('.') && !name.ends_with(':'))
         .collect();
     assert_eq!(top, ["0", "1", "1", "2", "10", "2", "10"], "{text}");
 
@@ -2823,4 +2828,106 @@ fn numbered_children_are_listed_in_natural_order_in_both_renderers() {
     };
     assert_eq!(names(&value), ["0", "1", "2", "10"]);
     assert_eq!(names(&value["children"][1]), ["1", "2", "10"]);
+}
+
+#[test]
+fn every_recognised_node_reports_the_zarr_format_it_was_read_as() {
+    // One store holding all three cases: a V3 root, a V2 subtree, and a node
+    // written with both. Both renderers are asked about the same store, so
+    // they cannot disagree about what was read.
+    let dir = fixture_dir("zarr-format");
+    let root = dir.join("mixed.zarr");
+
+    write_file(
+        &root.join("zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group"}"#,
+    );
+    write_file(
+        &root.join("v3/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [8, 8],
+            "chunk_grid": { "name": "regular", "configuration": { "chunk_shape": [4, 4] } },
+            "data_type": "uint16"
+        }"#,
+    );
+    write_file(&root.join("v2/.zgroup"), r#"{"zarr_format": 2}"#);
+    write_file(
+        &root.join("v2/mask/.zarray"),
+        r#"{"zarr_format": 2, "shape": [8, 8], "chunks": [4, 4], "dtype": "|u1"}"#,
+    );
+
+    // Both metadata layouts in one directory. `classify` reads V2 first, so
+    // this group is a V2 group and must say so -- the `zarr.json` beside it is
+    // a file this walk never opened.
+    write_file(&root.join("dual/.zgroup"), r#"{"zarr_format": 2}"#);
+    write_file(
+        &root.join("dual/zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group"}"#,
+    );
+
+    // A node neither layout can classify. It gets no format, because nothing
+    // read it.
+    write_file(
+        &root.join("broken/zarr.json"),
+        r#"{"zarr_format": 3, "node"#,
+    );
+
+    let path = root.to_str().unwrap().to_string();
+    let output = run(&[&path]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let value = json_of(&["--json", &path]);
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert!(
+        output.status.success(),
+        "expected success; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output_lines = lines(&stdout);
+    for expected in [
+        // The array's own rows are untouched and the format row joins them.
+        "zarr: V3",
+        "shape: [8, 8]",
+        "dtype: uint16",
+        "zarr: V2",
+        "dtype: |u1",
+        // Nothing was invented for the node that could not be classified.
+        "broken [unknown]",
+    ] {
+        assert!(
+            has(&output_lines, expected),
+            "missing {expected:?} in:\n{stdout}"
+        );
+    }
+
+    // Five recognised nodes -- root, v3, v2, v2/mask, dual -- and the broken
+    // one, which draws no row at all.
+    assert_eq!(stdout.matches("zarr: ").count(), 5, "{stdout}");
+
+    let child = |name: &str| -> Value {
+        value["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|child| child["name"] == json!(name))
+            .unwrap_or_else(|| panic!("a child called {name} in {value}"))
+            .clone()
+    };
+
+    assert_eq!(value["zarr_format"], json!(3));
+    assert_eq!(child("v3")["zarr_format"], json!(3));
+    assert_eq!(child("v2")["zarr_format"], json!(2));
+    assert_eq!(child("v2")["children"][0]["zarr_format"], json!(2));
+    // The precedence rule, in JSON as in the tree.
+    assert_eq!(child("dual")["zarr_format"], json!(2));
+    // An unrecognised node has no key rather than a null: there is no version
+    // to report, and a `null` would read as one that could not be read.
+    assert_eq!(child("broken").get("zarr_format"), None);
+    // And `kind` still carries group/array, so nothing was made redundant.
+    assert_eq!(child("v3")["kind"], json!("array"));
+    assert_eq!(child("dual")["kind"], json!("group"));
 }

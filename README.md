@@ -17,22 +17,33 @@ chunk data is never fetched.
 ```
 $ zarr-tree --depth 2 experiment.zarr
 experiment.zarr [group, SpatialData 0.2]
+├─ zarr: V3
 ├── images [group]
+│   ├─ zarr: V3
 │   └── morphology [group, OME-Zarr 0.5-dev-spatialdata, SpatialData image]
+│       ├─ zarr: V3
 │       ├─ axes: c, y, x
 │       ├─ pyramid levels: 1
 │       └─ datasets: s0
 ├── labels [group]
+│   ├─ zarr: V3
 │   └── nuclei [group, OME-Zarr 0.5-dev-spatialdata, SpatialData labels]
+│       ├─ zarr: V3
 │       ├─ axes: y, x
 │       ├─ pyramid levels: 1
 │       └─ datasets: s0
 ├── points [group]
+│   ├─ zarr: V3
 │   └── transcripts [group, SpatialData points]
+│       └─ zarr: V3
 ├── shapes [group]
+│   ├─ zarr: V3
 │   └── cell_boundaries [group, SpatialData shapes]
+│       └─ zarr: V3
 └── tables [group]
+    ├─ zarr: V3
     └── table [group, SpatialData table]
+        ├─ zarr: V3
         ├─ observations: 1,200
         ├─ variables: 313
         ├─ X: dense [1200, 313] float32
@@ -121,7 +132,7 @@ which added metadata-only structural validation (`--validate`).
 | | |
 | --- | --- |
 | Latest release | v0.4.0 |
-| Tests | 112 passing — 94 unit, 18 integration |
+| Tests | 154 passing — 128 unit, 26 integration |
 | Minimum supported Rust version | 1.88 |
 
 This is a small utility maintained by one person, not a certified product. The
@@ -168,6 +179,10 @@ one subject at a time.
 - Reads Zarr V2 and V3 metadata layouts, labelling each node `[group]`,
   `[array]` or `[unknown]`, and showing `shape`, `chunks` and `dtype` under
   every array.
+- Says which metadata format each node was read as, on a `zarr: V2`/`zarr: V3`
+  row and as `zarr_format` in `--json`. A store need not be all one version,
+  and this reports the reading actually taken — see
+  [docs/zarr.md](docs/zarr.md#format-version).
 - Tells a Zarr V3 sharded array's inner chunks from its shards and reports both
   — see [docs/zarr.md](docs/zarr.md#sharding).
 - Stops descending at arrays, so an array's chunk objects are never listed,
@@ -209,7 +224,10 @@ node and describe its structure:
 | dtype | `dtype`, NumPy notation | `data_type` |
 | Consolidation | `.zmetadata` | inline `consolidated_metadata` |
 
-V2 is checked first, so a directory carrying both is reported as V2. V2 dtypes
+Every recognised node says which of the two it was read as, on a `zarr:` row of
+its own. V2 is checked first, so a directory carrying both is reported as V2 —
+in the row as everywhere else, because V2 is the document the node's other
+fields came out of. V2 dtypes
 are printed exactly as stored — `<u2`, `|u1` — and are never translated. A
 sharded V3 array reports `chunks` (the inner chunk shape) and `shards` (the
 chunk grid) under separate names:
@@ -217,7 +235,9 @@ chunk grid) under separate names:
 ```
 $ zarr-tree sharded.zarr
 sharded.zarr [group]
+├─ zarr: V3
 └── img [array]
+    ├─ zarr:   V3
     ├─ shape:  [4096, 4096]
     ├─ chunks: [512, 512]
     ├─ shards: [2048, 2048]
@@ -241,10 +261,12 @@ dataset paths are shown:
 ```
 $ zarr-tree image.zarr
 image.zarr [group, OME-Zarr 0.4]
+├─ zarr: V2
 ├─ axes: c, y, x
 ├─ pyramid levels: 3
 ├─ datasets: 0, 1, 2
 ├── 0 [array]
+│   ├─ zarr:   V2
 │   ├─ shape:  [2, 2048, 2048]
 │   ├─ chunks: [1, 512, 512]
 │   └─ dtype:  <u2
@@ -277,30 +299,41 @@ summarises the two payload formats those elements use:
 ```
 $ zarr-tree --depth 2 experiment.zarr
 experiment.zarr [group, SpatialData 0.2]
+├─ zarr: V3
 ├── images [group]
+│   ├─ zarr: V3
 │   └── morphology [group, OME-Zarr 0.5-dev-spatialdata, SpatialData image]
+│       ├─ zarr: V3
 │       ├─ axes: c, y, x
 │       ├─ pyramid levels: 1
 │       └─ datasets: s0
 ├── labels [group]
+│   ├─ zarr: V3
 │   └── nuclei [group, OME-Zarr 0.5-dev-spatialdata, SpatialData labels]
+│       ├─ zarr: V3
 │       ├─ axes: y, x
 │       ├─ pyramid levels: 1
 │       └─ datasets: s0
 ├── points [group]
+│   ├─ zarr: V3
 │   └── transcripts [group, SpatialData points]
+│       ├─ zarr: V3
 │       ├─ rows: 3,714
 │       ├─ columns: 4
 │       ├─ parquet files: 2
 │       └─ schema: x:double, y:double, feature_name:string, cell_id:int32
 ├── shapes [group]
+│   ├─ zarr: V3
 │   └── cell_boundaries [group, SpatialData shapes]
+│       ├─ zarr: V3
 │       ├─ rows: 1,200
 │       ├─ columns: 2
 │       ├─ parquet files: 1
 │       └─ schema: geometry:byte_array, cell_id:int32
 └── tables [group]
+    ├─ zarr: V3
     └── table [group, SpatialData table]
+        ├─ zarr: V3
         ├─ observations: 1,200
         ├─ variables: 313
         ├─ X: dense [1200, 313] float32
@@ -409,9 +442,13 @@ Nothing else changes: the same walk, the same tree, the same `--depth` and
 ```
 $ zarr-tree --depth 1 s3://janelia-cosem-datasets/jrc_cos7-11/jrc_cos7-11.zarr
 s3://janelia-cosem-datasets/jrc_cos7-11/jrc_cos7-11.zarr [group]
+├─ zarr: V2
 ├── mapping [group]
+│   └─ zarr: V2
 ├── recon-1 [group]
+│   └─ zarr: V2
 └── recon-2 [group]
+    └─ zarr: V2
 ```
 
 The scheme is the only thing that decides. Every other argument is a path on
@@ -437,11 +474,14 @@ and 16 metadata reads:
 ```
 $ zarr-tree s3://janelia-cosem-datasets/jrc_cos7-11/jrc_cos7-11.zarr/recon-1/em
 s3://.../recon-1/em [group]
+├─ zarr: V2
 └── fibsem-uint16 [group, OME-Zarr 0.4]
+    ├─ zarr: V2
     ├─ axes: z, y, x
     ├─ pyramid levels: 6
     ├─ datasets: s0, s1, s2, s3, s4, s5
     ├── s0 [array]
+    │   ├─ zarr:   V2
     │   ├─ shape:  [12664, 1200, 8750]
     │   ├─ chunks: [256, 256, 256]
     │   └─ dtype:  <u2
@@ -472,16 +512,20 @@ server. Again nothing else changes: the same walk, the same tree, the same
 ```
 $ zarr-tree http://server.example/data/example.zarr
 http://server.example/data/example.zarr [group, OME-Zarr 0.5]
+├─ zarr: V3
 ├─ axes: y, x
 ├─ pyramid levels: 1
 ├─ datasets: 0
 ├── 0 [array]
+│   ├─ zarr:   V3
 │   ├─ shape:  [1024, 1024]
 │   ├─ chunks: [128, 128]
 │   ├─ shards: [512, 512]
 │   └─ dtype:  uint16
 └── labels [group]
+    ├─ zarr: V3
     └── cells [array]
+        ├─ zarr:   V3
         ├─ shape:  [1024, 1024]
         ├─ chunks: [256, 256]
         └─ dtype:  uint8
@@ -560,11 +604,14 @@ array whose `.zarray` omits `chunks` and `dtype`, and `truncated` has a
 ```
 $ zarr-tree broken.zarr
 broken.zarr [group]
+├─ zarr: V3
 ├── good [array]
+│   ├─ zarr:   V3
 │   ├─ shape:  [10]
 │   ├─ chunks: [10]
 │   └─ dtype:  float32
 ├── plain [array]
+│   ├─ zarr:   V2
 │   ├─ shape:  [10]
 │   ├─ chunks: ?
 │   └─ dtype:  ?
@@ -588,8 +635,8 @@ cargo clippy --all-targets -- -D warnings  # lints, as CI runs them
 cargo fmt --check            # formatting, as CI runs it
 ```
 
-The suite is in two parts: 94 unit tests in `src/main.rs`, which cover metadata
-parsing directly, and 18 integration tests in `tests/cli.rs`, which run the
+The suite is in two parts: 128 unit tests in `src/main.rs`, which cover metadata
+parsing directly, and 26 integration tests in `tests/cli.rs`, which run the
 compiled binary against throwaway fixture stores and assert on what it prints.
 The Parquet fixtures are written by the same crate that reads them back, so
 those tests run against real Parquet bytes with a real footer.

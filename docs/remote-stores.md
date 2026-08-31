@@ -26,9 +26,13 @@ listed or fetched.
 ```
 $ zarr-tree --depth 1 s3://janelia-cosem-datasets/jrc_cos7-11/jrc_cos7-11.zarr
 s3://janelia-cosem-datasets/jrc_cos7-11/jrc_cos7-11.zarr [group]
+├─ zarr: V2
 ├── mapping [group]
+│   └─ zarr: V2
 ├── recon-1 [group]
+│   └─ zarr: V2
 └── recon-2 [group]
+    └─ zarr: V2
 ```
 
 `--depth`, `--json` and `--validate` behave as they do locally.
@@ -166,16 +170,20 @@ where an unsigned one would have succeeded.
 ```
 $ zarr-tree http://server.example/data/example.zarr
 http://server.example/data/example.zarr [group, OME-Zarr 0.5]
+├─ zarr: V3
 ├─ axes: y, x
 ├─ pyramid levels: 1
 ├─ datasets: 0
 ├── 0 [array]
+│   ├─ zarr:   V3
 │   ├─ shape:  [1024, 1024]
 │   ├─ chunks: [128, 128]
 │   ├─ shards: [512, 512]
 │   └─ dtype:  uint16
 └── labels [group]
+    ├─ zarr: V3
     └── cells [array]
+        ├─ zarr:   V3
         ├─ shape:  [1024, 1024]
         ├─ chunks: [256, 256]
         └─ dtype:  uint8
@@ -225,6 +233,7 @@ no listing at all:
 ```
 $ zarr-tree --depth 0 https://static.example/data/example.zarr
 https://static.example/data/example.zarr [group, OME-Zarr 0.4]
+├─ zarr: V2
 ├─ axes: c, z, y, x
 ├─ pyramid levels: 3
 └─ datasets: 0, 1, 2
@@ -257,12 +266,15 @@ them, and how the overlay behaves — is in the
 ```
 $ zarr-tree --depth 1 https://ncsa.osn.xsede.org/Pangeo/pangeo-forge/gpcp-feedstock/gpcp.zarr
 https://ncsa.osn.xsede.org/Pangeo/pangeo-forge/gpcp-feedstock/gpcp.zarr [group]
+├─ zarr: V2
 ├── lat_bounds [array]
+│   ├─ zarr:   V2
 │   ├─ shape:  [180, 2]
 │   ├─ chunks: [180, 2]
 │   └─ dtype:  <f4
 ...
 └── time_bounds [array]
+    ├─ zarr:   V2
     ├─ shape:  [9226, 2]
     ├─ chunks: [200, 2]
     └─ dtype:  <i8
@@ -323,8 +335,11 @@ be enumerated prints one marker and no more:
 ```
 $ zarr-tree --depth 1 https://static.example/data/xenium.zarr
 https://static.example/data/xenium.zarr [group, SpatialData 0.2]
+├─ zarr: V3
 └── points [group]
+    ├─ zarr: V3
     └── transcripts [group, SpatialData points]
+        ├─ zarr: V3
         └─ parquet files: ?
 ```
 

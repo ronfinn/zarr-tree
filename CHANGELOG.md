@@ -22,6 +22,18 @@ with the pre-1.0 caveat that the output format is not yet stable.
 
 ### Added
 
+- Every recognised node reports the Zarr metadata format it was read as: a
+  `zarr: V2` / `zarr: V3` row, first under the node's own line on groups and
+  arrays alike, and a `zarr_format` of `2` or `3` in `--json`. A store need not
+  be all one version, so the fact is per node rather than per store. The row
+  describes the reading actually taken, not which files happen to exist: a node
+  carrying both layouts reports **V2**, because V2 is checked first and is the
+  document its other fields came out of. An `[unknown]` node gets no row and no
+  JSON key — nothing classified it, so there is no version to report. It sits
+  below any semantic tag rather than replacing one, so an OME-Zarr image or a
+  SpatialData element keeps its own label and gains this beside it. Additive
+  presentation only: no classification, hierarchy, ordering, field, finding or
+  exit status changes, and nothing extra is read from the store.
 - `--attributes` shows each node's user attributes as stored — V2 `.zattrs`,
   V3 `attributes` — as compact JSON on one row, and as a real `attributes`
   object in `--json`. Nothing is interpreted or promoted to a field of its
