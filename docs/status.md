@@ -52,7 +52,8 @@ credentials` is not read. HTTP access is anonymous.
 | Other consolidation forms | Not implemented |
 | Checking consolidated metadata against the store it describes | Not implemented |
 | Array `fill_value`, shown as stored in both versions | Supported |
-| Compressors | Not implemented |
+| Codec chain by name — V2 `filters` + `compressor`, V3 `codecs` | Supported |
+| Codec configuration, execution or decompression | Not implemented |
 | User attributes, on request and as stored (`--attributes`) | Supported |
 | V3 dtypes given in object (extension) form, reported by name | Supported |
 | V3 `dimension_names`, shown in order with unnamed dimensions kept in place | Supported |

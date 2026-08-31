@@ -1310,10 +1310,15 @@ fn a_sharded_array_reports_its_chunks_and_its_shards_separately() {
         "the shard shape leaked into the chunks row:\n{text}"
     );
 
-    // `shards` sits between `chunks` and `dtype`, so `dtype` still closes the
-    // block -- for the sharded array and the unsharded one alike.
+    // `shards` sits between `chunks` and `dtype`, and both arrays declare a
+    // codec chain, so `codecs` closes the block for each of them.
     assert!(text.contains("├─ shards: [256, 256]"), "{text}");
-    assert_eq!(text.matches("└─ dtype:  uint16").count(), 2, "{text}");
+    assert_eq!(text.matches("├─ dtype:  uint16").count(), 2, "{text}");
+    // The sharded array's chain is the document's `codecs` key -- that one
+    // entry. The codecs inside the shard are its configuration and are not
+    // shown, and the sharding itself is already reported as the two shapes.
+    assert!(text.contains("└─ codecs: sharding_indexed"), "{text}");
+    assert!(text.contains("└─ codecs: bytes"), "{text}");
 
     let tree: Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|error| panic!("--json should print valid JSON: {error}\n{stdout}"));
@@ -1333,7 +1338,8 @@ fn a_sharded_array_reports_its_chunks_and_its_shards_separately() {
             "shape": [1024, 1024],
             "chunks": [64, 64],
             "shards": [256, 256],
-            "dtype": "uint16"
+            "dtype": "uint16",
+            "codecs": ["sharding_indexed"]
         })
     );
     // An unsharded array has no shards to miss, so the key is absent rather
@@ -1341,7 +1347,8 @@ fn a_sharded_array_reports_its_chunks_and_its_shards_separately() {
     // read.
     assert_eq!(
         child("plain")["array"],
-        json!({ "shape": [1024, 1024], "chunks": [64, 64], "dtype": "uint16" })
+        json!({ "shape": [1024, 1024], "chunks": [64, 64], "dtype": "uint16",
+                "codecs": ["bytes"] })
     );
     assert_eq!(child("plain")["array"].get("shards"), None);
 }
@@ -2539,10 +2546,12 @@ fn v3_dimension_names_are_shown_and_a_v2_array_is_unchanged() {
     assert!(has(&rows, "dimensions: z, ?, x"), "{text}");
     // Three arrays have no names to show, and none of them prints a row.
     assert_eq!(text.matches("dimensions:").count(), 2, "{text}");
-    // The row closes the block where it appears, and `dtype` still closes it
-    // everywhere else.
-    assert!(text.contains("└─ dimensions: z, y, x"), "{text}");
-    assert_eq!(text.matches("└─ dtype:").count(), 3, "{text}");
+    // The row sits after `dtype` wherever it appears. The four V3 arrays all
+    // declare a codec chain, so that closes their blocks; the V2 array
+    // declares none and still closes on `dtype`.
+    assert!(text.contains("├─ dimensions: z, y, x"), "{text}");
+    assert_eq!(text.matches("└─ codecs:").count(), 4, "{text}");
+    assert_eq!(text.matches("└─ dtype:").count(), 1, "{text}");
     // Nothing was made unknown by the malformed key, and the walk finished.
     assert_eq!(text.matches("[array]").count(), 5, "{text}");
     assert!(output.status.success(), "{stdout}");
@@ -2653,10 +2662,12 @@ fn fill_values_are_shown_as_stored_and_groups_never_carry_one() {
     assert!(has(&rows, "fill: 2.5"), "{text}");
     // Six arrays declare one; the seventh and the group do not.
     assert_eq!(text.matches("fill:").count(), 6, "{text}");
-    // Where it is there it is the last row, so it takes the connector `dtype`
-    // used to carry -- and `dtype` still closes the block for `absent`.
-    assert_eq!(text.matches("└─ fill:").count(), 6, "{text}");
-    assert_eq!(text.matches("└─ dtype:").count(), 1, "{text}");
+    // Where it is there it sits after `dtype`. The two V2 arrays declare no
+    // codec chain, so `fill` closes their blocks; the V3 arrays all declare
+    // one, so `codecs` closes theirs.
+    assert_eq!(text.matches("└─ fill:").count(), 2, "{text}");
+    assert_eq!(text.matches("├─ fill:").count(), 4, "{text}");
+    assert_eq!(text.matches("└─ codecs: bytes").count(), 5, "{text}");
     // Nothing was reclassified and the walk finished.
     assert_eq!(text.matches("[array]").count(), 7, "{text}");
     assert!(output.status.success(), "{stdout}");
@@ -2696,6 +2707,177 @@ fn fill_values_are_shown_as_stored_and_groups_never_carry_one() {
         array_of("legacy"),
         json!({ "shape": [4], "chunks": [4], "dtype": "<u2", "fill_value": -1 })
     );
+    // And a V2 array declaring no filters and no compressor carries no
+    // `codecs` key at all.
+    assert_eq!(array_of("legacy").get("codecs"), None, "{stdout}");
+}
+
+#[test]
+fn codec_chains_are_summarised_for_both_zarr_versions() {
+    let dir = fixture_dir("codecs");
+    let root = dir.join("dataset.zarr");
+
+    // A root group carrying `codecs` and `compressor` keys of its own, to
+    // prove the row belongs to arrays and to nothing else.
+    write_file(
+        &root.join("zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group",
+            "codecs": [{"name": "blosc"}], "compressor": {"id": "gzip"}}"#,
+    );
+
+    let v3 = |codecs: &str| -> String {
+        format!(
+            r#"{{
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [1024],
+                "chunk_grid": {{"name": "regular", "configuration": {{"chunk_shape": [64]}}}},
+                "data_type": "uint16",
+                "codecs": {codecs}
+            }}"#
+        )
+    };
+
+    // A full V3 chain, an extension name, an entry with no readable name, and
+    // a `codecs` that is not a list at all.
+    write_file(
+        &root.join("chain/zarr.json"),
+        &v3(r#"[{"name": "transpose", "configuration": {"order": [0]}},
+                {"name": "bytes", "configuration": {"endian": "little"}},
+                {"name": "blosc", "configuration": {"cname": "zstd", "clevel": 5}}]"#),
+    );
+    write_file(
+        &root.join("extension/zarr.json"),
+        &v3(r#"[{"name": "bytes"}, {"name": "numcodecs.zfpy"}]"#),
+    );
+    write_file(
+        &root.join("nameless/zarr.json"),
+        &v3(r#"[{"name": "bytes"}, {"configuration": {}}, {"name": "blosc"}]"#),
+    );
+    write_file(&root.join("useless/zarr.json"), &v3(r#""blosc""#));
+
+    // A sharded array: its declared chain is the one entry the document's
+    // `codecs` key holds, and its two shape rows must be untouched by this.
+    write_file(
+        &root.join("sharded/zarr.json"),
+        r#"{
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [1024],
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [256]}},
+            "data_type": "uint16",
+            "codecs": [{
+                "name": "sharding_indexed",
+                "configuration": {"chunk_shape": [64], "codecs": [{"name": "bytes"},
+                                                                  {"name": "blosc"}]}
+            }]
+        }"#,
+    );
+
+    // And the V2 side: filters before compressor, a compressor alone, an
+    // array declaring neither, and one whose filter has no usable `id`.
+    write_file(
+        &root.join("v2-chain/.zarray"),
+        r#"{"zarr_format": 2, "shape": [1024], "chunks": [64], "dtype": "<i4",
+            "filters": [{"id": "delta", "dtype": "<i4"}],
+            "compressor": {"id": "blosc", "cname": "lz4", "clevel": 5, "shuffle": 1}}"#,
+    );
+    write_file(
+        &root.join("v2-compressor/.zarray"),
+        r#"{"zarr_format": 2, "shape": [1024], "chunks": [64], "dtype": "<i4",
+            "filters": null, "compressor": {"id": "gzip", "level": 1}}"#,
+    );
+    write_file(
+        &root.join("v2-raw/.zarray"),
+        r#"{"zarr_format": 2, "shape": [1024], "chunks": [64], "dtype": "<i4",
+            "filters": null, "compressor": null}"#,
+    );
+    write_file(
+        &root.join("v2-nameless/.zarray"),
+        r#"{"zarr_format": 2, "shape": [1024], "chunks": [64], "dtype": "<i4",
+            "filters": [{"level": 3}], "compressor": {"id": "zstd"}}"#,
+    );
+
+    let path = root.to_str().unwrap().to_string();
+    let text = String::from_utf8_lossy(&run(&[&path]).stdout).into_owned();
+    let output = run(&["--json", &path]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    let rows = lines(&text);
+    // Declaration order, never sorted: `transpose` comes first because the
+    // document puts it first, and `blosc` last.
+    assert!(has(&rows, "codecs: transpose, bytes, blosc"), "{text}");
+    assert!(has(&rows, "codecs: bytes, numcodecs.zfpy"), "{text}");
+    // A codec the array declares and we cannot name holds its position, so
+    // the chain is still three long.
+    assert!(has(&rows, "codecs: bytes, ?, blosc"), "{text}");
+    assert!(has(&rows, "codecs: sharding_indexed"), "{text}");
+    // One vocabulary across both versions: V2 filters, then its compressor.
+    assert!(has(&rows, "codecs: delta, blosc"), "{text}");
+    assert!(has(&rows, "codecs: gzip"), "{text}");
+    assert!(has(&rows, "codecs: ?, zstd"), "{text}");
+    // Configuration is never shown -- no `clevel`, `cname` or `level` reaches
+    // the output.
+    for configuration in ["clevel", "cname", "shuffle", "level", "endian"] {
+        assert!(!text.contains(configuration), "{configuration} in:\n{text}");
+    }
+    // Two arrays declare no usable chain and print no row, and the group's
+    // stray keys bought it nothing.
+    assert_eq!(text.matches("codecs:").count(), 7, "{text}");
+    // The sharded array's two shapes are exactly what they were.
+    assert!(has(&rows, "chunks: [64]"), "{text}");
+    assert!(has(&rows, "shards: [256]"), "{text}");
+    assert!(!has(&rows, "chunks: [256]"), "{text}");
+    assert_eq!(text.matches("[array]").count(), 9, "{text}");
+    assert!(output.status.success(), "{stdout}");
+
+    let tree: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("--json should print valid JSON: {error}\n{stdout}"));
+    let array_of = |name: &str| -> Value {
+        tree["children"]
+            .as_array()
+            .expect("the root should have children")
+            .iter()
+            .find(|child| child["name"] == json!(name))
+            .unwrap_or_else(|| panic!("no child named {name:?} in {stdout}"))["array"]
+            .clone()
+    };
+
+    // A list of strings in declaration order, not one joined string.
+    assert_eq!(
+        array_of("chain")["codecs"],
+        json!(["transpose", "bytes", "blosc"])
+    );
+    assert_eq!(
+        array_of("extension")["codecs"],
+        json!(["bytes", "numcodecs.zfpy"])
+    );
+    // Where the tree draws `?` the document holds `null`, in place.
+    assert_eq!(
+        array_of("nameless")["codecs"],
+        json!(["bytes", null, "blosc"])
+    );
+    assert_eq!(array_of("v2-chain")["codecs"], json!(["delta", "blosc"]));
+    assert_eq!(array_of("v2-nameless")["codecs"], json!([null, "zstd"]));
+    // No chain to report is no key, the rule `shards` already follows.
+    assert_eq!(array_of("v2-raw").get("codecs"), None, "{stdout}");
+    assert_eq!(array_of("useless").get("codecs"), None, "{stdout}");
+    // The sharded array keeps every field it had, and gains only this one.
+    assert_eq!(
+        array_of("sharded"),
+        json!({
+            "shape": [1024],
+            "chunks": [64],
+            "shards": [256],
+            "dtype": "uint16",
+            "codecs": ["sharding_indexed"]
+        })
+    );
+    // A group has no array section for a codec chain to appear in.
+    assert_eq!(tree.get("array"), None, "{stdout}");
+    assert_eq!(tree.get("codecs"), None, "{stdout}");
 }
 
 /// A small store touching everything `--attributes` has to get right: a V3

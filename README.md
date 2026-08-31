@@ -222,6 +222,7 @@ node and describe its structure:
 | Attributes | `.zattrs` | `attributes` in `zarr.json` |
 | Chunk shape | `chunks` | `chunk_grid`, or the sharding codec when sharded |
 | dtype | `dtype`, NumPy notation | `data_type` |
+| Codec chain | `filters`, then `compressor`, by `id` | `codecs`, by `name` |
 | Consolidation | `.zmetadata` | inline `consolidated_metadata` |
 
 Every recognised node says which of the two it was read as, on a `zarr:` row of
@@ -682,12 +683,12 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
   exists at all. On a prefix holding a very large number of loose objects that
   listing is paginated to the end.
 - Only `shape`, `chunks`/`chunk_shape`, `dtype`/`data_type`, the shard shape,
-  a V3 array's `dimension_names` and `fill_value` are read. Compressors are not
-  shown, a fill value is displayed as stored and never interpreted or checked
-  against the dtype, user attributes only on request and only as stored (see
-  `--attributes`), `codecs` is read for the sharding codec alone,
-  V2 dtypes are passed through as stored, and a V3 dtype in object form is
-  reported by its name alone — see
+  a V3 array's `dimension_names`, `fill_value` and the codec chain are read. A
+  fill value is displayed as stored and never interpreted or checked against
+  the dtype, a codec chain is listed by name with no configuration shown and
+  nothing ever run, user attributes only on request and only as stored (see
+  `--attributes`), V2 dtypes are passed through as stored, and a V3 dtype in
+  object form is reported by its name alone — see
   [docs/zarr.md](docs/zarr.md#deliberately-not-implemented).
 - OME-Zarr support goes no further than spotting image, plate and well groups
   and showing their version, and for an image its axis names, declared pyramid

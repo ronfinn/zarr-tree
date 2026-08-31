@@ -34,11 +34,11 @@ whole of it.
 It does not:
 
 - decode array data, or read a chunk of any kind;
-- execute or interpret codecs — the codec list is scanned for one name and
-  otherwise left alone;
-- resolve fill values, compressors or user attributes — a fill value and a V3
-  array's `dimension_names` are displayed as stored, never resolved, converted
-  or filled in;
+- execute or interpret codecs — a codec chain is listed by name and nothing in
+  it is run, instantiated or configured;
+- resolve fill values, codecs or user attributes — a fill value, a codec name
+  and a V3 array's `dimension_names` are displayed as stored, never resolved,
+  converted or filled in;
 - repair, rewrite or normalise a store;
 - check a document against the Zarr specification.
 
@@ -60,7 +60,7 @@ costs a read and no parsing at all.
 | File | Read for |
 | --- | --- |
 | `.zgroup` | Node identification: this node is a group. Its contents are not used. |
-| `.zarray` | Node identification and array metadata: `shape`, `chunks`, `dtype`, `fill_value`. |
+| `.zarray` | Node identification and array metadata: `shape`, `chunks`, `dtype`, `fill_value`, `filters`, `compressor`. |
 | `.zattrs` | User attributes. Read only on a group, and only to look for the OME-Zarr and SpatialData markers. |
 | `.zmetadata` | Consolidated metadata at the store root — see [Consolidated metadata](#consolidated-metadata). |
 
@@ -80,7 +80,8 @@ v2.zarr [group]
     ├─ shape:  [1024, 1024]
     ├─ chunks: [256, 256]
     ├─ dtype:  <u2
-    └─ fill:   0
+    ├─ fill:   0
+    └─ codecs: blosc
 ```
 
 **V2 dtypes are displayed exactly as stored**, in NumPy notation: `<u2`, `|u1`,
@@ -106,7 +107,7 @@ classified.
 | `node_type` | Node identification: `"group"` or `"array"`. Any other value, or none, leaves the node `[unknown]`. |
 | `shape` | An array's shape, copied as stored. |
 | `chunk_grid.configuration.chunk_shape` | The chunk grid's shape. Only a `regular` grid records one; any other grid leaves `chunks` unreadable. |
-| `codecs` | Scanned for a codec named exactly `sharding_indexed`, and for nothing else — see [Sharding](#sharding). |
+| `codecs` | The declared codec chain, by name — see [Codecs](#codecs) — and scanned for a codec named exactly `sharding_indexed` — see [Sharding](#sharding). |
 | `data_type` | The dtype: the string itself, or the `name` of an extension's object form. |
 | `dimension_names` | The array's own dimension names — see [Dimension names](#dimension-names). |
 | `fill_value` | The array's fill value, as stored — see [Fill values](#fill-values). |
@@ -114,7 +115,7 @@ classified.
 | `consolidated_metadata` | Consolidated metadata at the store root — see [Consolidated metadata](#consolidated-metadata). |
 
 Nothing else in a V3 document is read: not `chunk_key_encoding`, not
-`storage_transformers`, and not the codec chain beyond the one name above.
+`storage_transformers`, and no codec's `configuration`.
 
 ### Dimension names
 
@@ -220,6 +221,7 @@ Only rows this program actually reads:
 | Shard shape | not applicable | `chunk_grid.configuration.chunk_shape` when sharded |
 | dtype | `dtype`, NumPy notation | `data_type`, string form or an extension object's `name` |
 | Fill value | `fill_value`, required, may be `null` | `fill_value` |
+| Codec chain | `filters` in order, then `compressor`; each by its `id` | `codecs` in order, each by its `name` |
 | Consolidation | `.zmetadata` at the root | inline `consolidated_metadata` in the root `zarr.json` |
 | OME-Zarr metadata | keys at the top level of `.zattrs` | `attributes.ome` |
 
@@ -338,8 +340,9 @@ all V3 nodes cost nothing extra, their attributes being in a file already read.
 
 Every array prints its format and then three rows. A sharded V3 array prints a
 `shards` row after its chunks, an array that declares a fill value prints a
-`fill` row after its dtype, and a V3 array that names its dimensions prints a
-`dimensions` row after that:
+`fill` row after its dtype, a V3 array that names its dimensions prints a
+`dimensions` row after that, and an array declaring a codec chain prints a
+`codecs` row last:
 
 ```
 ├─ zarr:       V3
@@ -348,7 +351,8 @@ Every array prints its format and then three rows. A sharded V3 array prints a
 ├─ shards:     [1, 2048, 2048]
 ├─ dtype:      uint16
 ├─ fill:       0
-└─ dimensions: c, y, x
+├─ dimensions: c, y, x
+└─ codecs:     sharding_indexed
 ```
 
 `shape`, `chunks` and `dtype` are always drawn, showing `?` when the field
@@ -357,9 +361,11 @@ absence is information. `shards` is drawn only for an array that named the
 sharding codec; an unsharded array has no shards to be missing. `fill` is drawn
 only for an array whose document has a `fill_value` key — see
 [Fill values](#fill-values). `dimensions` is drawn only for a V3 array that
-declared `dimension_names` — see [Dimension names](#dimension-names). The row
-names are padded to the longest one actually printed, so an array with no
-`dimensions` row is laid out exactly as it always was.
+declared `dimension_names` — see [Dimension names](#dimension-names). `codecs`
+is drawn last, and only for an array declaring a chain — see
+[Codecs](#codecs). The row names are padded to the longest one actually
+printed, so an array with no `dimensions` row is laid out exactly as it always
+was.
 
 Dimension entries are copied out of the file rather than parsed into numbers.
 A malformed `"shape": [1, "x"]` prints as `[1, "x"]` rather than being dropped
@@ -432,6 +438,107 @@ In `--json` the value is the JSON value the document held, in its own type:
 Both documents were already being parsed for `shape` and `dtype`, so reading
 the fill value costs no extra request anywhere — local, S3, HTTP or a
 consolidated snapshot alike.
+
+## Codecs
+
+Both Zarr versions let an array declare what happens to a chunk between the
+stored bytes and the values — compression, byte order, a filter or two — and
+both spell it differently. One row answers the question for both:
+
+```
+└─ codecs: delta, blosc
+```
+
+**Names only, in declaration order.** Every codec carries a configuration
+beside its name — blosc's `cname` and `clevel`, gzip's `level`, delta's
+`dtype` — and none of it is read or shown. That is the same boundary an
+extension dtype's `configuration` sits behind: configuration is what a *reader*
+needs in order to decode, and nothing here decodes. Names are not checked
+against any registry either, so an extension codec is printed as stored:
+
+```
+└─ codecs: bytes, numcodecs.zfpy
+```
+
+The order is the metadata and is never sorted. `delta, blosc` and
+`blosc, delta` are different pipelines, so the chain is shown exactly as the
+document declares it — unlike child names, which are ordered for reading.
+
+### V2: filters, then compressor
+
+V2 splits the chain across two keys of `.zarray`. `filters` is a list applied
+to the values first, and `compressor` is the single codec applied last:
+
+```json
+"filters": [{"id": "delta", "dtype": "<i4"}],
+"compressor": {"id": "blosc", "cname": "lz4", "clevel": 5}
+```
+
+Each contributes its `id`, in the order they run, giving `codecs: delta, blosc`.
+The row does not say which of the two keys an entry came from, because the
+question it answers is *what runs, in what order* — and the answer reads the
+same whichever version wrote the store.
+
+**An array declaring no processing prints no row.** `"filters": null` with
+`"compressor": null` is how V2 spells an array stored raw; there is nothing to
+report, so nothing is reported, and no `codecs: none` is invented. This follows
+the rule `shards` and `dimension_names` already do — a field with nothing to
+report does not report. A V3 array is rarely quiet in the same way: its
+`codecs` is required, and even an uncompressed array declares
+`[{"name": "bytes"}]`.
+
+### V3: the codecs list
+
+V3 keeps one list in `zarr.json`, each entry an object naming a codec:
+
+```json
+"codecs": [{"name": "bytes", "configuration": {"endian": "little"}},
+           {"name": "blosc", "configuration": {"cname": "zstd"}}]
+```
+
+which reads as `codecs: bytes, blosc`.
+
+### A sharded array shows one codec
+
+```
+├─ chunks: [64, 64]
+├─ shards: [256, 256]
+├─ dtype:  uint16
+└─ codecs: sharding_indexed
+```
+
+This is the document's `codecs` key, and for a sharded array that key really is
+that one entry. The codecs applied to the chunks *inside* a shard live in
+`sharding_indexed`'s `configuration`, which is not displayed — the same
+boundary every other codec's configuration sits behind, and what keeps a
+summary row from growing into a codec tree. What the sharding does to the grid
+is already reported, and more usefully, as the two shape rows above it; see
+[Sharding](#sharding).
+
+### Unreadable entries keep their place
+
+A codec whose name cannot be read — an entry with no `id` or `name`, a name
+that is not a string, an entry that is not an object — becomes `?` in its own
+position rather than being dropped:
+
+```
+└─ codecs: bytes, ?, blosc
+```
+
+Dropping it would show a two-codec chain where the document declares three,
+which is a stronger claim than "we could not name this one". In `--json` that
+position is `null`, the convention `dimension_names` set:
+
+```json
+"codecs": ["bytes", null, "blosc"]
+```
+
+A whole field with no positions to hold — a V3 `codecs` that is not a list or
+is empty, a V2 `filters` that is not a list — contributes nothing, and an array
+left with no chain at all gets no row and no JSON key.
+
+Both keys are in documents already parsed for `shape` and `dtype`, so the
+chain costs no extra request anywhere.
 
 ## Arrays are leaves
 
@@ -521,7 +628,9 @@ number is worse than a `?`.
 
 Nothing else about the sharding is read: not the index location, not the index
 codecs, not the inner codec chain, not the shard layout in storage. The codec
-is never executed.
+is never executed, and it appears in the `codecs` row as the one name the
+document's `codecs` key holds — see
+[A sharded array shows one codec](#a-sharded-array-shows-one-codec).
 
 ## Consolidated metadata
 
@@ -699,7 +808,7 @@ shape in the [Command-line reference](cli.md#json-output).)
 | `kind` | `"group"`, `"array"` or `"unknown"` |
 | `zarr_format` | `2` or `3`, the number Zarr itself stamps into its metadata files. Absent on an `[unknown]` node — see [Format version](#format-version). |
 | `children` | The child nodes, in the order the tree lists them. Empty for an array, and empty at the depth limit. |
-| `array` | `shape`, `chunks`, `dtype`, `shards` on a sharded V3 array, `fill_value` where the document declares one, and `dimension_names` on a V3 array that declares them. |
+| `array` | `shape`, `chunks`, `dtype`, `shards` on a sharded V3 array, `fill_value` where the document declares one, `dimension_names` on a V3 array that declares them, and `codecs` where a chain is declared. |
 | `attributes` | The node's user attributes, with `--attributes` only. Values keep their JSON types; `null` where the document could not be read. Absent where there are none. |
 
 ```
@@ -723,10 +832,11 @@ Two rules govern the `array` object:
 - A field that was looked for and could not be read is `null`, the same thing
   the tree draws as `?`. `shape`, `chunks` and `dtype` are therefore always
   present.
-- `shards`, `fill_value` and `dimension_names` are **omitted entirely** where
-  they do not apply, rather than written as `null`. The two say different
-  things: `null` means "looked for, not readable", and an unsharded array has
-  no shards to miss, just as an array naming no dimensions has no names to
+- `shards`, `fill_value`, `dimension_names` and `codecs` are **omitted
+  entirely** where they do not apply, rather than written as `null`. The two
+  say different things: `null` means "looked for, not readable", and an
+  unsharded array has no shards to miss, just as an array naming no dimensions
+  has no names to miss and an array declaring no processing has no chain to
   miss.
 
 A `fill_value` of `null` is therefore not an omission but the value the
@@ -741,6 +851,15 @@ file itself left unnamed, kept in its own position:
 
 ```json
 "dimension_names": ["c", null, "y", "x"]
+```
+
+`codecs` uses the same convention for the same reason: the list is in
+declaration order and a `null` is a codec declared at that position whose name
+could not be read — see [Codecs](#codecs). For a V2 array the list is `filters`
+in order followed by `compressor`:
+
+```json
+"codecs": ["delta", "blosc"]
 ```
 
 Object keys come out in alphabetical order — `serde_json`'s default, kept
@@ -833,14 +952,16 @@ These are boundaries, not gaps. Several of them are what make the walk cheap
 enough to run against a remote store at all.
 
 - **Chunk reads of any kind**, and no chunk object is ever listed.
-- **Decompression and codec execution.** The `codecs` list is scanned for one
-  name; nothing in it is run or interpreted.
+- **Decompression.** Nothing is ever decoded, so no chunk is decompressed and
+  no codec is instantiated to find out whether it could be.
 - **Data-value inspection.** No element of any array is read, so nothing is
   counted, summed or ranged.
 - **Complete Zarr specification validation.** `--validate` checks a store
   against its own declarations, never a document against a schema.
 - **Store repair, rewriting or writing of any kind.**
-- **Compressors.**
+- **Codec execution, instantiation and configuration.** A chain is listed by
+  name; no codec is run, no `configuration` is read or shown, and no name is
+  checked against a registry — see [Codecs](#codecs).
 - **Fill-value interpretation.** The value is shown as the document wrote it
   and nothing more: `"NaN"` is a string, not a float; no value is decoded,
   normalised, or checked against the array's dtype — see

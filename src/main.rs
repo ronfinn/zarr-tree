@@ -466,6 +466,35 @@ struct ArrayMeta {
     /// `Null` variant of its own is what lets one `Option` hold both without
     /// collapsing them.
     fill_value: Option<Value>,
+    /// The processing chain the array declares, in declaration order.
+    ///
+    /// One field for both versions, because it answers one question -- what
+    /// happens to a chunk between the file and the values -- that both spell
+    /// differently. A V3 array's `codecs` list is taken as it stands; a V2
+    /// array's `filters` are taken in order and its `compressor` appended
+    /// after them, which is the order they run in. See `codecs_v2`.
+    ///
+    /// Names only. Every codec carries a `configuration` beside its name --
+    /// blosc's `cname` and `clevel`, gzip's `level` -- and none of it is read,
+    /// for the reason `data_type_v3` gives for ignoring an extension dtype's
+    /// configuration: it is what a *reader* needs in order to decode, and
+    /// nothing here decodes. That boundary is what keeps `sharding_indexed`
+    /// a single entry rather than a tree.
+    ///
+    /// The same two-layer `Option` as `dimension_names`, for the same two
+    /// distinct absences. The outer one is the field: an array that declares
+    /// no codec chain at all -- a V2 array with no filters and no compressor,
+    /// a V3 document whose `codecs` is missing, empty or not a list -- has no
+    /// row and no JSON key. The inner one is one position in the chain: a
+    /// codec whose name could not be read stays in the list as `None`, prints
+    /// `?` and stays `null` in JSON, because dropping it would claim a
+    /// shorter chain than the array declares.
+    ///
+    /// A `Vec`, never a set: a codec chain is a sequence, and `delta, blosc`
+    /// and `blosc, delta` are different pipelines. Nothing here sorts or
+    /// deduplicates it -- unlike child names, which are ordered for reading,
+    /// this order *is* the metadata.
+    codecs: Option<Vec<Option<String>>>,
     /// The array's user attributes, kept as stored, and only when
     /// `--attributes` asked for them. `Absent` otherwise.
     ///
@@ -3424,6 +3453,7 @@ fn array_meta_v2(text: &str) -> ArrayMeta {
             dtype: None,
             dimension_names: None,
             fill_value: None,
+            codecs: None,
             attributes: Attributes::Absent,
         };
     };
@@ -3445,6 +3475,8 @@ fn array_meta_v2(text: &str) -> ArrayMeta {
         // the key and allows its value to be `null`, so a missing key and a
         // `null` are both real states and are kept apart -- see `fill_value`.
         fill_value: value.get("fill_value").cloned(),
+        // V2's two keys, read as the one chain they describe.
+        codecs: codecs_v2(value.get("filters"), value.get("compressor")),
         // Filled in by `classify` when `--attributes` asked for it: V2 keeps
         // an array's attributes in a `.zattrs` beside this file, which is not
         // in hand here.
@@ -3501,9 +3533,110 @@ fn array_meta_v3(value: &Value) -> ArrayMeta {
         // Same rule as V2, and the same one line: the value is passed through
         // unread, never checked against `data_type` and never converted.
         fill_value: value.get("fill_value").cloned(),
+        // The same list the sharding search above walked, read for its names
+        // this time. One parse of the document serves both.
+        codecs: codecs_v3(value.get("codecs")),
         // Filled in by `classify`, which knows whether they were asked for.
         attributes: Attributes::Absent,
     }
+}
+
+/// Read a Zarr V2 `filters` and `compressor` as the one chain they describe,
+/// or `None` when the array declares no processing at all.
+///
+/// V2 splits the chain across two keys. `filters` is a list of codecs applied
+/// to the values before compression, and `compressor` is the single codec
+/// applied last; both are written as objects carrying an `id`:
+///
+/// ```json
+/// "filters": [{"id": "delta", "dtype": "<i4"}],
+/// "compressor": {"id": "blosc", "cname": "lz4", "clevel": 5}
+/// ```
+///
+/// which reads as `codecs: delta, blosc`. That is the order they run in, so it
+/// is the order they are shown in, and it is never sorted -- see `codecs`.
+/// Only each `id` is taken; `dtype`, `cname` and `clevel` are configuration
+/// and are not displayed.
+///
+/// Either key may be `null`, which is how V2 spells "no filters" and "no
+/// compression", and either may be missing. When nothing is left the chain is
+/// empty and comes back `None`: no row, no JSON key. An uncompressed V2 array
+/// is quiet rather than announcing `codecs: none`, which is the rule `shards`
+/// and `dimension_names` already follow -- a field with nothing to report does
+/// not report.
+///
+/// A `filters` that is not a list contributes no entries, because a chain has
+/// positions and that value has none. Inside a list, though, an entry whose
+/// `id` cannot be read stays as a `None` and prints `?`: the array declared a
+/// codec there, and dropping it would show a shorter chain than the file
+/// claims.
+fn codecs_v2(filters: Option<&Value>, compressor: Option<&Value>) -> Option<Vec<Option<String>>> {
+    let filters = filters
+        .and_then(|filters| filters.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+
+    // A `null` compressor is no compressor. Dropped here rather than left to
+    // become a `?`, because "this array is not compressed" is a statement the
+    // file makes, not a codec whose name we failed to read.
+    let compressor = compressor.filter(|compressor| !compressor.is_null());
+
+    // `Option<&Value>` is itself an iterator of nought or one item, so the
+    // compressor chains onto the filters without a branch: the two keys become
+    // one sequence in the order they run.
+    let chain: Vec<Option<String>> = filters
+        .iter()
+        .chain(compressor)
+        .map(|codec| codec_id(codec, "id"))
+        .collect();
+
+    if chain.is_empty() { None } else { Some(chain) }
+}
+
+/// Read a Zarr V3 `codecs` as the names to display, or `None` when there is
+/// nothing to show.
+///
+/// The key is a list of objects, each naming a codec and usually configuring
+/// it:
+///
+/// ```json
+/// "codecs": [{"name": "bytes", "configuration": {"endian": "little"}},
+///            {"name": "blosc", "configuration": {"cname": "zstd"}}]
+/// ```
+///
+/// which reads as `codecs: bytes, blosc`. Only the `name` is taken, and it is
+/// taken exactly as stored and checked against nothing: an extension codec
+/// shows as `my.extension.codec`, for the same reason an extension dtype shows
+/// as `numpy.datetime64`.
+///
+/// **A sharded array shows `sharding_indexed` and stops there.** The codecs
+/// applied to the chunks inside a shard live in that codec's `configuration`,
+/// and configuration is not displayed -- this row reports the document's
+/// `codecs` key, which for a sharded array really is that one entry. The
+/// sharding itself is already reported, as the `chunks` and `shards` rows;
+/// see [Sharding](../docs/zarr.md). Keeping the boundary here is what stops a
+/// summary row from growing into a codec tree.
+///
+/// Anything that is not a list, and a list with nothing in it, comes back
+/// `None`. An entry inside a list whose `name` cannot be read becomes `?` in
+/// place rather than being dropped.
+fn codecs_v3(value: Option<&Value>) -> Option<Vec<Option<String>>> {
+    let items = value?.as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+
+    Some(items.iter().map(|codec| codec_id(codec, "name")).collect())
+}
+
+/// One codec's display name, read from `key`, or `None` when it has none.
+///
+/// The two versions differ only in what the key is called -- V2's `id`, V3's
+/// `name` -- so one function serves both. An entry that is not an object, or
+/// whose name is not a string, has no name to show and takes the `?` any
+/// unreadable field takes.
+fn codec_id(codec: &Value, key: &str) -> Option<String> {
+    codec.get(key)?.as_str().map(String::from)
 }
 
 /// Read a Zarr V3 `dimension_names` as the names to display, or `None` when
@@ -3601,12 +3734,13 @@ fn format_dims(dims: &[Value]) -> String {
     format!("[{}]", items.join(", "))
 }
 
-/// Render dimension names as `c, ?, y, x`.
+/// Render a list of names as `c, ?, y, x`.
 ///
-/// A name we do not have -- an explicit `null`, or an entry that was not a
-/// string -- becomes `?` in place, so the names that follow it stay on the
-/// dimensions they belong to.
-fn format_dimension_names(names: &[Option<String>]) -> String {
+/// A name we do not have -- an explicit `null`, an entry that was not a
+/// string, a codec object with no `name` -- becomes `?` in place, so the names
+/// that follow it stay in the positions they belong to. Dimension names and
+/// codec chains are both lists of that shape and both are drawn here.
+fn format_names(names: &[Option<String>]) -> String {
     let items: Vec<&str> = names
         .iter()
         .map(|name| name.as_deref().unwrap_or("?"))
@@ -3687,10 +3821,11 @@ fn dataset_paths(value: Option<&Value>) -> Option<Vec<String>> {
 ///
 /// `zarr`, `shape`, `chunks` and `dtype` are always printed, in that order. A sharded
 /// array gains a `shards` row between `chunks` and `dtype`; an array whose
-/// metadata declares a fill value gains a `fill` row after `dtype`; and an
-/// array that names its dimensions gains a `dimensions` row after that. Every
-/// other array prints exactly the rows it always has. Whichever row ends up
-/// last carries the closing connector. A field we could not read shows as `?`.
+/// metadata declares a fill value gains a `fill` row after `dtype`; an array
+/// that names its dimensions gains a `dimensions` row after that; and an array
+/// declaring a codec chain gains a `codecs` row last. Every other array prints
+/// exactly the rows it always has. Whichever row ends up last carries the
+/// closing connector. A field we could not read shows as `?`.
 fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::Result<()> {
     // The dimension lists are drawn here rather than kept ready-made, because
     // `--json` wants the same facts as JSON arrays. Rendering late is what
@@ -3701,7 +3836,11 @@ fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::
     // Joined the way OME axes are, and for the same reason: a list of names
     // reads better bare than in brackets. An unnamed dimension keeps its
     // place as `?` rather than being dropped.
-    let names = meta.dimension_names.as_deref().map(format_dimension_names);
+    let names = meta.dimension_names.as_deref().map(format_names);
+    // The same rendering, because it is the same shape of list: names in the
+    // order the file declared them, with `?` holding any position we could not
+    // name.
+    let codecs = meta.codecs.as_deref().map(format_names);
     // `Value`'s `Display` is compact JSON, which is exactly the rendering this
     // row wants: a string keeps its quotes (`"NaN"`), a JSON null reads as
     // `null` rather than as an empty cell, and a number is the text the file
@@ -3737,6 +3876,15 @@ fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::
 
     if let Some(names) = names.as_deref() {
         rows.push(("dimensions:", Some(names)));
+    }
+
+    // Last of the array's own rows, and only for an array that declares a
+    // chain. It sits here rather than beside `chunks` because it is the other
+    // variable-length list, and two of those read better at the end of the
+    // block than in the middle of the fixed-width rows. "codecs:" is the same
+    // width as "chunks:", so it never widens the block by itself.
+    if let Some(codecs) = codecs.as_deref() {
+        rows.push(("codecs:", Some(codecs)));
     }
 
     // `row` hands back exactly the shape this loop wants: no row at all, or a
@@ -3884,14 +4032,15 @@ fn node_attributes(kind: &NodeKind) -> Option<&Attributes> {
 
 /// An array's fields, with `null` where the tree would print `?`.
 ///
-/// `shards`, `dimension_names` and `fill_value` are the exceptions to that
-/// rule, and are left out altogether rather than written as `null`. The two
-/// say different things: `null` means the field was looked for and could not
-/// be read, which every array has a shape, chunks and a dtype to be. An
-/// unsharded array has no shards to miss, and an array that names no
-/// dimensions has no names to miss, so those keys are simply not applicable
-/// and do not appear. Inside `dimension_names` a `null` is a different thing
-/// again -- a dimension the file itself left unnamed -- and a `fill_value` of
+/// `shards`, `dimension_names`, `fill_value` and `codecs` are the exceptions to
+/// that rule, and are left out altogether rather than written as `null`. The
+/// two say different things: `null` means the field was looked for and could
+/// not be read, which every array has a shape, chunks and a dtype to be. An
+/// unsharded array has no shards to miss, an array that names no dimensions
+/// has no names to miss, and an array declaring no codec chain has no chain to
+/// miss, so those keys are simply not applicable and do not appear. Inside
+/// `dimension_names` or `codecs` a `null` is a different thing again -- a
+/// position the file declared and we could not name -- and a `fill_value` of
 /// `null` is a third: the value the document itself wrote there.
 fn json_array_meta(meta: &ArrayMeta) -> Value {
     let mut value = json!({
@@ -3923,6 +4072,17 @@ fn json_array_meta(meta: &ArrayMeta) -> Value {
     // then.
     if let Some(fill) = &meta.fill_value {
         value["fill_value"] = fill.clone();
+    }
+
+    // A list of strings in declaration order, with a `null` wherever the tree
+    // draws `?` -- the convention `dimension_names` set, and for the same
+    // reason: a `null` in place says "a codec is declared here and we could
+    // not name it", which is not the same as a shorter chain. For a V2 array
+    // this is `filters` in order followed by `compressor`; the row does not
+    // say which key an entry came from, because the question it answers is
+    // what runs, in what order.
+    if let Some(codecs) = &meta.codecs {
+        value["codecs"] = json!(codecs);
     }
 
     value
@@ -4850,7 +5010,7 @@ mod tests {
 
     /// And for dimension names, where an unnamed dimension keeps its place.
     fn named(names: &Option<Vec<Option<String>>>) -> Option<String> {
-        names.as_deref().map(format_dimension_names)
+        names.as_deref().map(format_names)
     }
 
     /// An empty fixture directory inside the system temp directory, named for
@@ -6698,7 +6858,7 @@ mod tests {
 
         assert_eq!(names.len(), 4);
         assert_eq!(names[1], None);
-        assert_eq!(format_dimension_names(&names), "c, ?, y, x");
+        assert_eq!(format_names(&names), "c, ?, y, x");
     }
 
     #[test]
@@ -6958,6 +7118,281 @@ mod tests {
         assert!(text.contains("├─ dtype:  <u2\n"), "{text}");
         assert!(text.ends_with("└─ fill:   -1\n"), "{text}");
         assert_eq!(json_array_meta(&meta)["fill_value"], json!(-1));
+    }
+
+    #[test]
+    fn a_v2_compressor_is_the_whole_chain_when_there_are_no_filters() {
+        let meta = array_meta_v2(
+            r#"{"zarr_format": 2, "shape": [10], "chunks": [10], "dtype": "<i4",
+                "filters": null,
+                "compressor": {"id": "blosc", "cname": "lz4", "clevel": 5, "shuffle": 1}}"#,
+        );
+
+        // The `id` alone. `cname`, `clevel` and `shuffle` are configuration
+        // and are what a decoder needs, which is not what this row is for.
+        assert_eq!(codecs(&meta), Some(String::from("blosc")));
+    }
+
+    #[test]
+    fn v2_filters_run_before_the_compressor_and_are_shown_in_that_order() {
+        // The order is the metadata. `filters` first, in the order the file
+        // lists them, then `compressor` last, because that is the order they
+        // run in -- and it is never sorted, unlike child names.
+        let meta = array_meta_v2(
+            r#"{"zarr_format": 2, "shape": [10], "chunks": [10], "dtype": "<i4",
+                "filters": [{"id": "delta", "dtype": "<i4"}, {"id": "fixedscaleoffset"}],
+                "compressor": {"id": "zstd", "level": 3}}"#,
+        );
+
+        assert_eq!(
+            meta.codecs,
+            Some(vec![
+                Some(String::from("delta")),
+                Some(String::from("fixedscaleoffset")),
+                Some(String::from("zstd")),
+            ])
+        );
+        assert_eq!(
+            codecs(&meta),
+            Some(String::from("delta, fixedscaleoffset, zstd"))
+        );
+    }
+
+    #[test]
+    fn a_v2_array_declaring_no_processing_shows_no_chain() {
+        // `null` on both keys is how V2 spells an array stored raw, and an
+        // empty `filters` list says the same. There is nothing to report, so
+        // nothing is reported: no row, no JSON key, and no invented `none`.
+        for (filters, compressor) in [
+            (r#""filters": null, "compressor": null"#, "both null"),
+            (r#""filters": [], "compressor": null"#, "empty filters"),
+            (r#""dtype": "<i4""#, "neither key"),
+        ] {
+            let text = format!(
+                r#"{{"zarr_format": 2, "shape": [10], "chunks": [10], "dtype": "<i4", {filters}}}"#
+            );
+
+            let meta = array_meta_v2(&text);
+
+            assert_eq!(meta.codecs, None, "{compressor}");
+            assert!(!row_text(&meta).contains("codecs:"), "{compressor}");
+            assert_eq!(json_array_meta(&meta).get("codecs"), None, "{compressor}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_v2_codec_id_is_shown_exactly_as_stored() {
+        // Checked against no registry, the same terms a V2 dtype is passed
+        // through on.
+        let meta = array_meta_v2(
+            r#"{"zarr_format": 2, "shape": [10], "chunks": [10], "dtype": "<i4",
+                "compressor": {"id": "imagecodecs_jpegxl"}}"#,
+        );
+
+        assert_eq!(codecs(&meta), Some(String::from("imagecodecs_jpegxl")));
+    }
+
+    #[test]
+    fn an_unreadable_v2_codec_keeps_its_place_in_the_chain() {
+        // A filter with no `id`, one that is not an object at all, and a
+        // compressor whose `id` is not a string. Each is a codec the array
+        // declares and we cannot name, so each holds its position as `?`:
+        // dropping them would show a two-codec chain where the file declares
+        // four.
+        let meta = array_meta_v2(
+            r#"{"zarr_format": 2, "shape": [10], "chunks": [10], "dtype": "<i4",
+                "filters": [{"id": "delta"}, {"level": 3}, "blosc"],
+                "compressor": {"id": 7}}"#,
+        );
+
+        let chain = meta.codecs.clone().expect("a declared chain");
+        assert_eq!(chain.len(), 4);
+        assert_eq!(chain[0], Some(String::from("delta")));
+        assert_eq!(chain[1], None);
+        assert_eq!(chain[2], None);
+        assert_eq!(chain[3], None);
+        assert_eq!(codecs(&meta), Some(String::from("delta, ?, ?, ?")));
+        // In JSON the unreadable positions are `null`, which says "a codec is
+        // declared here and could not be named" rather than "shorter chain".
+        assert_eq!(
+            json_array_meta(&meta)["codecs"],
+            json!(["delta", null, null, null])
+        );
+    }
+
+    #[test]
+    fn a_v3_codec_chain_is_read_in_declaration_order() {
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [10],
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [5]}},
+            "data_type": "uint16",
+            "codecs": [
+                {"name": "transpose", "configuration": {"order": [1, 0]}},
+                {"name": "bytes", "configuration": {"endian": "little"}},
+                {"name": "blosc", "configuration": {"cname": "zstd", "clevel": 5}}
+            ]
+        });
+
+        let meta = array_meta_v3(&value);
+
+        assert_eq!(codecs(&meta), Some(String::from("transpose, bytes, blosc")));
+        // Reading them costs the rows beside them nothing.
+        assert_eq!(shown(&meta.chunks), Some(String::from("[5]")));
+        assert_eq!(meta.shards, None);
+    }
+
+    #[test]
+    fn an_unknown_v3_codec_name_is_shown_exactly_as_stored() {
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [10],
+            "data_type": "uint16",
+            "codecs": [{"name": "bytes"}, {"name": "numcodecs.zfpy"}]
+        });
+
+        assert_eq!(
+            codecs(&array_meta_v3(&value)),
+            Some(String::from("bytes, numcodecs.zfpy"))
+        );
+    }
+
+    #[test]
+    fn a_sharded_array_names_the_sharding_codec_and_keeps_its_two_shapes() {
+        // The chain is the document's `codecs` key, which for a sharded array
+        // really is this one entry. The codecs applied inside a shard are in
+        // that entry's `configuration`, and configuration is not displayed --
+        // the same boundary an extension dtype's is. What sharding does to the
+        // grid is already reported, as the two shape rows, and those must not
+        // move.
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [4096, 4096],
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2048, 2048]}},
+            "data_type": "uint16",
+            "codecs": [{
+                "name": "sharding_indexed",
+                "configuration": {
+                    "chunk_shape": [512, 512],
+                    "codecs": [{"name": "bytes"}, {"name": "blosc"}]
+                }
+            }]
+        });
+
+        let meta = array_meta_v3(&value);
+
+        assert_eq!(codecs(&meta), Some(String::from("sharding_indexed")));
+        assert_eq!(shown(&meta.chunks), Some(String::from("[512, 512]")));
+        assert_eq!(shown(&meta.shards), Some(String::from("[2048, 2048]")));
+        assert_eq!(
+            json_array_meta(&meta)["codecs"],
+            json!(["sharding_indexed"])
+        );
+    }
+
+    #[test]
+    fn an_unreadable_v3_codec_keeps_its_place_and_a_useless_field_shows_nothing() {
+        // An entry with no `name`, and one that is not an object.
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [10],
+            "data_type": "uint16",
+            "codecs": [{"name": "bytes"}, {"configuration": {}}, 7, {"name": "blosc"}]
+        });
+
+        assert_eq!(
+            codecs(&array_meta_v3(&value)),
+            Some(String::from("bytes, ?, ?, blosc"))
+        );
+
+        // A `codecs` that is not a list, and an empty one, have no positions
+        // to hold: no row and no key, exactly as a missing key.
+        for codecs in [json!("blosc"), json!({}), json!([]), json!(7)] {
+            let value = json!({
+                "zarr_format": 3, "node_type": "array", "shape": [10],
+                "data_type": "uint16", "codecs": codecs
+            });
+
+            let meta = array_meta_v3(&value);
+            assert_eq!(meta.codecs, None, "{codecs}");
+            assert_eq!(meta.dtype, Some(String::from("uint16")), "{codecs}");
+        }
+
+        let bare = array_meta_v3(&json!({
+            "zarr_format": 3, "node_type": "array", "shape": [10], "data_type": "uint16"
+        }));
+        assert_eq!(bare.codecs, None);
+    }
+
+    #[test]
+    fn a_malformed_v2_array_document_declares_no_codecs() {
+        // `.zarray` that is not JSON is still an array, with every field
+        // missing. Codecs join that rather than changing it.
+        let meta = array_meta_v2("{not json");
+
+        assert_eq!(meta.codecs, None);
+        assert!(!row_text(&meta).contains("codecs:"));
+    }
+
+    #[test]
+    fn the_codecs_row_comes_last_and_holds_its_order() {
+        // Placement against every other row an array can draw, and the whole
+        // block in one assertion so a row moving cannot pass unnoticed.
+        let meta = array_meta_v3(&json!({
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [4096, 4096],
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [2048, 2048]}},
+            "data_type": "uint16",
+            "fill_value": 0,
+            "dimension_names": ["y", "x"],
+            "codecs": [{
+                "name": "sharding_indexed",
+                "configuration": {"chunk_shape": [512, 512], "codecs": [{"name": "bytes"}]}
+            }]
+        }));
+
+        let text = row_text(&meta);
+        let rows: Vec<&str> = text.lines().collect();
+
+        assert_eq!(
+            rows,
+            vec![
+                "├─ zarr:       V3",
+                "├─ shape:      [4096, 4096]",
+                "├─ chunks:     [512, 512]",
+                "├─ shards:     [2048, 2048]",
+                "├─ dtype:      uint16",
+                "├─ fill:       0",
+                "├─ dimensions: y, x",
+                "└─ codecs:     sharding_indexed",
+            ],
+            "{text}"
+        );
+
+        // And the same array in JSON, with every field beside `codecs`
+        // untouched.
+        assert_eq!(
+            json_array_meta(&meta),
+            json!({
+                "shape": [4096, 4096],
+                "chunks": [512, 512],
+                "shards": [2048, 2048],
+                "dtype": "uint16",
+                "fill_value": 0,
+                "dimension_names": ["y", "x"],
+                "codecs": ["sharding_indexed"],
+            })
+        );
+    }
+
+    /// An array's codec chain as the tree draws it.
+    fn codecs(meta: &ArrayMeta) -> Option<String> {
+        meta.codecs.as_deref().map(format_names)
     }
 
     /// The rows one array draws, as the text a person would see.

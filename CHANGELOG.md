@@ -22,6 +22,26 @@ with the pre-1.0 caveat that the output format is not yet stable.
 
 ### Added
 
+- Arrays report the codec chain they declare: a `codecs:` row last under the
+  array, and a `codecs` list in `--json`. One row for both Zarr versions,
+  because it answers one question — what happens to a chunk between the stored
+  bytes and the values. A V3 array's `codecs` list is shown as it stands; a V2
+  array's `filters` are shown in order followed by its `compressor`, which is
+  the order they run in. Names only, in declaration order and never sorted:
+  every codec's `configuration` — blosc's `cname` and `clevel`, gzip's `level`
+  — is left alone, no name is checked against a registry, and nothing is ever
+  run or instantiated. A sharded array shows `sharding_indexed`, the one entry
+  its `codecs` key holds; the codecs inside a shard are that codec's
+  configuration and are not displayed, and what sharding does to the grid is
+  already reported as the `chunks` and `shards` rows. A codec whose name could
+  not be read holds its position as `?` in the tree and `null` in `--json`,
+  rather than being dropped and claiming a shorter chain. An array declaring no
+  processing at all — a V2 array with `"filters": null` and
+  `"compressor": null` — gets no row and no JSON key, and no `codecs: none` is
+  invented. Additive presentation only: no classification, hierarchy, ordering,
+  existing field, finding or exit status changes, sharding's chunk/shard
+  reporting is untouched, `--validate` is unchanged, and nothing extra is read
+  from the store.
 - Arrays report their declared fill value: a `fill:` row after `dtype`, and a
   `fill_value` in `--json`. Read from a V2 `.zarray` and a V3 `zarr.json`
   alike, and shown exactly as the document wrote it — compact JSON in the tree,
