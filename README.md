@@ -681,9 +681,10 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
 - Pointing at a prefix that is not a Zarr node lists it to find out whether it
   exists at all. On a prefix holding a very large number of loose objects that
   listing is paginated to the end.
-- Only `shape`, `chunks`/`chunk_shape`, `dtype`/`data_type`, the shard shape
-  and a V3 array's `dimension_names` are read. Compressors and fill values are
-  not shown, user attributes only on request and only as stored (see
+- Only `shape`, `chunks`/`chunk_shape`, `dtype`/`data_type`, the shard shape,
+  a V3 array's `dimension_names` and `fill_value` are read. Compressors are not
+  shown, a fill value is displayed as stored and never interpreted or checked
+  against the dtype, user attributes only on request and only as stored (see
   `--attributes`), `codecs` is read for the sharding codec alone,
   V2 dtypes are passed through as stored, and a V3 dtype in object form is
   reported by its name alone — see

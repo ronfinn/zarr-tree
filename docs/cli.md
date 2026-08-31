@@ -129,7 +129,8 @@ depends on what the node is:
 | `zarr:` | Every recognised group and array, first — `V2` or `V3`, the metadata format the node was read as. See [Format version](zarr.md#format-version). |
 | `shape:`, `chunks:`, `dtype:` | Every array |
 | `shards:` | A Zarr V3 sharded array, between `chunks:` and `dtype:` |
-| `dimensions:` | A Zarr V3 array declaring `dimension_names`, after `dtype:`. An unnamed dimension shows as `?` in its own position. |
+| `fill:` | An array whose metadata declares a `fill_value`, after `dtype:`. Drawn as compact JSON, so `0`, `"NaN"` and `null` are each visibly the type they are, and never interpreted or checked against the dtype. See [Fill values](zarr.md#fill-values). |
+| `dimensions:` | A Zarr V3 array declaring `dimension_names`, after `fill:`. An unnamed dimension shows as `?` in its own position. |
 | `axes:`, `pyramid levels:`, `datasets:` | An OME-Zarr image |
 | `rows:`, `columns:`, `wells:` | An OME-Zarr HCS plate |
 | `rows:`, `columns:`, `parquet files:`, `schema:` | A SpatialData points or shapes element with a payload |
@@ -318,7 +319,7 @@ and then one section per kind of metadata that applies to it:
 | `kind` | every node | `group`, `array` or `unknown` |
 | `zarr_format` | recognised groups and arrays | `2` or `3`, the Zarr metadata version the node was read as. Absent on `unknown` |
 | `children` | every node | The child nodes, in the order the tree lists them |
-| `array` | arrays | `shape`, `chunks`, `dtype`, `shards` when sharded, and `dimension_names` when declared |
+| `array` | arrays | `shape`, `chunks`, `dtype`, `shards` when sharded, `fill_value` when declared, and `dimension_names` when declared |
 | `ome` | OME-Zarr groups | `tag`, `kind`, `version`, `axes`, `pyramid_levels`, `datasets`, and `rows`/`columns`/`wells` on a plate |
 | `spatialdata` | SpatialData nodes | `kind`, `version`, and `regions`/`region_key`/`instance_key` on a table |
 | `parquet` | points and shapes elements with a payload | `rows`, `columns`, `files`, `schema` |
@@ -360,10 +361,11 @@ $ zarr-tree --json partial.zarr | jq '.children[0].array'
 ```
 
 Every array has a shape, chunks and a dtype to be missing, so all three keys
-are always present and `null` means unreadable. `shards` and `dimension_names`
-are the exceptions and are omitted rather than `null`, because an unsharded
-array has no shards to
-miss.
+are always present and `null` means unreadable. `shards`, `fill_value` and
+`dimension_names` are the exceptions and are omitted rather than `null`,
+because an unsharded array has no shards to miss. A `fill_value` that *is*
+`null` is therefore the value the document wrote, not a missing one — see
+[Fill values](zarr.md#fill-values).
 
 **A payload that exists but could not be inspected is `"parquet": null`.** A
 points element whose `points.parquet/` directory could not be listed, or whose

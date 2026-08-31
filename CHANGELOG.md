@@ -22,6 +22,19 @@ with the pre-1.0 caveat that the output format is not yet stable.
 
 ### Added
 
+- Arrays report their declared fill value: a `fill:` row after `dtype`, and a
+  `fill_value` in `--json`. Read from a V2 `.zarray` and a V3 `zarr.json`
+  alike, and shown exactly as the document wrote it — compact JSON in the tree,
+  so `0`, `-1`, `3.14`, `"NaN"` and `null` are each visibly the type they are,
+  and the native JSON value in `--json`. Nothing is interpreted: a string
+  sentinel such as `"NaN"` stays a string, no value is converted to a float,
+  and none is checked against the array's dtype. A stated `"fill_value": null`
+  — which is how V2 spells "this array declares no fill value" — prints
+  `fill: null` and carries `"fill_value": null`; a document with no such key
+  gets no row and no JSON key, and no default is invented for it. Additive
+  presentation only: no classification, hierarchy, ordering, existing field,
+  finding or exit status changes, `--validate` is unchanged, and nothing extra
+  is read from the store — both documents were already parsed.
 - Every recognised node reports the Zarr metadata format it was read as: a
   `zarr: V2` / `zarr: V3` row, first under the node's own line on groups and
   arrays alike, and a `zarr_format` of `2` or `3` in `--json`. A store need not

@@ -448,6 +448,24 @@ struct ArrayMeta {
     /// attributes; neither is derived from the other and an array may carry
     /// both -- see `axis_names`.
     dimension_names: Option<Vec<Option<String>>>,
+    /// The array's fill value, exactly as the metadata document wrote it.
+    ///
+    /// Kept as a raw `serde_json::Value` because the field has no one JSON
+    /// type: V2 writes `0`, `-1`, `3.14`, `true`, `null` or the string
+    /// `"NaN"`, and V3 adds a two-element list for a complex type and an
+    /// object for some extension types. Anything narrower would have to
+    /// either reject the shapes it did not expect or convert them, and
+    /// converting is interpretation -- `"NaN"` is not a float here, it is the
+    /// four characters the file holds.
+    ///
+    /// The `Option` is the key, not the value. `None` means the document had
+    /// no `fill_value` at all: no row, no JSON key. `Some(Value::Null)` means
+    /// it had one and wrote `null`, which V2 spells for "this array declares
+    /// no fill value" -- a fact of the file, printed as `fill: null`. Rust's
+    /// `None` and JSON's `null` are different absences, and `Value` having a
+    /// `Null` variant of its own is what lets one `Option` hold both without
+    /// collapsing them.
+    fill_value: Option<Value>,
     /// The array's user attributes, kept as stored, and only when
     /// `--attributes` asked for them. `Absent` otherwise.
     ///
@@ -3405,6 +3423,7 @@ fn array_meta_v2(text: &str) -> ArrayMeta {
             shards: None,
             dtype: None,
             dimension_names: None,
+            fill_value: None,
             attributes: Attributes::Absent,
         };
     };
@@ -3422,6 +3441,10 @@ fn array_meta_v2(text: &str) -> ArrayMeta {
             .map(String::from),
         // V2 has no dimension-name key, and one is never invented for it.
         dimension_names: None,
+        // As stored, whatever JSON type that turned out to be. V2 requires
+        // the key and allows its value to be `null`, so a missing key and a
+        // `null` are both real states and are kept apart -- see `fill_value`.
+        fill_value: value.get("fill_value").cloned(),
         // Filled in by `classify` when `--attributes` asked for it: V2 keeps
         // an array's attributes in a `.zattrs` beside this file, which is not
         // in hand here.
@@ -3475,6 +3498,9 @@ fn array_meta_v3(value: &Value) -> ArrayMeta {
         shards,
         dtype: data_type_v3(value.get("data_type")),
         dimension_names: dimension_names_v3(value.get("dimension_names")),
+        // Same rule as V2, and the same one line: the value is passed through
+        // unread, never checked against `data_type` and never converted.
+        fill_value: value.get("fill_value").cloned(),
         // Filled in by `classify`, which knows whether they were asked for.
         attributes: Attributes::Absent,
     }
@@ -3660,9 +3686,10 @@ fn dataset_paths(value: Option<&Value>) -> Option<Vec<String>> {
 /// Print the metadata rows that sit underneath an array line.
 ///
 /// `zarr`, `shape`, `chunks` and `dtype` are always printed, in that order. A sharded
-/// array gains a `shards` row between `chunks` and `dtype`, and an array that
-/// names its dimensions gains a `dimensions` row after `dtype`; every other
-/// array prints exactly the three rows it always has. Whichever row ends up
+/// array gains a `shards` row between `chunks` and `dtype`; an array whose
+/// metadata declares a fill value gains a `fill` row after `dtype`; and an
+/// array that names its dimensions gains a `dimensions` row after that. Every
+/// other array prints exactly the rows it always has. Whichever row ends up
 /// last carries the closing connector. A field we could not read shows as `?`.
 fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::Result<()> {
     // The dimension lists are drawn here rather than kept ready-made, because
@@ -3675,6 +3702,11 @@ fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::
     // reads better bare than in brackets. An unnamed dimension keeps its
     // place as `?` rather than being dropped.
     let names = meta.dimension_names.as_deref().map(format_dimension_names);
+    // `Value`'s `Display` is compact JSON, which is exactly the rendering this
+    // row wants: a string keeps its quotes (`"NaN"`), a JSON null reads as
+    // `null` rather than as an empty cell, and a number is the text the file
+    // wrote. Nothing is re-formatted on the way.
+    let fill = meta.fill_value.as_ref().map(Value::to_string);
 
     // A `Vec` rather than the fixed array this used to be, because the number
     // of rows is no longer fixed. Everything else about the drawing is the
@@ -3694,6 +3726,14 @@ fn print_array_meta(out: &mut dyn Write, meta: &ArrayMeta, prefix: &str) -> io::
     }
 
     rows.push(("dtype:", meta.dtype.as_deref()));
+
+    // Only when the document has the key. There is no `fill: ?`: unlike a
+    // shape this tool has to read *into*, a fill value is one JSON value and
+    // any JSON value at all is printable, so the only thing that can go wrong
+    // is that there was none to print.
+    if let Some(fill) = fill.as_deref() {
+        rows.push(("fill:", Some(fill)));
+    }
 
     if let Some(names) = names.as_deref() {
         rows.push(("dimensions:", Some(names)));
@@ -3844,14 +3884,15 @@ fn node_attributes(kind: &NodeKind) -> Option<&Attributes> {
 
 /// An array's fields, with `null` where the tree would print `?`.
 ///
-/// `shards` and `dimension_names` are the exceptions to that rule, and are
-/// left out altogether rather than written as `null`. The two say different
-/// things: `null` means the field was looked for and could not be read, which
-/// every array has a shape, chunks and a dtype to be. An unsharded array has
-/// no shards to miss, and an array that names no dimensions has no names to
-/// miss, so those keys are simply not applicable and do not appear. Inside
-/// `dimension_names` a `null` is a different thing again -- a dimension the
-/// file itself left unnamed.
+/// `shards`, `dimension_names` and `fill_value` are the exceptions to that
+/// rule, and are left out altogether rather than written as `null`. The two
+/// say different things: `null` means the field was looked for and could not
+/// be read, which every array has a shape, chunks and a dtype to be. An
+/// unsharded array has no shards to miss, and an array that names no
+/// dimensions has no names to miss, so those keys are simply not applicable
+/// and do not appear. Inside `dimension_names` a `null` is a different thing
+/// again -- a dimension the file itself left unnamed -- and a `fill_value` of
+/// `null` is a third: the value the document itself wrote there.
 fn json_array_meta(meta: &ArrayMeta) -> Value {
     let mut value = json!({
         // Real JSON arrays rather than the `[4096, 4096]` text the tree draws,
@@ -3873,6 +3914,15 @@ fn json_array_meta(meta: &ArrayMeta) -> Value {
     // position without being given a name it does not have.
     if let Some(names) = &meta.dimension_names {
         value["dimension_names"] = json!(names);
+    }
+
+    // The value the document held, put back verbatim -- a number stays a
+    // number and `"NaN"` stays a string. An explicit `null` is written as
+    // `null`, which is why this is a key-presence test and not a
+    // `Value::is_null` one: the key appears when the file had it, and only
+    // then.
+    if let Some(fill) = &meta.fill_value {
+        value["fill_value"] = fill.clone();
     }
 
     value
@@ -6734,6 +6784,190 @@ mod tests {
         assert_eq!(meta.dimension_names, None);
         assert_eq!(shown(&meta.shape), Some(String::from("[10]")));
         assert_eq!(meta.dtype, Some(String::from("<u2")));
+    }
+
+    #[test]
+    fn a_v2_fill_value_is_kept_in_the_json_type_it_was_written_in() {
+        // V2 requires the key and puts no one type behind it. Each of these
+        // is a real thing a writer puts there, and each comes back as itself:
+        // `"NaN"` is four characters and stays four characters, because
+        // turning it into a float would be decoding, not inspecting.
+        for fill in [
+            json!(0),
+            json!(-1),
+            json!(2.5),
+            json!("NaN"),
+            json!("-Infinity"),
+            json!(true),
+            json!([0.0, 1.0]),
+            json!({ "re": 0.0, "im": 1.0 }),
+        ] {
+            let text = json!({
+                "zarr_format": 2,
+                "shape": [10],
+                "chunks": [10],
+                "dtype": "<f4",
+                "fill_value": fill
+            })
+            .to_string();
+
+            let meta = array_meta_v2(&text);
+
+            assert_eq!(meta.fill_value, Some(fill.clone()));
+            // And costs the rows beside it nothing.
+            assert_eq!(meta.dtype, Some(String::from("<f4")));
+            assert_eq!(shown(&meta.shape), Some(String::from("[10]")));
+        }
+    }
+
+    #[test]
+    fn an_absent_fill_value_is_not_the_same_as_an_explicit_null_one() {
+        // The distinction the whole representation exists for. V2 spells "no
+        // fill value" as `"fill_value": null`, which is a fact the file
+        // states; a document with no such key stated nothing. Rust's `None`
+        // and JSON's `null` are different absences, and `Value::Null` living
+        // inside the `Some` is what keeps them apart.
+        let stated = array_meta_v2(
+            r#"{"zarr_format": 2, "shape": [10], "chunks": [10], "dtype": "<i4", "fill_value": null}"#,
+        );
+        let silent =
+            array_meta_v2(r#"{"zarr_format": 2, "shape": [10], "chunks": [10], "dtype": "<i4"}"#);
+
+        assert_eq!(stated.fill_value, Some(Value::Null));
+        assert_eq!(silent.fill_value, None);
+
+        // Which the two renderers carry through: a stated null is a row and a
+        // key, a silent one is neither.
+        assert!(row_text(&stated).contains("fill:   null"));
+        assert!(!row_text(&silent).contains("fill:"));
+        assert_eq!(
+            json_array_meta(&stated).get("fill_value"),
+            Some(&Value::Null)
+        );
+        assert_eq!(json_array_meta(&silent).get("fill_value"), None);
+    }
+
+    #[test]
+    fn a_malformed_v2_array_document_has_no_fill_value() {
+        // `.zarray` that is not JSON leaves the node an array with every field
+        // missing, which fill values join rather than change: no row, no key,
+        // and certainly no invented default.
+        let meta = array_meta_v2("{not json");
+
+        assert_eq!(meta.fill_value, None);
+        assert_eq!(meta.dtype, None);
+        assert_eq!(json_array_meta(&meta).get("fill_value"), None);
+    }
+
+    #[test]
+    fn a_v3_fill_value_is_kept_as_stored_whatever_its_type() {
+        // V3 has the same key with a wider vocabulary: a bare number, one of
+        // the three float sentinels as a string, a hex bit pattern, a
+        // two-element list for a complex type, `true` for a bool. None of it
+        // is read against `data_type` -- that would be decoding.
+        for fill in [
+            json!(0),
+            json!(-1),
+            json!(2.5),
+            json!("NaN"),
+            json!("Infinity"),
+            json!("0x7fc00000"),
+            json!([0.0, 1.0]),
+            json!(true),
+        ] {
+            let value = json!({
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [10],
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [10]}},
+                "data_type": "float32",
+                "fill_value": fill
+            });
+
+            let meta = array_meta_v3(&value);
+
+            assert_eq!(meta.fill_value, Some(fill.clone()));
+            assert_eq!(meta.dtype, Some(String::from("float32")));
+        }
+
+        // And a V3 array with no such key gets no row and no key, exactly as
+        // a V2 one does.
+        let bare = array_meta_v3(&json!({
+            "zarr_format": 3, "node_type": "array", "shape": [10], "data_type": "float32"
+        }));
+        assert_eq!(bare.fill_value, None);
+    }
+
+    #[test]
+    fn the_fill_row_sits_between_dtype_and_dimensions() {
+        // Placement and rendering together: `fill` comes after `dtype` and
+        // before `dimensions`, and the value is drawn as compact JSON, so a
+        // string keeps the quotes that say it is one.
+        let meta = array_meta_v3(&json!({
+            "zarr_format": 3,
+            "node_type": "array",
+            "shape": [64, 64],
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [32, 32]}},
+            "data_type": "float32",
+            "fill_value": "NaN",
+            "dimension_names": ["y", "x"]
+        }));
+
+        let text = row_text(&meta);
+        let rows: Vec<&str> = text.lines().collect();
+
+        assert_eq!(
+            rows,
+            vec![
+                "├─ zarr:       V3",
+                "├─ shape:      [64, 64]",
+                "├─ chunks:     [32, 32]",
+                "├─ dtype:      float32",
+                "├─ fill:       \"NaN\"",
+                "└─ dimensions: y, x",
+            ],
+            "{text}"
+        );
+
+        // The same array in JSON: a string stays a string, and the fields
+        // beside it are untouched.
+        assert_eq!(
+            json_array_meta(&meta),
+            json!({
+                "shape": [64, 64],
+                "chunks": [32, 32],
+                "dtype": "float32",
+                "fill_value": "NaN",
+                "dimension_names": ["y", "x"],
+            })
+        );
+    }
+
+    #[test]
+    fn a_numeric_fill_row_closes_the_block_when_it_is_last() {
+        // With no dimension names the fill row is the last one, so it takes
+        // the closing connector `dtype` used to carry. A negative value is
+        // drawn as written -- nothing here knows or cares that the dtype is
+        // unsigned.
+        let meta = array_meta_v2(
+            r#"{"zarr_format": 2, "shape": [4], "chunks": [4], "dtype": "<u2", "fill_value": -1}"#,
+        );
+
+        let text = row_text(&meta);
+
+        assert!(text.contains("├─ dtype:  <u2\n"), "{text}");
+        assert!(text.ends_with("└─ fill:   -1\n"), "{text}");
+        assert_eq!(json_array_meta(&meta)["fill_value"], json!(-1));
+    }
+
+    /// The rows one array draws, as the text a person would see.
+    ///
+    /// `print_array_meta` writes the block under an array line, which is the
+    /// smallest thing that can be asked about row order and padding.
+    fn row_text(meta: &ArrayMeta) -> String {
+        let mut out: Vec<u8> = Vec::new();
+        print_array_meta(&mut out, meta, "").unwrap();
+        String::from_utf8(out).unwrap()
     }
 
     #[test]

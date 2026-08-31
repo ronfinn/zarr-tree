@@ -2578,6 +2578,126 @@ fn v3_dimension_names_are_shown_and_a_v2_array_is_unchanged() {
     );
 }
 
+#[test]
+fn fill_values_are_shown_as_stored_and_groups_never_carry_one() {
+    let dir = fixture_dir("fill-values");
+    let root = dir.join("dataset.zarr");
+
+    // A root group carrying a `fill_value` key of its own. Groups have no such
+    // field, and nothing looks for one there: this exists to prove the row is
+    // an array's alone.
+    write_file(
+        &root.join("zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group", "fill_value": 0}"#,
+    );
+
+    // Five V3 arrays that differ only in their fill value: an integer, a
+    // string sentinel, an explicit null, no such key at all, and a list.
+    let array = |fill: &str| -> String {
+        format!(
+            r#"{{
+                "zarr_format": 3,
+                "node_type": "array",
+                "shape": [4],
+                "chunk_grid": {{"name": "regular", "configuration": {{"chunk_shape": [4]}}}},
+                "codecs": [{{"name": "bytes"}}],
+                "data_type": "float32"{fill}
+            }}"#
+        )
+    };
+
+    write_file(&root.join("zero/zarr.json"), &array(r#", "fill_value": 0"#));
+    write_file(
+        &root.join("sentinel/zarr.json"),
+        &array(r#", "fill_value": "NaN""#),
+    );
+    write_file(
+        &root.join("nulled/zarr.json"),
+        &array(r#", "fill_value": null"#),
+    );
+    write_file(&root.join("absent/zarr.json"), &array(""));
+    write_file(
+        &root.join("complex/zarr.json"),
+        &array(r#", "fill_value": [0.0, -1.5]"#),
+    );
+
+    // Two V2 arrays beside them, where the key is the norm rather than the
+    // exception, and where a negative fill under an unsigned dtype is left
+    // exactly as written -- checking it against the dtype would be validation.
+    write_file(
+        &root.join("legacy/.zarray"),
+        r#"{"zarr_format": 2, "shape": [4], "chunks": [4], "dtype": "<u2",
+            "fill_value": -1}"#,
+    );
+    write_file(
+        &root.join("legacy-float/.zarray"),
+        r#"{"zarr_format": 2, "shape": [4], "chunks": [4], "dtype": "<f8",
+            "fill_value": 2.5}"#,
+    );
+
+    let path = root.to_str().unwrap().to_string();
+    let text = String::from_utf8_lossy(&run(&[&path]).stdout).into_owned();
+    let output = run(&["--json", &path]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    let rows = lines(&text);
+    assert!(has(&rows, "fill: 0"), "{text}");
+    // Compact JSON, so a string keeps the quotes that say it is one and a
+    // stated null reads as `null` rather than as an empty cell.
+    assert!(has(&rows, r#"fill: "NaN""#), "{text}");
+    assert!(has(&rows, "fill: null"), "{text}");
+    assert!(has(&rows, "fill: [0.0,-1.5]"), "{text}");
+    assert!(has(&rows, "fill: -1"), "{text}");
+    assert!(has(&rows, "fill: 2.5"), "{text}");
+    // Six arrays declare one; the seventh and the group do not.
+    assert_eq!(text.matches("fill:").count(), 6, "{text}");
+    // Where it is there it is the last row, so it takes the connector `dtype`
+    // used to carry -- and `dtype` still closes the block for `absent`.
+    assert_eq!(text.matches("└─ fill:").count(), 6, "{text}");
+    assert_eq!(text.matches("└─ dtype:").count(), 1, "{text}");
+    // Nothing was reclassified and the walk finished.
+    assert_eq!(text.matches("[array]").count(), 7, "{text}");
+    assert!(output.status.success(), "{stdout}");
+
+    let tree: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("--json should print valid JSON: {error}\n{stdout}"));
+    let child = |name: &str| -> Value {
+        tree["children"]
+            .as_array()
+            .expect("the root should have children")
+            .iter()
+            .find(|child| child["name"] == json!(name))
+            .unwrap_or_else(|| panic!("no child named {name:?} in {stdout}"))
+            .clone()
+    };
+    let array_of = |name: &str| -> Value { child(name)["array"].clone() };
+
+    // The native JSON type, never a string standing in for one.
+    assert_eq!(array_of("zero")["fill_value"], json!(0));
+    assert_eq!(array_of("sentinel")["fill_value"], json!("NaN"));
+    assert_eq!(array_of("complex")["fill_value"], json!([0.0, -1.5]));
+    assert_eq!(array_of("legacy")["fill_value"], json!(-1));
+    assert_eq!(array_of("legacy-float")["fill_value"], json!(2.5));
+    // A stated null is a key holding null; an absent one is no key at all.
+    assert_eq!(
+        array_of("nulled").get("fill_value"),
+        Some(&Value::Null),
+        "{stdout}"
+    );
+    assert_eq!(array_of("absent").get("fill_value"), None, "{stdout}");
+    // The group's stray key bought it nothing: a group has no array section
+    // for one to appear in.
+    assert_eq!(tree.get("array"), None, "{stdout}");
+    assert_eq!(tree.get("fill_value"), None, "{stdout}");
+    // The rows an array already had are exactly as they were.
+    assert_eq!(
+        array_of("legacy"),
+        json!({ "shape": [4], "chunks": [4], "dtype": "<u2", "fill_value": -1 })
+    );
+}
+
 /// A small store touching everything `--attributes` has to get right: a V3
 /// root with values of every JSON kind, a V2 group whose attributes are also
 /// OME-Zarr metadata, a V2 array, an empty attributes object, and a `.zattrs`

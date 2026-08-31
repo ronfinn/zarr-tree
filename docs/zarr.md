@@ -36,8 +36,9 @@ It does not:
 - decode array data, or read a chunk of any kind;
 - execute or interpret codecs — the codec list is scanned for one name and
   otherwise left alone;
-- resolve fill values, compressors or user attributes — a V3 array's
-  `dimension_names` are displayed as stored, never resolved or filled in;
+- resolve fill values, compressors or user attributes — a fill value and a V3
+  array's `dimension_names` are displayed as stored, never resolved, converted
+  or filled in;
 - repair, rewrite or normalise a store;
 - check a document against the Zarr specification.
 
@@ -59,7 +60,7 @@ costs a read and no parsing at all.
 | File | Read for |
 | --- | --- |
 | `.zgroup` | Node identification: this node is a group. Its contents are not used. |
-| `.zarray` | Node identification and array metadata: `shape`, `chunks`, `dtype`. |
+| `.zarray` | Node identification and array metadata: `shape`, `chunks`, `dtype`, `fill_value`. |
 | `.zattrs` | User attributes. Read only on a group, and only to look for the OME-Zarr and SpatialData markers. |
 | `.zmetadata` | Consolidated metadata at the store root — see [Consolidated metadata](#consolidated-metadata). |
 
@@ -78,7 +79,8 @@ v2.zarr [group]
     ├─ zarr:   V2
     ├─ shape:  [1024, 1024]
     ├─ chunks: [256, 256]
-    └─ dtype:  <u2
+    ├─ dtype:  <u2
+    └─ fill:   0
 ```
 
 **V2 dtypes are displayed exactly as stored**, in NumPy notation: `<u2`, `|u1`,
@@ -107,12 +109,12 @@ classified.
 | `codecs` | Scanned for a codec named exactly `sharding_indexed`, and for nothing else — see [Sharding](#sharding). |
 | `data_type` | The dtype: the string itself, or the `name` of an extension's object form. |
 | `dimension_names` | The array's own dimension names — see [Dimension names](#dimension-names). |
+| `fill_value` | The array's fill value, as stored — see [Fill values](#fill-values). |
 | `attributes` | User attributes, read only on a group, and only for the OME-Zarr (`attributes.ome`) and SpatialData markers. |
 | `consolidated_metadata` | Consolidated metadata at the store root — see [Consolidated metadata](#consolidated-metadata). |
 
 Nothing else in a V3 document is read: not `chunk_key_encoding`, not
-`fill_value`, not `storage_transformers`, and not the codec chain beyond the one
-name above.
+`storage_transformers`, and not the codec chain beyond the one name above.
 
 ### Dimension names
 
@@ -217,6 +219,7 @@ Only rows this program actually reads:
 | Chunk shape | `chunks` | `chunk_grid.configuration.chunk_shape`, or the sharding codec's `configuration.chunk_shape` when sharded |
 | Shard shape | not applicable | `chunk_grid.configuration.chunk_shape` when sharded |
 | dtype | `dtype`, NumPy notation | `data_type`, string form or an extension object's `name` |
+| Fill value | `fill_value`, required, may be `null` | `fill_value` |
 | Consolidation | `.zmetadata` at the root | inline `consolidated_metadata` in the root `zarr.json` |
 | OME-Zarr metadata | keys at the top level of `.zattrs` | `attributes.ome` |
 
@@ -334,8 +337,9 @@ all V3 nodes cost nothing extra, their attributes being in a file already read.
 ## Arrays and their metadata
 
 Every array prints its format and then three rows. A sharded V3 array prints a
-`shards` row after its chunks, and a V3 array that names its dimensions prints
-a `dimensions` row after its dtype:
+`shards` row after its chunks, an array that declares a fill value prints a
+`fill` row after its dtype, and a V3 array that names its dimensions prints a
+`dimensions` row after that:
 
 ```
 ├─ zarr:       V3
@@ -343,23 +347,91 @@ a `dimensions` row after its dtype:
 ├─ chunks:     [1, 512, 512]
 ├─ shards:     [1, 2048, 2048]
 ├─ dtype:      uint16
+├─ fill:       0
 └─ dimensions: c, y, x
 ```
 
 `shape`, `chunks` and `dtype` are always drawn, showing `?` when the field
 could not be read — they are the three things every Zarr array has, so their
 absence is information. `shards` is drawn only for an array that named the
-sharding codec; an unsharded array has no shards to be missing. `dimensions` is
-drawn only for a V3 array that declared `dimension_names` — see
-[Dimension names](#dimension-names). The row names are padded to the longest
-one actually printed, so an array with no `dimensions` row is laid out exactly
-as it always was.
+sharding codec; an unsharded array has no shards to be missing. `fill` is drawn
+only for an array whose document has a `fill_value` key — see
+[Fill values](#fill-values). `dimensions` is drawn only for a V3 array that
+declared `dimension_names` — see [Dimension names](#dimension-names). The row
+names are padded to the longest one actually printed, so an array with no
+`dimensions` row is laid out exactly as it always was.
 
 Dimension entries are copied out of the file rather than parsed into numbers.
 A malformed `"shape": [1, "x"]` prints as `[1, "x"]` rather than being dropped
 or repaired, and `--json` carries the same values as real JSON. Nothing is
 multiplied out: no element count, no byte size, no chunk count is calculated,
 because doing so would mean deciding what a non-numeric dimension meant.
+
+## Fill values
+
+Both Zarr versions let an array declare the value a chunk that was never
+written stands for. V2 puts `fill_value` in `.zarray`, V3 puts it in
+`zarr.json`, and both are read the same way: copied out of the document
+untouched.
+
+The value has no single JSON type. All of these are things real stores write:
+
+```json
+"fill_value": 0
+"fill_value": -1
+"fill_value": 3.14
+"fill_value": "NaN"
+"fill_value": null
+"fill_value": [0.0, 1.0]
+```
+
+So it is shown as compact JSON, which is what makes the type visible:
+
+```
+├─ dtype:  <f4
+└─ fill:   "NaN"
+```
+
+The quotes are the point. `"NaN"` is how both versions spell a not-a-number
+fill for a float array, and it is stored as the three characters `NaN` in a
+string. Turning it into a floating-point NaN would be decoding the value, which
+is the line this tool does not cross — so it stays a string, and `"Infinity"`
+and `"-Infinity"` with it. Nothing here is special-cased.
+
+Nothing is checked against the dtype either. A `<u2` array declaring
+`"fill_value": -1` prints `fill: -1`, because reporting what a store says is
+this tool's job and deciding whether a store is wrong about its own fill value
+would need the dtype semantics it deliberately does not have. `--validate` does
+not look at fill values.
+
+**A stated `null` is not a missing key.** V2 requires `fill_value` and spells
+"this array declares no fill value" as `null`, which is a fact the document
+states:
+
+```
+└─ fill:   null
+```
+
+An array whose document has no `fill_value` at all stated nothing, and gets no
+row and no JSON key. No default is invented for it — not `0`, not `null`. The
+same rule as `shards` and `dimension_names`: a key that is not applicable does
+not appear, and the difference between the two absences is preserved rather
+than flattened.
+
+In `--json` the value is the JSON value the document held, in its own type:
+
+```json
+"array": {
+  "shape": [4],
+  "chunks": [4],
+  "dtype": "<f4",
+  "fill_value": "NaN"
+}
+```
+
+Both documents were already being parsed for `shape` and `dtype`, so reading
+the fill value costs no extra request anywhere — local, S3, HTTP or a
+consolidated snapshot alike.
 
 ## Arrays are leaves
 
@@ -627,7 +699,7 @@ shape in the [Command-line reference](cli.md#json-output).)
 | `kind` | `"group"`, `"array"` or `"unknown"` |
 | `zarr_format` | `2` or `3`, the number Zarr itself stamps into its metadata files. Absent on an `[unknown]` node — see [Format version](#format-version). |
 | `children` | The child nodes, in the order the tree lists them. Empty for an array, and empty at the depth limit. |
-| `array` | `shape`, `chunks`, `dtype`, `shards` on a sharded V3 array, and `dimension_names` on a V3 array that declares them. |
+| `array` | `shape`, `chunks`, `dtype`, `shards` on a sharded V3 array, `fill_value` where the document declares one, and `dimension_names` on a V3 array that declares them. |
 | `attributes` | The node's user attributes, with `--attributes` only. Values keep their JSON types; `null` where the document could not be read. Absent where there are none. |
 
 ```
@@ -651,10 +723,18 @@ Two rules govern the `array` object:
 - A field that was looked for and could not be read is `null`, the same thing
   the tree draws as `?`. `shape`, `chunks` and `dtype` are therefore always
   present.
-- `shards` and `dimension_names` are **omitted entirely** where they do not
-  apply, rather than written as `null`. The two say different things: `null`
-  means "looked for, not readable", and an unsharded array has no shards to
-  miss, just as an array naming no dimensions has no names to miss.
+- `shards`, `fill_value` and `dimension_names` are **omitted entirely** where
+  they do not apply, rather than written as `null`. The two say different
+  things: `null` means "looked for, not readable", and an unsharded array has
+  no shards to miss, just as an array naming no dimensions has no names to
+  miss.
+
+A `fill_value` of `null` is therefore not an omission but the value the
+document itself wrote — see [Fill values](#fill-values):
+
+```json
+"fill_value": null
+```
 
 Inside `dimension_names` a `null` means a third thing again — a dimension the
 file itself left unnamed, kept in its own position:
@@ -760,7 +840,11 @@ enough to run against a remote store at all.
 - **Complete Zarr specification validation.** `--validate` checks a store
   against its own declarations, never a document against a schema.
 - **Store repair, rewriting or writing of any kind.**
-- **Compressors and fill values.**
+- **Compressors.**
+- **Fill-value interpretation.** The value is shown as the document wrote it
+  and nothing more: `"NaN"` is a string, not a float; no value is decoded,
+  normalised, or checked against the array's dtype — see
+  [Fill values](#fill-values).
 - **Interpretation of user attributes.** They are shown on request, and only as
   stored — see [User attributes](#user-attributes). Beyond the OME-Zarr and
   SpatialData markers this program already reads, no attribute key is given a
