@@ -448,7 +448,7 @@ because a partial walk would report every node below the limit as missing.
 
 | Check | Metadata used | Severity when broken |
 | --- | --- | --- |
-| A node's metadata is readable, and an array's `shape`, `chunks` and `shards` agree on dimensionality | the node's own `.zgroup` / `.zarray` / `zarr.json` | `ERROR` for an unreadable root or a dimensionality disagreement; `WARN` for an unreadable node below the root, or unreadable chunks |
+| A node's metadata is readable, and an array's `shape`, `chunks`, `shards` and `dimension_names` agree on dimensionality | the node's own `.zgroup` / `.zarray` / `zarr.json` | `ERROR` for an unreadable root or a dimensionality disagreement; `WARN` for an unreadable node below the root, or unreadable chunks |
 | Every OME `datasets[].path` exists and is an array | `multiscales[0].datasets`, resolved against the node map | `ERROR` |
 | Pyramid levels agree on dimensionality | the levels' own `shape`, against `multiscales[0].axes` where declared, else against the first level | `ERROR` |
 | Every path in a plate's `wells` exists and is a group | `plate.wells`, resolved against the node map | `ERROR` |

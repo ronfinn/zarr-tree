@@ -128,7 +128,7 @@ The [SpatialData reference](spatialdata.md) documents all of this in detail.
 | Text output | Supported |
 | JSON output (`--validate --json`) | Supported |
 | Exit status 2 when at least one `ERROR` is found | Supported |
-| Array shape / chunk / shard dimensionality agreement | Supported |
+| Array shape / chunk / shard / dimension-name dimensionality agreement | Supported |
 | OME dataset paths exist and agree on dimensionality | Supported |
 | Declared HCS well paths exist | Supported |
 | A table's `region` names an existing element | Supported |

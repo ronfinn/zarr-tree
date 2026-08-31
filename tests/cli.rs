@@ -2254,13 +2254,15 @@ const SOUND: &[(&str, &str)] = &[
         "images/morphology/0/zarr.json",
         r#"{"zarr_format": 3, "node_type": "array", "shape": [3, 64, 64],
             "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1, 32, 32]}},
-            "data_type": "uint16"}"#,
+            "data_type": "uint16", "dimension_names": ["c", "y", "x"]}"#,
     ),
+    // The `null` is a dimension this level deliberately left unnamed. It is
+    // still a dimension, so this array names three of them and holds.
     (
         "images/morphology/1/zarr.json",
         r#"{"zarr_format": 3, "node_type": "array", "shape": [3, 32, 32],
             "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1, 32, 32]}},
-            "data_type": "uint16"}"#,
+            "data_type": "uint16", "dimension_names": ["c", null, "x"]}"#,
     ),
     (
         "tables/zarr.json",
@@ -2306,10 +2308,11 @@ const SOUND: &[(&str, &str)] = &[
     ),
 ];
 
-/// The three files that make the sound store an unsound one, each breaking a
-/// different rule: a multiscale declaring a level that was never written, a
-/// table annotating an element that does not exist, and an `X` that is not the
-/// shape its own indexes say it is.
+/// The four files that make the sound store an unsound one, each breaking a
+/// different rule: a multiscale declaring a level that was never written, an
+/// array naming fewer dimensions than its shape has, a table annotating an
+/// element that does not exist, and an `X` that is not the shape its own
+/// indexes say it is.
 const BROKEN: &[(&str, &str)] = &[
     (
         "images/morphology/zarr.json",
@@ -2320,6 +2323,12 @@ const BROKEN: &[(&str, &str)] = &[
                 "datasets": [{"path": "0"}, {"path": "2"}]
             }]}
         }}"#,
+    ),
+    (
+        "images/morphology/1/zarr.json",
+        r#"{"zarr_format": 3, "node_type": "array", "shape": [3, 32, 32],
+            "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1, 32, 32]}},
+            "data_type": "uint16", "dimension_names": ["c", "y"]}"#,
     ),
     (
         "tables/table/zarr.json",
@@ -2358,7 +2367,9 @@ fn validation_passes_a_store_whose_declarations_all_hold() {
         "PASS  /tables/table  table region \"morphology\" names an existing SpatialData element",
         "PASS  /tables/table  AnnData X rows match the 10 observations the obs index declares",
         "PASS  /tables/table  AnnData X columns match the 4 variables the var index declares",
-        "Validation: 12 passed, 0 warnings, 0 errors",
+        "PASS  /images/morphology/0  array shape and dimension names agree on 3 dimensions",
+        "PASS  /images/morphology/1  array shape and dimension names agree on 3 dimensions",
+        "Validation: 14 passed, 0 warnings, 0 errors",
     ] {
         assert!(
             stdout.lines().any(|line| line == expected),
@@ -2390,7 +2401,8 @@ fn validation_reports_a_declaration_the_store_does_not_have() {
         "ERROR /images/morphology  OME dataset path \"2\" does not exist",
         "ERROR /tables/table  table region \"cells\" does not name an existing SpatialData element",
         "ERROR /tables/table  AnnData X has 9 rows but the obs index declares 10 observations",
-        "Validation: 9 passed, 0 warnings, 3 errors",
+        "ERROR /images/morphology/1  array shape has 3 dimensions but its dimension names cover 2 dimensions",
+        "Validation: 10 passed, 0 warnings, 4 errors",
     ] {
         assert!(
             stdout.lines().any(|line| line == expected),
@@ -2424,11 +2436,11 @@ fn validation_json_carries_the_same_findings_and_a_summary() {
 
     assert_eq!(
         report["summary"],
-        json!({"passed": 9, "warnings": 0, "errors": 3})
+        json!({"passed": 10, "warnings": 0, "errors": 4})
     );
 
     let findings = report["findings"].as_array().expect("a list of findings");
-    assert_eq!(findings.len(), 12, "{stdout}");
+    assert_eq!(findings.len(), 14, "{stdout}");
     // The first finding is the first line of the report, so the two outputs
     // are the same findings in the same order.
     assert_eq!(
@@ -2445,6 +2457,18 @@ fn validation_json_carries_the_same_findings_and_a_summary() {
                 && found["path"] == "/tables/table"
                 && found["message"]
                     == "table region \"cells\" does not name an existing SpatialData element"
+        }),
+        "{stdout}"
+    );
+
+    // The dimension-name mismatch is a finding like any other: the same three
+    // fields, in the same array, with no schema of its own.
+    assert!(
+        findings.iter().any(|found| {
+            found["severity"] == "error"
+                && found["path"] == "/images/morphology/1"
+                && found["message"]
+                    == "array shape has 3 dimensions but its dimension names cover 2 dimensions"
         }),
         "{stdout}"
     );

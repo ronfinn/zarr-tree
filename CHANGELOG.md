@@ -17,6 +17,11 @@ with the pre-1.0 caveat that the output format is not yet stable.
   printing as `?` and staying `null` in JSON; an array that names no
   dimensions prints no row. These are the array's own names, kept separate
   from OME-Zarr `axes`.
+- `--validate` checks a Zarr V3 `dimension_names` against the array's `shape`:
+  one name per dimension, or an `ERROR`. This joins the existing array
+  dimensionality rule rather than adding an eighth — a `null` entry counts as
+  the dimension it is, the names themselves are never read, and they are never
+  compared with OME-Zarr `axes`.
 - Zarr V3 data types written in the object (extension) form are reported by
   the `name` they declare — `dtype: numpy.datetime64` — instead of showing as
   missing. String data types are unchanged, and a `data_type` with no usable

@@ -3763,6 +3763,9 @@ fn check_node(
 /// another one has nothing missing -- it has something this program does not
 /// read -- and the comparison is simply not made.
 ///
+/// A V3 `dimension_names` joins the same comparison when the array has one:
+/// one name per dimension, counted and not read.
+///
 /// Nothing here looks at a codec, a fill value or a dtype. This is the
 /// dimensionality check the feature asked for and not a Zarr conformance pass.
 fn check_array(path: &str, meta: &ArrayMeta, findings: &mut Vec<ValidationFinding>) {
@@ -3822,6 +3825,39 @@ fn check_array(path: &str, meta: &ArrayMeta, findings: &mut Vec<ValidationFindin
                     "array shape has {} but its shards have {}",
                     plural(shape.len(), "dimension"),
                     plural(shards.len(), "dimension")
+                ),
+            ),
+        });
+    }
+
+    // A V3 array may name its own dimensions, and there has to be one name
+    // per dimension. Only the count is checked: a `null` entry is a dimension
+    // the file deliberately left unnamed, which is a name we do not have and
+    // not a dimension that is missing, so it counts like any other. Nothing
+    // here looks at what the names say, and nothing compares them with an
+    // OME-Zarr `axes` list -- the two are separate metadata and neither is
+    // derived from the other.
+    //
+    // An array that named no dimensions is silent here rather than warned
+    // about, exactly as an unsharded array is silent about shards: V2 has no
+    // such key and V3 makes it optional, so there is nothing to check.
+    if let Some(names) = &meta.dimension_names {
+        findings.push(match names.len() == shape.len() {
+            true => finding(
+                Severity::Pass,
+                path,
+                format!(
+                    "array shape and dimension names agree on {}",
+                    plural(shape.len(), "dimension")
+                ),
+            ),
+            false => finding(
+                Severity::Error,
+                path,
+                format!(
+                    "array shape has {} but its dimension names cover {}",
+                    plural(shape.len(), "dimension"),
+                    plural(names.len(), "dimension")
                 ),
             ),
         });
@@ -7355,6 +7391,96 @@ mod tests {
             .lines()
             .map(String::from)
             .collect()
+    }
+
+    /// The findings one V3 array's metadata yields, severity and message.
+    ///
+    /// Straight off the struct rather than through the printer: these tests
+    /// are about which findings one rule makes, and the printed form is the
+    /// integration tests' business.
+    fn array_findings(value: &Value) -> Vec<(&'static str, String)> {
+        let meta = array_meta_v3(value);
+        let mut findings = Vec::new();
+        check_array("img", &meta, &mut findings);
+
+        findings
+            .into_iter()
+            .map(|found| (found.severity.label(), found.message))
+            .collect()
+    }
+
+    /// Only the findings that are about dimension names.
+    fn name_findings(value: &Value) -> Vec<(&'static str, String)> {
+        array_findings(value)
+            .into_iter()
+            .filter(|(_, message)| message.contains("dimension names"))
+            .collect()
+    }
+
+    #[test]
+    fn an_array_that_names_no_dimensions_is_not_checked_for_names() {
+        // V2 has no such key and V3 makes it optional, so there is nothing to
+        // check and nothing to say -- not even a warning. An empty list reads
+        // the same way, because that is what `dimension_names_v3` makes of it.
+        for value in [
+            json!({"zarr_format": 3, "node_type": "array", "shape": [3, 64, 64],
+                   "chunk_grid": {"name": "regular",
+                                  "configuration": {"chunk_shape": [1, 32, 32]}},
+                   "data_type": "uint16"}),
+            json!({"zarr_format": 3, "node_type": "array", "shape": [3, 64, 64],
+                   "chunk_grid": {"name": "regular",
+                                  "configuration": {"chunk_shape": [1, 32, 32]}},
+                   "data_type": "uint16", "dimension_names": []}),
+        ] {
+            assert!(name_findings(&value).is_empty(), "{value}");
+            // The rest of rule one still ran.
+            assert!(!array_findings(&value).is_empty(), "{value}");
+        }
+    }
+
+    #[test]
+    fn dimension_names_that_match_the_shape_pass_even_where_one_is_null() {
+        // A `null` is a dimension the file left unnamed, not a dimension it
+        // left out: three entries are three dimensions either way, and the
+        // names themselves are never read.
+        for names in [json!(["c", "y", "x"]), json!(["c", null, "x"])] {
+            let value = json!({"zarr_format": 3, "node_type": "array", "shape": [3, 64, 64],
+                               "chunk_grid": {"name": "regular",
+                                              "configuration": {"chunk_shape": [1, 32, 32]}},
+                               "data_type": "uint16", "dimension_names": names});
+
+            assert_eq!(
+                name_findings(&value),
+                vec![(
+                    "PASS",
+                    String::from("array shape and dimension names agree on 3 dimensions")
+                )],
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn dimension_names_that_do_not_match_the_shape_are_an_error() {
+        // Both ways round: too few names and too many are the same fault.
+        for (names, count) in [(json!(["c", "y"]), 2), (json!(["c", "z", "y", "x"]), 4)] {
+            let value = json!({"zarr_format": 3, "node_type": "array", "shape": [3, 64, 64],
+                               "chunk_grid": {"name": "regular",
+                                              "configuration": {"chunk_shape": [1, 32, 32]}},
+                               "data_type": "uint16", "dimension_names": names});
+
+            assert_eq!(
+                name_findings(&value),
+                vec![(
+                    "ERROR",
+                    format!(
+                        "array shape has 3 dimensions but its dimension names cover \
+                         {count} dimensions"
+                    )
+                )],
+                "{value}"
+            );
+        }
     }
 
     #[test]

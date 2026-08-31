@@ -566,6 +566,8 @@ it.
 | No readable chunk shape | `WARN` — only a regular grid records one, so nothing is claimed |
 | `shards` agrees with `shape` (sharded arrays only) | `PASS` |
 | `shards` disagrees with `shape` | `ERROR` |
+| `dimension_names` has one entry per `shape` dimension (V3 arrays that declare any) | `PASS` |
+| `dimension_names` has a different number of entries | `ERROR` |
 
 ```
 $ zarr-tree --validate sharded.zarr
@@ -574,6 +576,23 @@ PASS  /img  array shape and chunks agree on 2 dimensions
 PASS  /img  array shape and shards agree on 2 dimensions
 
 Validation: 3 passed, 0 warnings, 0 errors
+```
+
+Only the count of `dimension_names` is checked. A `null` entry is a dimension
+the file deliberately left unnamed — still a dimension, so `["c", null, "x"]`
+holds against a shape of `[3, 64, 64]` — and the names themselves are never
+read: nothing checks them for uniqueness or meaning, and nothing compares them
+with an OME-Zarr `axes` list, which is separate metadata a level may also
+carry. An array that declares no `dimension_names` produces no finding, exactly
+as an unsharded array says nothing about shards.
+
+```
+$ zarr-tree --validate misnamed.zarr
+PASS  /  Zarr root metadata is readable
+PASS  /img  array shape and chunks agree on 3 dimensions
+ERROR /img  array shape has 3 dimensions but its dimension names cover 2 dimensions
+
+Validation: 2 passed, 0 warnings, 1 error
 ```
 
 An array whose sharding codec could not be read through warns rather than

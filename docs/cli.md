@@ -447,7 +447,7 @@ no policy engine, and no way to add an eighth from outside the source.
 
 | # | Area | Check | Severities it can produce |
 | --- | --- | --- | --- |
-| 1 | Zarr | Every node walked into could be identified, and an array's `shape`, `chunks` and — when sharded — `shards` agree on how many dimensions there are. Codecs, fill values and dtypes are not checked. | `PASS`, `WARN`, `ERROR` |
+| 1 | Zarr | Every node walked into could be identified, and an array's `shape`, `chunks`, — when sharded — `shards` and — when declared — `dimension_names` agree on how many dimensions there are. Codecs, fill values and dtypes are not checked, and neither is what a dimension name says. | `PASS`, `WARN`, `ERROR` |
 | 2 | OME-Zarr | Every `multiscales[0].datasets[].path` names a node that exists and is an array. | `PASS`, `WARN`, `ERROR` |
 | 3 | OME-Zarr | Every resolution level has the same number of dimensions, and the same number as the multiscale declares axes. No scale, resolution or downsampling factor is looked at. | `PASS`, `ERROR` |
 | 4 | HCS | Every path in a plate's `wells` list names a group that exists. Acquisitions and fields of view are not checked; a well itself is checked for nothing. | `PASS`, `WARN`, `ERROR` |
