@@ -202,6 +202,6 @@ on:
 - [Roadmap](roadmap.md) — direction, with nothing promised.
 - [Changelog](../CHANGELOG.md) — which release each capability above arrived
   in.
-- [Contributing](../CONTRIBUTING.md) — building it, the quality gate, and the
+- [Development notes](../CONTRIBUTING.md) — building it, the quality gate, and the
   design constraints behind the non-goals above.
 - [README](../README.md) — the project overview.

@@ -1,54 +1,52 @@
 # Roadmap
 
-The roadmap is directional. It is not a promise of dates, releases or version
-numbers, and nothing here is committed until it is merged. For what actually
-exists today, see [Project status](status.md).
+`zarr-tree` is a small, fast, read-only Rust CLI for inspecting Zarr, OME-Zarr
+and SpatialData structure and metadata without reading scientific array or
+chunk data. Everything on this page has to fit that sentence.
 
-Items move down this page as often as up it. An item under *Research* may turn
-out to be a bad idea and simply be dropped.
+Nothing here is a promise of dates or releases. For what exists today, see
+[Project status](status.md).
 
-## Near term
+## Next
 
-Work that is intended, small, and consistent with the current design.
+Small additions that answer a structural question from metadata the walk
+already reads, with no new reads and no new dependency.
 
-- Final repository and release polish. The README has been split into focused
-  guides under `docs/`, and contributor and maintenance documents are in place;
-  what remains is tidying up around a release.
-- Expanding metadata-only structural validation, within the existing model —
-  findings over metadata already read, no schema and no rule engine.
-- Improving how OME-Zarr metadata is presented.
-- Small usability fixes that come out of running the tool against real public
-  stores.
+- OME-Zarr `omero` channel labels — the names (and perhaps colours) an image
+  declares for its channels.
+- The V3 `chunk_grid` name, so a non-regular grid is visible rather than just
+  an unreadable `chunks` row.
+- Usability fixes that come out of running the tool against real stores.
 
-## Under consideration
+## Maybe later
 
-Plausible, not planned. Each would need to earn its place against the design
-rules in `CLAUDE.md` — metadata only, no chunk reads, a short dependency list.
+Plausible, but each needs a clear use first.
 
+- `--filter` / `--only`: show a subset of the tree. The first option that
+  changes *which* nodes print rather than *what* a node says, so it needs a
+  small design before any code.
 - OME-Zarr `image-label` metadata beyond its presence.
-- Channel metadata and `omero` summaries.
-- Coordinate transformations and physical scales.
-- More detailed HCS metadata: acquisitions, fields of view.
-- Distribution through crates.io.
-- Pre-built release binaries.
+- OME-Zarr coordinate transformations and physical scales.
+- More HCS detail: acquisitions, fields of view.
+- More structural validation, within the existing model: findings over
+  metadata already read, comparing a store against its own declarations.
+- Faster remote walks: requests currently go out one at a time.
 
-## Research
+## Not doing
 
-Open questions. No design exists for any of these, and pursuing one may well
-show that it does not belong in this tool.
+These keep the tool narrow. They are decisions, not gaps.
 
-- [`zarrs`](https://github.com/LDeakin/zarrs) integration, if an actual
-  array-reading, chunk-decoding or remote-store need ever justifies the
-  dependency.
-- Chunk-aware inspection — reporting on chunk layout without reading chunk
-  data.
-- Selective array reads, for the cases where a value genuinely answers a
-  structural question.
-- Remote concurrency and performance work: requests currently go out one at a
-  time and nothing is cached between runs.
-- Additional object-store backends.
+- **A general Zarr reader.** No chunk, pixel or array-value reads, no
+  decompression, and no `zarrs` dependency to get them.
+- **A data converter.** Nothing is written, repaired, migrated or rewritten.
+- **A schema-validation framework.** `--validate` checks a store against its
+  own declarations, never a document against a specification.
+- **A policy engine.** No rule registry, configurable rules or severity
+  policies.
+- **A data platform.** No catalogue, cache, server, database or GUI.
+- **More storage backends.** Local, S3 and HTTP(S) are the whole list.
+- **Packaging ceremony.** No crates.io publishing or pre-built binaries unless
+  a real need appears; `cargo install --path .` is enough.
 
-## Not on the roadmap
-
-The boundaries under [Explicit non-goals](status.md#explicit-non-goals) are not
-roadmap items. They are decisions.
+The format-level boundaries are listed in
+[Explicit non-goals](status.md#explicit-non-goals).

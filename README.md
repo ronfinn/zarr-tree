@@ -161,10 +161,10 @@ are as much a part of the design as the features.
 - [Roadmap](docs/roadmap.md) — direction, with nothing promised.
 - [Releases](https://github.com/ronfinn/zarr-tree/releases)
 
-Contributing and maintenance:
+Development:
 
 - [Changelog](CHANGELOG.md) — user-visible changes, per release.
-- [Contributing](CONTRIBUTING.md) — setup, the quality gate, and the design
+- [Development notes](CONTRIBUTING.md) — setup, the quality gate, and the design
   constraints a change is expected to preserve.
 - [Security policy](SECURITY.md) — scope, and how to report a vulnerability.
 
@@ -637,14 +637,14 @@ cargo clippy --all-targets -- -D warnings  # lints, as CI runs them
 cargo fmt --check            # formatting, as CI runs it
 ```
 
-The suite is in two parts: 128 unit tests in `src/main.rs`, which cover metadata
-parsing directly, and 26 integration tests in `tests/cli.rs`, which run the
+The suite is in two parts: unit tests in `src/main.rs`, which cover metadata
+parsing directly, and integration tests in `tests/cli.rs`, which run the
 compiled binary against throwaway fixture stores and assert on what it prints.
 The Parquet fixtures are written by the same crate that reads them back, so
 those tests run against real Parquet bytes with a real footer.
 
 CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
-`cargo test` on every push and pull request.
+`cargo test` on every push, and checks the minimum Rust version (1.88).
 
 ## Limitations
 
@@ -734,19 +734,18 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
 ## Roadmap
 
 Direction, with nothing promised, lives in [docs/roadmap.md](docs/roadmap.md).
-Near term it is documentation work, more structural validation within the
-existing model, and better OME-Zarr presentation. GCS and Azure backends, and
-anything beyond lightweight OME-Zarr and SpatialData recognition, remain out of
-scope.
+Near term it is small metadata-inspection additions, mainly better OME-Zarr
+presentation. Reading array data, converting stores, and GCS or Azure backends
+remain out of scope.
 
-## Contributing
+## Maintenance
 
-Issues and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers
-the development setup, the quality gate CI runs, and the design constraints —
-read-only, metadata-only, arrays are leaves — that a change is expected to
-preserve. [CHANGELOG.md](CHANGELOG.md) records what has changed between
-releases, and [SECURITY.md](SECURITY.md) covers vulnerability reporting, which
-does not go through public issues.
+This is a personal project with one maintainer; work happens directly on
+`master`. [CONTRIBUTING.md](CONTRIBUTING.md) covers the development setup, the
+quality gate CI runs, and the design constraints — read-only, metadata-only,
+arrays are leaves — that a change is expected to preserve.
+[CHANGELOG.md](CHANGELOG.md) records what has changed between releases, and
+[SECURITY.md](SECURITY.md) covers vulnerability reporting.
 
 ## Why this project exists
 

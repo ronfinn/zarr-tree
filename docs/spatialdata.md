@@ -765,9 +765,8 @@ a node — is in
 
 ## Current limitations
 
-All of these remain true today. Several are
-[under consideration](roadmap.md#under-consideration) rather than closed, and
-the full matrix is in [Project status](status.md#spatialdata).
+All of these remain true today. The full matrix is in
+[Project status](status.md#spatialdata).
 
 - **No data value of any kind is read**: no expression value, annotation value,
   category, index label, coordinate or geometry.

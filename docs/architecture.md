@@ -530,11 +530,10 @@ would buy nothing this program does today. The whole dependency list is
 `object_store`, `parquet`, `serde_json`, `tokio` and `url`, and keeping it
 short is a stated design rule.
 
-That is a description of the present, not a verdict. `zarrs` integration is
-listed under Research on the [roadmap](roadmap.md#research), together with
-chunk-aware inspection and selective array reads: if a real array-reading or
-chunk-decoding need arrives, that is when the trade would be worth making. No
-decision has been taken, and nothing in the current code anticipates one.
+The [roadmap](roadmap.md#not-doing) now makes that a decision rather than a
+deferral: this tool is not going to become a general Zarr reader, so there is
+no array-reading or chunk-decoding need for `zarrs` to meet. Nothing in the
+current code anticipates one.
 
 ## Source map
 

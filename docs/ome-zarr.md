@@ -344,7 +344,7 @@ is reported as an image; the alternative would be to guess from the `labels/`
 directory name, which this program does not do.
 
 Nothing here is a claim of image-label support. Richer `image-label` metadata
-is [under consideration](roadmap.md#under-consideration).
+is on the [roadmap](roadmap.md#maybe-later).
 
 ## JSON representation
 
@@ -484,9 +484,9 @@ was — see [Structural validation](cli.md#structural-validation).
 
 ## Current limitations
 
-All of these remain true today. Several are
-[under consideration](roadmap.md#under-consideration) rather than closed, and
-the full matrix is in [Project status](status.md#ome-zarr).
+All of these remain true today. Several are on the [roadmap](roadmap.md)
+rather than closed, and the full matrix is in
+[Project status](status.md#ome-zarr).
 
 - **`coordinateTransformations` are not read**, in a multiscale or in a
   dataset entry.
