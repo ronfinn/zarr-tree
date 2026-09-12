@@ -845,7 +845,7 @@ USAGE:
 
 ```
 $ zarr-tree --version
-zarr-tree 0.4.0
+zarr-tree 0.5.0
 ```
 
 Both are answered on sight, wherever they appear on the command line, and

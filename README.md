@@ -126,13 +126,15 @@ deliberately not implemented.
 
 ## Project status
 
-The latest release is [v0.4.0](https://github.com/ronfinn/zarr-tree/releases),
-which added metadata-only structural validation (`--validate`).
+The latest release is [v0.5.0](https://github.com/ronfinn/zarr-tree/releases),
+which added more array metadata — format version, fill value, codec chain,
+chunk layout and dimension names — plus `--attributes` and natural child
+ordering.
 
 | | |
 | --- | --- |
-| Latest release | v0.4.0 |
-| Tests | 154 passing — 128 unit, 26 integration |
+| Latest release | v0.5.0 |
+| Tests | 185 passing — 156 unit, 29 integration |
 | Minimum supported Rust version | 1.88 |
 
 This is a small utility maintained by one person, not a certified product. The
@@ -376,8 +378,8 @@ limitations.
 
 ## Installation
 
-`zarr-tree` is not on crates.io and there are no release binaries yet, so it is
-built from source:
+`zarr-tree` is built from source. It is not on crates.io and there are no
+release binaries:
 
 ```sh
 git clone https://github.com/ronfinn/zarr-tree.git

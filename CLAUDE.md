@@ -17,7 +17,7 @@ against throwaway fixture stores.
 
 ## Status
 
-- Latest release: **v0.4.0**. Manifest version `0.4.0`.
+- Latest release: **v0.5.0**. Manifest version `0.5.0`.
 - `master` carries unreleased work on top of it; `CHANGELOG.md`'s
   `[Unreleased]` section is the list.
 - What the tool can do today: [docs/status.md](docs/status.md). Direction:

@@ -21,8 +21,8 @@ and no service to sign in to.
 
 ## Install from source
 
-`zarr-tree` is not published on crates.io and there are no pre-built release
-binaries yet, so building from source is the only installation path.
+`zarr-tree` is installed by building it from source. It is not published on
+crates.io and there are no pre-built release binaries.
 
 ```sh
 git clone https://github.com/ronfinn/zarr-tree.git
@@ -34,7 +34,7 @@ The binary lands at `target/release/zarr-tree`:
 
 ```
 $ ./target/release/zarr-tree --version
-zarr-tree 0.4.0
+zarr-tree 0.5.0
 ```
 
 To put it on your `PATH`, install it into Cargo's bin directory
@@ -48,10 +48,10 @@ The examples below assume `zarr-tree` is on your `PATH`.
 
 ### Release versus master
 
-The latest tagged release is **v0.4.0**, and `master` is at that release. The
-manifest version stays at `0.4.0` until the next release is cut, so a later
-build from `master` also reports `zarr-tree 0.4.0` while possibly carrying work
-that is not in the v0.4.0 release.
+The latest tagged release is **v0.5.0**, and `master` is at that release. The
+manifest version stays at `0.5.0` until the next release is cut, so a later
+build from `master` also reports `zarr-tree 0.5.0` while possibly carrying work
+that is not in the v0.5.0 release.
 
 [Project status](status.md) records what is implemented today.
 

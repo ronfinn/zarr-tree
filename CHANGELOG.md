@@ -10,6 +10,13 @@ with the pre-1.0 caveat that the output format is not yet stable.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-12
+
+More of what an array's own metadata declares — format version, fill value,
+codec chain, chunk layout and dimension names — plus `--attributes` and natural
+child ordering. The read-only, metadata-only model is unchanged: nothing here
+reads a chunk or lists one.
+
 ### Changed
 
 - Child names sort naturally rather than bytewise: a run of digits inside a
@@ -246,7 +253,8 @@ First release: local Zarr metadata inspection.
 - Graceful degradation throughout: an unreadable field prints `?`, an
   unreadable node prints `[unknown]`, and the rest of the walk continues.
 
-[Unreleased]: https://github.com/ronfinn/zarr-tree/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ronfinn/zarr-tree/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ronfinn/zarr-tree/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ronfinn/zarr-tree/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ronfinn/zarr-tree/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ronfinn/zarr-tree/compare/v0.1.0...v0.2.0

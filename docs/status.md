@@ -2,10 +2,10 @@
 
 | | |
 | --- | --- |
-| Latest release | [v0.4.0](https://github.com/ronfinn/zarr-tree/releases/tag/v0.4.0) |
-| Development status | at v0.4.0, on `master` |
+| Latest release | [v0.5.0](https://github.com/ronfinn/zarr-tree/releases/tag/v0.5.0) |
+| Development status | at v0.5.0, on `master` |
 | Minimum supported Rust version | 1.88 |
-| Tests | 128 unit, 26 integration |
+| Tests | 156 unit, 29 integration |
 | License | MIT |
 
 This document records what `zarr-tree` implements today. It is a capability
@@ -16,7 +16,7 @@ Two states appear in the tables below:
 
 | Status | Meaning |
 | --- | --- |
-| Supported | Implemented and released, as of v0.4.0. |
+| Supported | Implemented and released, as of v0.5.0. |
 | Not implemented | Absent, and listed here because it is a reasonable thing to expect. |
 
 ## Storage
@@ -159,7 +159,7 @@ mechanism for adding an eighth from outside the source.
 | `--validate` | Supported |
 | `--attributes` | Supported |
 | `-h` / `--help`, `-V` / `--version` | Supported |
-| Exit status 0 walked, 1 failure, 2 validation error | Supported (2 on master) |
+| Exit status 0 walked, 1 failure, 2 validation error | Supported |
 | Quiet `BrokenPipe` handling for `\| head`, `\| less` | Supported |
 | Filtering, colour, or any other output option | Not implemented |
 
