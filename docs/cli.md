@@ -134,6 +134,7 @@ depends on what the node is:
 | `codecs:` | An array declaring a codec chain, after `dimensions:`. Names only, in declaration order — V2 `filters` then `compressor`, V3 `codecs` — with `?` for a codec that could not be named. See [Codecs](zarr.md#codecs). |
 | `layout:` | An array whose document says anything about chunk order or chunk naming, last. `order=C, separator="."` for a V2 array, `encoding=default, separator="/"` for a V3 one, with either half left out where the document did not give it. See [Chunk layout](zarr.md#chunk-layout). |
 | `axes:`, `pyramid levels:`, `datasets:` | An OME-Zarr image |
+| `channels:` | An OME-Zarr image whose `omero` block lists channels, after `datasets:`. Labels in declaration order, `?` for one that could not be read. See [Channel labels](ome-zarr.md#channel-labels). |
 | `rows:`, `columns:`, `wells:` | An OME-Zarr HCS plate |
 | `rows:`, `columns:`, `parquet files:`, `schema:` | A SpatialData points or shapes element with a payload |
 | `observations:`, `variables:`, `X:`, `obs columns:`, `var columns:` | A SpatialData table |
@@ -322,7 +323,7 @@ and then one section per kind of metadata that applies to it:
 | `zarr_format` | recognised groups and arrays | `2` or `3`, the Zarr metadata version the node was read as. Absent on `unknown` |
 | `children` | every node | The child nodes, in the order the tree lists them |
 | `array` | arrays | `shape`, `chunks`, `dtype`, `shards` when sharded, `fill_value` when declared, `dimension_names` when declared, `codecs` when a chain is declared, and `layout` when the document says anything about chunk order or naming |
-| `ome` | OME-Zarr groups | `tag`, `kind`, `version`, `axes`, `pyramid_levels`, `datasets`, and `rows`/`columns`/`wells` on a plate |
+| `ome` | OME-Zarr groups | `tag`, `kind`, `version`, `axes`, `pyramid_levels`, `datasets`, `channels` on an image declaring `omero` channels, and `rows`/`columns`/`wells` on a plate |
 | `spatialdata` | SpatialData nodes | `kind`, `version`, and `regions`/`region_key`/`instance_key` on a table |
 | `parquet` | points and shapes elements with a payload | `rows`, `columns`, `files`, `schema` |
 | `anndata` | SpatialData tables | `encoding_version`, `observations`, `variables`, `obs_columns`, `var_columns`, `x` |

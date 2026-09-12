@@ -191,8 +191,8 @@ one subject at a time.
   however many millions of them there are. That is what makes a remote walk
   affordable.
 - Recognises OME-Zarr images, HCS plates and wells from their metadata markers,
-  and shows an image's axis names, declared pyramid level count and dataset
-  paths — see [docs/ome-zarr.md](docs/ome-zarr.md).
+  and shows an image's axis names, declared pyramid level count, dataset paths
+  and channel labels — see [docs/ome-zarr.md](docs/ome-zarr.md).
 - Recognises a SpatialData store root and its image, labels, points, shapes and
   table elements, from metadata markers rather than directory names.
 - Summarises a points or shapes element's Parquet payload — rows, columns, file
@@ -697,8 +697,9 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
   [docs/zarr.md](docs/zarr.md#deliberately-not-implemented).
 - OME-Zarr support goes no further than spotting image, plate and well groups
   and showing their version, and for an image its axis names, declared pyramid
-  level count and dataset paths. Coordinate transformations, `omero`, axis
-  `type` and `unit`, acquisitions and field-of-view indices are not read, no
+  level count, dataset paths and `omero` channel labels. Coordinate
+  transformations, `omero` rendering settings, axis `type` and `unit`,
+  acquisitions and field-of-view indices are not read, no
   scale factor or pixel size is calculated, and `image-label` is read only for
   its presence — the full list is in
   [docs/ome-zarr.md](docs/ome-zarr.md#current-limitations).

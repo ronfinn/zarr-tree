@@ -297,7 +297,7 @@ object to `ome_info`, which decides between three kinds:
 
 | `OmeKind` | Marker | Read from it |
 | --- | --- | --- |
-| `Image` | a non-empty `multiscales` array | axis names and dataset paths from the first entry |
+| `Image` | a non-empty `multiscales` array | axis names and dataset paths from the first entry, and `omero` channel labels |
 | `Plate` | a `plate` object | declared row and column counts, and the well paths |
 | `Well` | a `well` object | nothing beyond the tag |
 
@@ -308,7 +308,7 @@ and needs no per-version handling.
 
 `image-label` is read for its presence alone, and only as the thing that tells
 a SpatialData `labels` element from an `image` — nothing inside it is
-displayed. Coordinate transformations, `omero` blocks, channel metadata,
+displayed. Coordinate transformations, `omero` rendering settings,
 acquisitions and fields of view are not read; see
 [Project status](status.md#ome-zarr).
 

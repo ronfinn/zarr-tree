@@ -12,8 +12,6 @@ Nothing here is a promise of dates or releases. For what exists today, see
 Small additions that answer a structural question from metadata the walk
 already reads, with no new reads and no new dependency.
 
-- OME-Zarr `omero` channel labels — the names (and perhaps colours) an image
-  declares for its channels.
 - The V3 `chunk_grid` name, so a non-regular grid is visible rather than just
   an unreadable `chunks` row.
 - Usability fixes that come out of running the tool against real stores.
@@ -25,6 +23,7 @@ Plausible, but each needs a clear use first.
 - `--filter` / `--only`: show a subset of the tree. The first option that
   changes *which* nodes print rather than *what* a node says, so it needs a
   small design before any code.
+- OME-Zarr `omero` channel colours, beside the labels already shown.
 - OME-Zarr `image-label` metadata beyond its presence.
 - OME-Zarr coordinate transformations and physical scales.
 - More HCS detail: acquisitions, fields of view.

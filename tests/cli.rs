@@ -424,6 +424,216 @@ fn ome_zarr_metadata_rows_are_printed_above_the_child_arrays() {
     );
 }
 
+/// A store of four OME-Zarr images that differ only in what their `omero`
+/// block says about channels, returned as the fixture directory and the path
+/// to hand the binary.
+///
+/// - `widefield`: OME-Zarr 0.4 on Zarr V2, `omero` at the top of `.zattrs`.
+/// - `confocal`: OME-Zarr 0.5 on Zarr V3, `omero` inside `attributes.ome`,
+///   labels out of alphabetical order and full rendering settings beside them.
+/// - `partial`: 0.5, with a middle channel that has a colour and no label.
+/// - `plain`: 0.5, with no `omero` block at all.
+fn channel_fixture(name: &str) -> (PathBuf, String) {
+    let dir = fixture_dir(name);
+    let root = dir.join("channels.zarr");
+
+    write_file(
+        &root.join("zarr.json"),
+        r#"{"zarr_format": 3, "node_type": "group"}"#,
+    );
+
+    write_file(&root.join("widefield/.zgroup"), r#"{"zarr_format": 2}"#);
+    write_file(
+        &root.join("widefield/.zattrs"),
+        r#"{
+            "multiscales": [{"version": "0.4", "axes": [{"name": "c"}, {"name": "y"}, {"name": "x"}],
+                             "datasets": [{"path": "0"}]}],
+            "omero": {"channels": [{"label": "LaminB1", "color": "0000FF"},
+                                   {"label": "Dapi", "color": "FFFFFF"}]}
+        }"#,
+    );
+    write_file(
+        &root.join("widefield/0/.zarray"),
+        r#"{"zarr_format": 2, "shape": [2, 64, 64], "chunks": [1, 64, 64], "dtype": "<u2"}"#,
+    );
+
+    // The three V3 images share everything but their `omero` block.
+    let v3_image = |omero: &str| {
+        format!(
+            r#"{{
+                "zarr_format": 3,
+                "node_type": "group",
+                "attributes": {{
+                    "ome": {{
+                        "version": "0.5",
+                        "multiscales": [{{
+                            "axes": [{{"name": "c"}}, {{"name": "y"}}, {{"name": "x"}}],
+                            "datasets": [{{"path": "0"}}]
+                        }}]
+                        {omero}
+                    }}
+                }}
+            }}"#
+        )
+    };
+    let level = r#"{
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": [3, 64, 64],
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [1, 64, 64]}},
+        "data_type": "uint16"
+    }"#;
+
+    write_file(
+        &root.join("confocal/zarr.json"),
+        &v3_image(
+            r#", "omero": {"channels": [
+                {"label": "RFP", "color": "FF0000", "active": true, "family": "linear",
+                 "window": {"start": 0, "end": 1500, "min": 0, "max": 65535}},
+                {"label": "DAPI", "color": "0000FF", "active": false},
+                {"label": "GFP", "color": "00FF00", "inverted": false}
+            ]}"#,
+        ),
+    );
+    write_file(&root.join("confocal/0/zarr.json"), level);
+
+    write_file(
+        &root.join("partial/zarr.json"),
+        &v3_image(
+            r#", "omero": {"channels": [
+                {"label": "DAPI"}, {"color": "00FF00"}, {"label": "RFP"}
+            ]}"#,
+        ),
+    );
+    write_file(&root.join("partial/0/zarr.json"), level);
+
+    write_file(&root.join("plain/zarr.json"), &v3_image(""));
+    write_file(&root.join("plain/0/zarr.json"), level);
+
+    let path = root.to_str().unwrap().to_string();
+    (dir, path)
+}
+
+#[test]
+fn omero_channel_labels_are_shown_in_declared_order() {
+    let (dir, path) = channel_fixture("channels-tree");
+
+    let output = run(&[&path]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert!(
+        output.status.success(),
+        "expected success, got {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lines = lines(&stdout);
+
+    // The rows under one image, from its own line to its first level. The
+    // channels row is the image's last, after the multiscale's rows and
+    // before its children, and keeps the order the metadata declared.
+    let section = |image: &str| -> Vec<String> {
+        let start = lines
+            .iter()
+            .position(|line| line.starts_with(&format!("{image} [group")))
+            .unwrap_or_else(|| panic!("no {image:?} group in:\n{stdout}"));
+        lines[start..=start + 6].to_vec()
+    };
+    assert_eq!(
+        section("confocal"),
+        vec![
+            "confocal [group, OME-Zarr 0.5]",
+            "zarr: V3",
+            "axes: c, y, x",
+            "pyramid levels: 1",
+            "datasets: 0",
+            "channels: RFP, DAPI, GFP",
+            "0 [array]",
+        ],
+        "{stdout}"
+    );
+
+    // The V2 layout reads the same, from the top of `.zattrs`.
+    assert_eq!(
+        section("widefield")[5],
+        "channels: LaminB1, Dapi",
+        "{stdout}"
+    );
+    // A channel with no label holds its place as `?` and is not named.
+    assert_eq!(section("partial")[5], "channels: DAPI, ?, RFP", "{stdout}");
+    // No `omero`, no row: the image goes straight from its rows to its level.
+    assert_eq!(section("plain")[5], "0 [array]", "{stdout}");
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("channels:"))
+            .count(),
+        3,
+        "{stdout}"
+    );
+
+    // Only the labels are read. None of the rendering settings beside them --
+    // colour, window, family, active, inverted -- reaches the output. The root
+    // line is skipped: it is the temp path, and a process id could spell 1500.
+    for unexpected in ["FF0000", "0000FF", "1500", "linear", "active", "inverted"] {
+        assert!(
+            !lines[1..].iter().any(|line| line.contains(unexpected)),
+            "rendering setting {unexpected:?} leaked into:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn omero_channel_labels_appear_in_json() {
+    let (dir, path) = channel_fixture("channels-json");
+
+    let output = run(&["--json", &path]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert!(
+        output.status.success(),
+        "expected success; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let tree: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("--json should print valid JSON: {error}\n{stdout}"));
+    let ome = |name: &str| -> Value {
+        tree["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|child| child["name"] == json!(name))
+            .unwrap_or_else(|| panic!("no child named {name:?} in {tree}"))["ome"]
+            .clone()
+    };
+
+    // The whole section for one image, so it is plain that `channels` is the
+    // one addition and the labels are all it holds.
+    assert_eq!(
+        ome("confocal"),
+        json!({
+            "tag": "OME-Zarr 0.5",
+            "kind": "image",
+            "version": "0.5",
+            "axes": ["c", "y", "x"],
+            "pyramid_levels": 1,
+            "datasets": ["0"],
+            "channels": ["RFP", "DAPI", "GFP"]
+        })
+    );
+    assert_eq!(ome("widefield")["channels"], json!(["LaminB1", "Dapi"]));
+    // An unreadable label is `null` in place, never a made-up name.
+    assert_eq!(ome("partial")["channels"], json!(["DAPI", null, "RFP"]));
+    // No `omero`, no key -- not `null`, and not an empty list.
+    assert_eq!(ome("plain").get("channels"), None);
+}
+
 #[test]
 fn a_labels_group_is_a_child_but_not_a_pyramid_level() {
     let dir = fixture_dir("ome-labels");

@@ -16,7 +16,7 @@ Two states appear in the tables below:
 
 | Status | Meaning |
 | --- | --- |
-| Supported | Implemented and released, as of v0.5.0. |
+| Supported | Implemented on current `master`. Which release first shipped it is recorded in the [Changelog](../CHANGELOG.md). |
 | Not implemented | Absent, and listed here because it is a reasonable thing to expect. |
 
 ## Storage
@@ -84,7 +84,8 @@ detail.
 | `image-label` presence, to tell a segmentation from an image | Supported |
 | Axis `type` and `unit` | Not implemented |
 | Coordinate transformations, scale factors, physical extents | Not implemented |
-| `omero` / channel metadata | Not implemented |
+| `omero` channel labels, in declared order | Supported |
+| `omero` rendering settings — colours, windows, families, active flags | Not implemented |
 | Acquisitions, field-of-view indices | Not implemented |
 | Full OME-NGFF specification conformance checking | Not implemented, and out of scope |
 

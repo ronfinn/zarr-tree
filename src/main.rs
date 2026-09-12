@@ -685,6 +685,14 @@ struct OmeInfo {
     /// fact shown twice. Keeping the list is what stops the two from drifting:
     /// the count is simply its length.
     datasets: Option<Vec<String>>,
+    /// The channel labels an image's `omero` block declares, in the order it
+    /// declares them. `None` when there is no `omero` block, or it lists no
+    /// channels, and always `None` for a plate or a well.
+    ///
+    /// The inner `Option` is a channel whose label could not be read. It keeps
+    /// its position -- the rule `dimension_names` follows -- so the channels
+    /// after it are not shifted onto the wrong names. See `channel_labels`.
+    channels: Option<Vec<Option<String>>>,
 }
 
 impl OmeInfo {
@@ -2505,11 +2513,16 @@ fn ome_info(ome: &Value, version: Option<&Value>) -> Option<OmeInfo> {
         // shape since OME-NGFF 0.1 -- always a list of objects with a `path` --
         // so unlike the axes it needs no per-version handling at all. What 0.4
         // added to each entry, `coordinateTransformations`, is not read.
+        //
+        // `omero` is not part of a multiscale: it sits beside `multiscales` in
+        // this same object, at the top of `.zattrs` for V2 and inside
+        // `attributes.ome` for V3, so it is already in hand for both.
         return Some(OmeInfo {
             kind: OmeKind::Image,
             version: namespace_version(version),
             axes: axis_names(first.get("axes")),
             datasets: dataset_paths(first.get("datasets")),
+            channels: channel_labels(ome.get("omero")),
         });
     }
 
@@ -2544,6 +2557,7 @@ fn ome_info(ome: &Value, version: Option<&Value>) -> Option<OmeInfo> {
             version: stored_version(plate),
             axes: None,
             datasets: None,
+            channels: None,
         });
     }
 
@@ -2553,6 +2567,7 @@ fn ome_info(ome: &Value, version: Option<&Value>) -> Option<OmeInfo> {
             version: stored_version(well),
             axes: None,
             datasets: None,
+            channels: None,
         });
     }
 
@@ -3401,6 +3416,17 @@ fn ome_rows(ome: Option<&OmeInfo>) -> Vec<String> {
         rows.push(format!("pyramid levels: {}", datasets.len()));
         rows.push(format!("datasets: {}", datasets.join(", ")));
     }
+    // After the multiscale's rows rather than among them, because `omero` is a
+    // block of its own. An unreadable label shows as `?` in its place, and a
+    // long list is capped the way a Parquet schema is: an image can carry
+    // dozens of channels, and `--json` has every one.
+    if let Some(channels) = &ome.channels {
+        let labels: Vec<String> = channels
+            .iter()
+            .map(|label| label.as_deref().unwrap_or("?").to_string())
+            .collect();
+        rows.push(format!("channels: {}", capped(&labels).join(", ")));
+    }
     // A plate says how big it declares itself to be. Each count is independent,
     // so a plate that declared only some of the three lists shows only those.
     // A well adds no rows at all: its images are the child groups below it, and
@@ -4024,6 +4050,51 @@ fn dataset_paths(value: Option<&Value>) -> Option<Vec<String>> {
     Some(paths)
 }
 
+/// Read an OME-Zarr `omero` block as the channel labels it declares, or `None`
+/// when there is nothing to show.
+///
+/// `omero` has held the same shape in every version that has it -- a
+/// `channels` list of objects, each with a `label` beside its rendering
+/// settings:
+///
+/// ```json
+/// "omero": {"channels": [{"label": "DAPI", "color": "0000FF", "window": {...}}]}
+/// ```
+///
+/// Only the `label` is read. Colour, window, family, the active flag and the
+/// rest of the rendering settings are how a viewer should *draw* a channel,
+/// and are left alone.
+///
+/// Labels are shown exactly as stored, in declaration order, unsorted and
+/// unchecked. A channel whose label cannot be read -- no `label`, a `label`
+/// that is not a string, an entry that is not an object -- keeps its position
+/// as an inner `None`, the way an unnamed dimension does; no name is made up
+/// for it, from the axes or from anywhere else.
+///
+/// A missing `omero`, one that is not an object, and a `channels` that is
+/// absent, not a list or empty all come back `None`: no row, and no key in
+/// `--json`.
+fn channel_labels(omero: Option<&Value>) -> Option<Vec<Option<String>>> {
+    // `get` on anything that is not an object yields `None`, so a malformed
+    // `omero` falls out here without a check of its own.
+    let channels = omero?.get("channels")?.as_array()?;
+    if channels.is_empty() {
+        return None;
+    }
+
+    Some(
+        channels
+            .iter()
+            .map(|channel| {
+                channel
+                    .get("label")
+                    .and_then(|label| label.as_str())
+                    .map(String::from)
+            })
+            .collect(),
+    )
+}
+
 /// Print the metadata rows that sit underneath an array line.
 ///
 /// `zarr`, `shape`, `chunks` and `dtype` are always printed, in that order. A sharded
@@ -4457,6 +4528,12 @@ fn json_parquet(parquet: &ParquetSummary) -> Value {
 /// rule the tree's rows follow, and the same one `shards` follows on an array:
 /// a count that was not declared is left out rather than written as `null`,
 /// because only a plate has these to declare in the first place.
+///
+/// `channels` is left out on the same terms, when the image declares no
+/// `omero` channels. Where it is present it holds every label, uncapped, and
+/// an unreadable label is `null` in its place -- the convention
+/// `dimension_names` set, and unlike the older `?` strings in `axes` and
+/// `datasets`: a label is free text, and `"?"` is one a channel could have.
 fn json_ome(ome: &OmeInfo) -> Value {
     let mut value = json!({
         "tag": ome.tag(),
@@ -4466,6 +4543,10 @@ fn json_ome(ome: &OmeInfo) -> Value {
         "pyramid_levels": ome.datasets.as_ref().map(|datasets| datasets.len()),
         "datasets": ome.datasets,
     });
+
+    if let Some(channels) = &ome.channels {
+        value["channels"] = json!(channels);
+    }
 
     if let OmeKind::Plate {
         rows,
@@ -8051,6 +8132,175 @@ mod tests {
         });
 
         assert!(ome_info_v3(&value).is_none());
+    }
+
+    #[test]
+    fn omero_channel_labels_are_read_from_v3_in_declared_order() {
+        // A 0.5 image: `omero` sits beside `multiscales` inside `attributes.ome`.
+        // The labels are deliberately out of alphabetical order, and each
+        // channel carries the rendering settings a real one does, none of which
+        // may leak into the output.
+        let value = json!({
+            "zarr_format": 3,
+            "node_type": "group",
+            "attributes": {
+                "ome": {
+                    "version": "0.5",
+                    "multiscales": [{
+                        "axes": [{ "name": "c" }, { "name": "y" }, { "name": "x" }],
+                        "datasets": [{ "path": "0" }]
+                    }],
+                    "omero": {
+                        "channels": [
+                            { "label": "RFP", "color": "FF0000", "active": true,
+                              "window": { "start": 0, "end": 1500, "min": 0, "max": 65535 } },
+                            { "label": "DAPI", "color": "0000FF", "family": "linear" },
+                            { "label": "GFP", "color": "00FF00", "inverted": false }
+                        ],
+                        "rdefs": { "model": "color" }
+                    }
+                }
+            }
+        });
+
+        let info = ome_info_v3(&value).expect("a V3 image group should be recognised");
+
+        assert_eq!(named(&info.channels), Some(String::from("RFP, DAPI, GFP")));
+        // Last of the image's rows, after the multiscale's own.
+        assert_eq!(
+            ome_rows(Some(&info)),
+            vec![
+                "axes: c, y, x",
+                "pyramid levels: 1",
+                "datasets: 0",
+                "channels: RFP, DAPI, GFP"
+            ]
+        );
+        // The same list in `--json`, as the labels alone.
+        assert_eq!(json_ome(&info)["channels"], json!(["RFP", "DAPI", "GFP"]));
+    }
+
+    #[test]
+    fn omero_channel_labels_are_read_from_the_top_level_of_v2_attributes() {
+        // A 0.4 image, as IDR writes one: `.zattrs` *is* the attributes object,
+        // so `omero` is a top-level key beside `multiscales`.
+        let attrs = json!({
+            "multiscales": [{ "version": "0.4", "datasets": [{ "path": "0" }] }],
+            "omero": {
+                "channels": [
+                    { "label": "LaminB1", "color": "0000FF" },
+                    { "label": "Dapi", "color": "FFFFFF" }
+                ]
+            }
+        });
+
+        let info = ome_info_v2(&attrs).expect("multiscales makes this an image");
+
+        assert_eq!(named(&info.channels), Some(String::from("LaminB1, Dapi")));
+    }
+
+    #[test]
+    fn a_channel_without_a_usable_label_keeps_its_place() {
+        // Five channels, three of which have no label to show: one with no
+        // `label` key, one whose label is not a string, and one that is not an
+        // object at all. None of them is dropped or given a made-up name, so
+        // `RFP` is still the fifth channel.
+        let attrs = json!({
+            "multiscales": [{ "datasets": [{ "path": "0" }] }],
+            "omero": {
+                "channels": [
+                    { "label": "DAPI" },
+                    { "color": "00FF00" },
+                    { "label": 7 },
+                    "GFP",
+                    { "label": "RFP" }
+                ]
+            }
+        });
+
+        let info = ome_info_v2(&attrs).expect("multiscales makes this an image");
+
+        assert_eq!(
+            info.channels,
+            Some(vec![
+                Some(String::from("DAPI")),
+                None,
+                None,
+                None,
+                Some(String::from("RFP"))
+            ])
+        );
+        assert!(
+            ome_rows(Some(&info)).contains(&String::from("channels: DAPI, ?, ?, ?, RFP")),
+            "{:?}",
+            ome_rows(Some(&info))
+        );
+        // `null` rather than `"?"` in `--json`: `"?"` is a label a channel
+        // could really have.
+        assert_eq!(
+            json_ome(&info)["channels"],
+            json!(["DAPI", null, null, null, "RFP"])
+        );
+    }
+
+    #[test]
+    fn an_image_with_no_omero_channels_has_no_channels_row_or_key() {
+        // Every way of declaring no channels: no `omero` at all, an `omero`
+        // that is not an object, an `omero` with no `channels`, and a
+        // `channels` that is not a list or is empty. Each still leaves a
+        // perfectly good image, with the rest of its rows intact.
+        for omero in [
+            None,
+            Some(json!("DAPI")),
+            Some(json!({})),
+            Some(json!({ "channels": { "label": "DAPI" } })),
+            Some(json!({ "channels": "DAPI" })),
+            Some(json!({ "channels": [] })),
+        ] {
+            let mut attrs = json!({ "multiscales": [{ "datasets": [{ "path": "0" }] }] });
+            if let Some(omero) = &omero {
+                attrs["omero"] = omero.clone();
+            }
+
+            let info = ome_info_v2(&attrs).expect("multiscales makes this an image");
+
+            assert_eq!(info.channels, None, "omero: {omero:?}");
+            assert_eq!(
+                ome_rows(Some(&info)),
+                vec!["pyramid levels: 1", "datasets: 0"],
+                "omero: {omero:?}"
+            );
+            assert_eq!(json_ome(&info).get("channels"), None, "omero: {omero:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_channel_list_is_capped_in_the_tree_and_whole_in_json() {
+        // Fourteen channels, as a multiplexed image might carry. The row names
+        // the first twelve in order and counts the rest; `--json` has all of
+        // them.
+        let labels: Vec<String> = (1..=14).map(|n| format!("ch{n}")).collect();
+        let attrs = json!({
+            "multiscales": [{ "datasets": [{ "path": "0" }] }],
+            "omero": {
+                "channels": labels
+                    .iter()
+                    .map(|label| json!({ "label": label }))
+                    .collect::<Vec<Value>>()
+            }
+        });
+
+        let info = ome_info_v2(&attrs).expect("multiscales makes this an image");
+
+        assert!(
+            ome_rows(Some(&info)).contains(&format!(
+                "channels: {}, ... (2 more)",
+                labels[..12].join(", ")
+            )),
+            "{:?}",
+            ome_rows(Some(&info))
+        );
+        assert_eq!(json_ome(&info)["channels"], json!(labels));
     }
 
     #[test]

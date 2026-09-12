@@ -10,6 +10,21 @@ with the pre-1.0 caveat that the output format is not yet stable.
 
 ## [Unreleased]
 
+### Added
+
+- OME-Zarr images show the channel labels their `omero` block declares: a
+  `channels:` row after `datasets`, and a `channels` list in the `ome` section
+  of `--json`. Read from the top of `.zattrs` for OME-Zarr 0.4 and earlier and
+  from `attributes.ome` for 0.5 — documents already read for the image's other
+  rows, so nothing extra is fetched. Labels are shown exactly as stored, in the
+  order declared, and never sorted, checked or matched against the axes. A
+  channel with no readable label holds its place as `?` in the tree and `null`
+  in `--json`, and is not given a name. An image with no `omero` block, or one
+  listing no channels, gets no row and no key. The tree names the first twelve
+  channels and counts the rest; `--json` carries every label. Labels only:
+  colours, windows, families, active flags and every other rendering setting
+  are left unread.
+
 ## [0.5.0] - 2026-09-12
 
 More of what an array's own metadata declares — format version, fill value,

@@ -12,6 +12,7 @@ This is not a summary of OME-NGFF. It documents one program's reading of it.
 - [Axes](#axes)
 - [Multiscale datasets](#multiscale-datasets)
 - [Pyramid level semantics](#pyramid-level-semantics)
+- [Channel labels](#channel-labels)
 - [Plates and wells](#plates-and-wells)
 - [Labels and image-label](#labels-and-image-label)
 - [JSON representation](#json-representation)
@@ -35,8 +36,8 @@ attributes say otherwise. This is a rule of the project, not an accident of the
 implementation — see [CLAUDE.md](../CLAUDE.md) and
 [Design principles](architecture.md#design-principles).
 
-**Values are shown as stored.** Versions, axis names and dataset paths are
-printed back exactly as they were written, unchecked against the versions or
+**Values are shown as stored.** Versions, axis names, dataset paths and
+channel labels are printed back exactly as they were written, unchecked against the versions or
 forms that exist. An unfamiliar value still shows.
 
 **The tree is recognition, not validation.** Ordinary output claims only that
@@ -239,6 +240,51 @@ factor, pixel size, downsampling ratio or physical extent is derived, because
 read at all. A three-level pyramid is three levels; whether each is half the
 previous one is not a question this program asks.
 
+## Channel labels
+
+An image may carry an `omero` block describing how its channels should be
+drawn. From it, `zarr-tree` reads the one thing that says what a channel *is*
+— its `label` — and shows the labels on one row, after the multiscale's rows:
+
+```
+$ zarr-tree 6001240.zarr
+6001240.zarr [group, OME-Zarr 0.4]
+├─ zarr: V2
+├─ axes: c, z, y, x
+├─ pyramid levels: 3
+├─ datasets: 0, 1, 2
+├─ channels: LaminB1, Dapi
+...
+```
+
+`omero` sits beside `multiscales`, in the same object the rest of this page
+reads, so both layouts are covered by one reading and nothing extra is fetched:
+
+| OME-Zarr | Zarr | `omero` lives at |
+| --- | --- | --- |
+| 0.1 – 0.4 | V2 | the top level of `.zattrs` |
+| 0.5 | V3 | `attributes.ome.omero` in `zarr.json` |
+
+`omero.channels` is a list of objects, and each `label` is read from it:
+
+- Labels are shown **exactly as stored, in declaration order** — not sorted,
+  checked, de-duplicated, or matched against the axes or against the size of
+  the `c` dimension.
+- A channel whose label cannot be read — no `label`, a `label` that is not a
+  string, an entry that is not an object — **keeps its position** as `?`, the
+  rule [axes](#axes) follow. It is never given a name, from the axes or from
+  anywhere else: `channels: DAPI, ?, RFP`.
+- An image with no `omero`, an `omero` that is not an object, or a `channels`
+  that is absent, not a list or empty prints **no row at all**.
+- The tree names the first twelve channels and counts the rest —
+  `... (40 more)` — the way a Parquet schema row does. `--json` carries every
+  label.
+
+**Only `label` is read.** A channel's `color`, `window` (`start`, `end`, `min`,
+`max`), `family`, `active`, `inverted` and `coefficient` are how a viewer
+should *render* it, and are left alone, as is `omero.rdefs`. `omero` is read
+only on an image; a plate or a well is not looked at for one.
+
 ## Plates and wells
 
 High-content screening stores a plate of wells rather than a single image. Both
@@ -359,6 +405,7 @@ An OME-Zarr group carries an `ome` section in `--json`, beside the `name`,
 | `axes` | always | The names, or `null` |
 | `pyramid_levels` | always | The declared count, or `null` |
 | `datasets` | always | The declared paths, or `null` |
+| `channels` | images declaring `omero` channels | Every declared label, in order, `null` for one that could not be read |
 | `rows` | plates | The declared row count |
 | `columns` | plates | The declared column count |
 | `wells` | plates | The declared well **count**, not the paths |
@@ -382,7 +429,20 @@ is missing, because a plate that declared no `columns` has no column count to
 be unreadable.
 
 `axes` and `datasets` carry the `?` placeholders too, so a JSON reader sees the
-same declared count the tree shows. See
+same declared count the tree shows. `channels` holds its places with `null`
+instead, because a label is free text and `"?"` is one a channel could really
+have; it is omitted, like a plate's counts, when the image declares no
+channels:
+
+```
+$ zarr-tree --json 6001240.zarr | jq '.ome.channels'
+[
+  "LaminB1",
+  "Dapi"
+]
+```
+
+See
 [JSON representation](zarr.md#json-representation) for the node fields common
 to every kind.
 
@@ -498,8 +558,8 @@ rather than closed, and the full matrix is in
   prescribes, or against the arrays below.
 - **Only the first `multiscales` entry is read.** Additional entries are not
   reported.
-- **`omero` and channel metadata are not read**: no channel names, windows,
-  colours or rendering settings.
+- **Only channel labels are read from `omero`**: no colours, windows,
+  families, active flags or other rendering settings, and no `rdefs`.
 - **`image-label` is read for its presence alone**, and only where SpatialData
   raster discrimination needs it. No image-label relationship is surfaced — see
   [Labels and image-label](#labels-and-image-label).
